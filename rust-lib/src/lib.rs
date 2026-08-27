@@ -12,12 +12,14 @@
 
 pub mod history;
 pub mod networks;
+pub mod send;
 pub mod settings;
 pub mod tokens;
 pub mod txbuild;
 
 pub use history::{History, TxRecord};
 pub use networks::Network;
+pub use send::{NonceReserver, SendJob, SendStatus};
 pub use settings::{NetworkSettings, Settings, SettingsError, SettingsStore, VerifiedProxyMode};
 pub use tokens::Token;
 
