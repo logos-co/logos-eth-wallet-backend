@@ -3,9 +3,20 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    eth_rpc_module.url = "github:logos-co/logos-evm-eth-rpc-module";
-    fee_module.url = "github:logos-co/logos-evm-fee-module";
-    keystore_module.url = "github:logos-co/logos-evm-keystore-module";
+    # Every dependency must build against THIS module-builder. Without the follows each
+    # drags its own, and a skewed generated ABI segfaults the module inside provider init.
+    eth_rpc_module = {
+      url = "github:logos-co/logos-evm-eth-rpc-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
+    fee_module = {
+      url = "github:logos-co/logos-evm-fee-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
+    keystore_module = {
+      url = "github:logos-co/logos-evm-keystore-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

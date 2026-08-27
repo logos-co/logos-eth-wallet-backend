@@ -177,8 +177,10 @@ fn parse_u64_any(s: &str) -> Option<u64> {
 
 
 
-/// `eth_rpc_module` wraps every reply as `{ ok, result }`. Unwrap to the inner result,
-/// surfacing its own error rather than a generic one.
+/// `eth_rpc_module` wraps most replies as `{ ok, result }` — but not all: broadcasting
+/// answers `{ ok, hash }`. Reading only `result` there silently yields a null hash, a
+/// history row that cannot be followed up, and a send that looks like it went nowhere while
+/// the money has actually moved. Accept both keys.
 fn unwrap_rpc(reply: &str) -> Result<Value, String> {
     let v: Value = serde_json::from_str(reply).map_err(|e| e.to_string())?;
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -188,7 +190,7 @@ fn unwrap_rpc(reply: &str) -> Result<Value, String> {
             .unwrap_or("eth_rpc call failed")
             .to_string());
     }
-    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    Ok(v.get("result").or_else(|| v.get("hash")).cloned().unwrap_or(Value::Null))
 }
 
 impl EthWalletBackendImpl {
@@ -259,8 +261,15 @@ impl EthWalletBackendImpl {
             return Err(fee.get("error").and_then(Value::as_str)
                 .unwrap_or("fee estimation failed").to_string());
         }
+        // fee_module emits amounts as decimal strings but `gasLimit` as a JSON number, so
+        // every numeric field is read through both forms rather than assuming one.
         let pick = |k: &str| -> Result<U256, String> {
-            fee.get(k).and_then(Value::as_str).and_then(parse_u256_any)
+            fee.get(k)
+                .and_then(|v| match v {
+                    Value::String(t) => parse_u256_any(t),
+                    Value::Number(n) => n.as_u64().map(U256::from),
+                    _ => None,
+                })
                 .ok_or_else(|| format!("fee_module returned no usable `{k}`"))
         };
         let max_fee = pick("maxFeePerGas")?;
@@ -268,8 +277,10 @@ impl EthWalletBackendImpl {
         if max_priority > max_fee {
             return Err("maxPriorityFeePerGas cannot exceed maxFeePerGas".into());
         }
-        let gas_limit = fee.get("gasLimit").and_then(Value::as_str).and_then(parse_u64_any)
-            .ok_or("fee_module returned no usable `gasLimit` — refusing rather than guessing one")?;
+        let gas_limit = u64::try_from(pick("gasLimit").map_err(|_| {
+            "fee_module returned no usable `gasLimit` — refusing rather than guessing one"
+        })?)
+        .map_err(|_| "fee_module returned an implausible `gasLimit`")?;
         let fee_source =
             fee.get("source").and_then(Value::as_str).unwrap_or("unknown").to_string();
 
@@ -732,7 +743,19 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
                 .map_err(|e| format!("{e:?}"))
                 .and_then(|r| unwrap_rpc(&r));
             let hash = match sent {
-                Ok(v) => v.as_str().unwrap_or_default().to_string(),
+                Ok(v) => match v.as_str().map(str::to_string).filter(|h| !h.is_empty()) {
+                    Some(h) => h,
+                    None => {
+                        return Ok(Self::job_reply(&self.settle(
+                            st,
+                            job,
+                            // The transaction may well be on-chain; we simply cannot follow it.
+                            SendStatus::Failed {
+                                reason: "the node accepted the transaction but returned no hash".into(),
+                            },
+                        )))
+                    }
+                },
                 Err(e) => {
                     return Ok(Self::job_reply(&self.settle(
                         st, job, SendStatus::Failed { reason: e },
@@ -825,9 +848,28 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 }
 
+// The registration hook. The generated provider glue DECLARES this symbol and the loader
+// resolves it at dlopen; the author owes the definition. Omitting it links cleanly and
+// segfaults inside `ensure_ready` at set_context time on macOS (lazy resolution, no hint);
+// Linux at least says `undefined symbol: logos_module_install`.
+#[no_mangle]
+pub extern "Rust" fn logos_module_install() {
+    install::<EthWalletBackendImpl>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn unwrap_rpc_reads_the_broadcast_hash_key_too() {
+        // send_raw_transaction answers `{ok, hash}` while every other method answers
+        // `{ok, result}`. Reading only `result` loses the hash of a transaction that has
+        // already moved money.
+        assert_eq!(unwrap_rpc(r#"{"ok":true,"hash":"0xabc"}"#).unwrap(), json!("0xabc"));
+        assert_eq!(unwrap_rpc(r#"{"ok":true,"result":"0x2a"}"#).unwrap(), json!("0x2a"));
+    }
 
     #[test]
     fn unwrap_rpc_surfaces_the_inner_error_not_a_generic_one() {
