@@ -25,10 +25,29 @@ pub struct Token {
 /// confirmed as the canonical mainnet WETH9 deployment.
 const WETH_MAINNET: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
 
-/// MUST-VERIFY before any release that offers WETH on these networks. Several unrelated
-/// WETH deployments exist on Sepolia and none is canonical; Hoodi is not surveyed at all.
-/// Verify against an authoritative source, confirm `symbol()`/`decimals()` on-chain through
-/// the configured endpoint, and have the transcription checked by a second person.
+/// VERIFIED ABSENT — these stay `None`, and the investigation that established it is the
+/// reason, not an absence of effort.
+///
+/// **Sepolia**: at least six WETH contracts are deployed and *all six* return
+/// `symbol() == "WETH"` and `decimals() == 18`, so an on-chain check cannot choose between
+/// them. Worse, the three largest ecosystems on the chain each hardcode a DIFFERENT one:
+/// Uniswap's routers bake in `0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14`, Aave's gateway
+/// returns `0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c`, and Chainlink CCIP lists
+/// `0x097D90c9d3E0B50Ca60e1ae45F6A81010f9FB534`. `eth-clients/sepolia` — the authoritative
+/// network definition — names no token contracts at all, and there is no genesis predeploy.
+/// Picking by popularity does not even converge: the largest deployment by ETH backing is not
+/// the best-documented one.
+///
+/// **Hoodi**: four live WETH contracts, no official registry (`eth-clients/hoodi` names only
+/// the deposit contract; Lido's registry, the most complete for this chain, lists none), and
+/// no Uniswap deployment to act as a de-facto pointer. The mainnet WETH address is confirmed
+/// EMPTY here — `eth_getCode` returns `0x` — because mainnet WETH was a nonce-based CREATE in
+/// 2017 and cannot reproduce on another chain.
+///
+/// Shipping any of them would be this wallet asserting a network-wide fact that is not true.
+/// The concrete harm: a user holding Aave-faucet WETH sees a zero balance and concludes their
+/// funds vanished. So these networks offer ETH only, and a user who wants a specific WETH
+/// must be given a way to name it rather than have one chosen for them.
 const WETH_SEPOLIA: Option<&str> = None;
 const WETH_HOODI: Option<&str> = None;
 
@@ -138,6 +157,9 @@ mod tests {
 
     #[test]
     fn mainnet_offers_weth_and_the_unverified_testnets_do_not() {
+        // Not "unverified" for want of looking: sepolia has six WETH deployments that pass
+        // every on-chain check and three ecosystems that disagree about which is real; hoodi
+        // has four and no registry at all. See the note on WETH_SEPOLIA.
         assert!(find(1, "WETH").is_some());
         assert!(find(1, WETH_MAINNET).is_some(), "lookup by address must work");
         // Deliberate: an unverified address is absent, not guessed. Flip these when

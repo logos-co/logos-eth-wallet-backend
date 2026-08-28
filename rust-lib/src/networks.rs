@@ -36,8 +36,10 @@ pub const SEPOLIA: Network = Network {
     explorer: "https://sepolia.etherscan.io",
 };
 
-// Hoodi's explorer is not verified from an authoritative source yet; see tokens.rs
-// for the same discipline applied to token addresses.
+// Hoodi's explorer is not verified from an authoritative source yet; see tokens.rs for the
+// same discipline applied to token addresses. Multicall3 IS confirmed present here — its
+// bytecode is byte-identical to mainnet's (sha256 0fb6a9db…) and aggregate3 answers live —
+// so the balance path works on all three networks.
 pub const HOODI: Network = Network {
     chain_id: 560_048,
     key: "hoodi",

@@ -424,8 +424,28 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         if chain_id < 0 {
             return err(format!("chain {chain_id} is not a valid chain id"));
         }
-        match self.with_state(|st| st.settings.set_active_chain(chain_id as u64).map_err(|e| e.to_string()))
-        {
+        match self.with_state(|st| {
+            // Refuse while a send is awaiting approval. The human is looking at a request
+            // naming one network; letting the active chain move under it means they approve
+            // for a chain the wallet has already left.
+            let pending: Vec<(String, u64)> = st
+                .jobs
+                .read()
+                .map_err(|_| "job lock poisoned".to_string())?
+                .values()
+                .filter(|j| !j.status.is_terminal())
+                .map(|j| (j.request_id.clone(), j.chain_id))
+                .collect();
+            if let Some((id, pending_chain)) = pending.first() {
+                let name = networks::by_chain_id(*pending_chain)
+                    .map(|n| n.name.to_string())
+                    .unwrap_or_else(|| pending_chain.to_string());
+                return Err(format!(
+                    "cannot switch network while a send is awaiting approval on {name} ({id})"
+                ));
+            }
+            st.settings.set_active_chain(chain_id as u64).map_err(|e| e.to_string())
+        }) {
             Ok(s) => {
                 emit_active_chain_changed(chain_id);
                 json!({ "ok": true, "activeChainId": s.active_chain_id }).to_string()
