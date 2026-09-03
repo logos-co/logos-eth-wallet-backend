@@ -3,6 +3,10 @@
 //! The set matches `verified_proxy_module`'s `networkProfiles()` whitelist, so every
 //! selectable network is light-client-verifiable. Adding a fourth here without adding it
 //! there gives the user a verified-proxy toggle that cannot work.
+//!
+//! There is deliberately no `explorer` field. Nothing ever fetched or opened one, so its
+//! removal closes no live leak — it removes the loaded gun a live explorer URL leaves for
+//! whoever next adds a "view on explorer" button that would disclose the user's IP.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +19,6 @@ pub struct Network {
     pub name: &'static str,
     pub native_symbol: &'static str,
     pub testnet: bool,
-    pub explorer: &'static str,
 }
 
 pub const MAINNET: Network = Network {
@@ -24,7 +27,6 @@ pub const MAINNET: Network = Network {
     name: "Ethereum",
     native_symbol: "ETH",
     testnet: false,
-    explorer: "https://etherscan.io",
 };
 
 pub const SEPOLIA: Network = Network {
@@ -33,20 +35,16 @@ pub const SEPOLIA: Network = Network {
     name: "Sepolia",
     native_symbol: "ETH",
     testnet: true,
-    explorer: "https://sepolia.etherscan.io",
 };
 
-// Hoodi's explorer is not verified from an authoritative source yet; see tokens.rs for the
-// same discipline applied to token addresses. Multicall3 IS confirmed present here — its
-// bytecode is byte-identical to mainnet's (sha256 0fb6a9db…) and aggregate3 answers live —
-// so the balance path works on all three networks.
+// Multicall3 IS confirmed present here — its bytecode is byte-identical to mainnet's
+// (sha256 0fb6a9db…) and aggregate3 answers live — so the balance path works on all three.
 pub const HOODI: Network = Network {
     chain_id: 560_048,
     key: "hoodi",
     name: "Hoodi",
     native_symbol: "ETH",
     testnet: true,
-    explorer: "",
 };
 
 pub const ALL: [Network; 3] = [MAINNET, SEPOLIA, HOODI];
