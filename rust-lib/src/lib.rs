@@ -1,0 +1,36 @@
+//! eth_wallet_backend — an Ethereum-only wallet coordinator.
+//!
+//! Exactly one network is active at a time, chosen from mainnet, sepolia and hoodi. The
+//! token table is fixed (native ETH plus WETH where its address has been verified) and
+//! there are no user-added tokens. Fees come from `fee_module`, JSON-RPC from
+//! `eth_rpc_module`, and signatures are *requested* from `keystore_module` and authorised
+//! by a human in `signer_ui` — no key material reaches this module.
+//!
+//! Everything below is plain Rust with no Logos runtime and is unit-tested with
+//! `cargo test --no-default-features`; the glue lives behind the default `logos_module`
+//! feature.
+
+pub mod budget;
+pub mod depinit;
+pub mod details;
+pub mod gate;
+pub mod history;
+pub mod networks;
+pub mod receipt;
+pub mod send;
+pub mod settings;
+pub mod sweep;
+pub mod tokens;
+pub mod txbuild;
+pub mod units;
+pub mod verified;
+
+pub use history::{History, TxRecord};
+pub use networks::Network;
+pub use receipt::TokenTransfer;
+pub use send::{NonceReserver, SendJob, SendLedger, SendStatus};
+pub use settings::{NetworkSettings, Settings, SettingsError, SettingsStore};
+pub use tokens::Token;
+
+#[cfg(feature = "logos_module")]
+mod glue;

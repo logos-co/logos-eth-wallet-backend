@@ -1,0 +1,80 @@
+name: eth_wallet_backend Unit Tests
+
+# The whole pure core of the wallet coordinator, run on every change.
+#
+# Nothing else here can go red. The doctests drive a real daemon against a live
+# chain, so they cannot run on a PR; `nix build` proves the module links, which
+# says nothing about whether a nonce is ever handed out twice or a refused gate
+# loses a send. Those are the questions rust-lib/tests/ exists to answer, and
+# until this workflow they were only ever asked on a developer's laptop.
+#
+# `--no-default-features` drops the `logos_module` glue, and with it the
+# logos-rust-sdk path dependency — so this needs no nix, no module host and no
+# network beyond crates.io. (nix's own fetcher gets 403s from crates.io; plain
+# cargo does not.)
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # Matches rust-version in rust-lib/Cargo.toml, itself pinned to the nix
+        # toolchain — so a test passing here cannot fail the real build on MSRV.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Provide the SDK manifest cargo insists on resolving
+        # `--no-default-features` drops the logos_module feature, so the SDK is
+        # never COMPILED here -- but cargo still resolves the manifest of an
+        # optional path dependency, and `logos-rust-sdk-src` is gitignored
+        # because the nix builder stages it at build time. Without this the job
+        # dies before running a single test:
+        #   failed to load manifest for dependency `logos-rust-sdk`
+        # Any rev at 0.3.0 serves, which is what Cargo.lock records; nothing
+        # from it is built.
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --no-default-features
+        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+
+      - name: The source-shape guards must actually be present
+        # Six files under rust-lib/tests/ assert things about the SHAPE of
+        # src/glue.rs rather than about a value it returns: that no outbound
+        # call is made under a lock, that the gate cache is opened by an arm and
+        # by nothing else, that every declared event is fired somewhere. A guard
+        # like that goes green the moment it stops being compiled, and green is
+        # exactly what it looks like when it has been deleted -- so name one
+        # test from each file rather than trusting the run above.
+        run: |
+          out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
+          for t in no_broadcast_is_ever_settled_by_request_id \
+                   only_an_arm_opens_the_cache \
+                   no_restart_hands_out_a_number_whose_transaction_may_have_left \
+                   a_send_the_gate_refused_is_still_a_live_send \
+                   every_event_this_module_declares_is_emitted_somewhere \
+                   the_relay_arms_once_listens_off_thread_and_closes_its_own_window; do
+            echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
+          done
+          n=$(echo "$out" | grep -c ': test$')
+          echo "tests: $n"; [ "$n" -ge 332 ]

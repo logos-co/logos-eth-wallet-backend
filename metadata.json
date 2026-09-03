@@ -1,0 +1,27 @@
+{
+  "name": "eth_wallet_backend",
+  "display_name": "Ethereum Wallet Backend",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "description": "Ethereum-only wallet coordinator: one active network at a time, a fixed token table, balances, Send with full fee control, and local transaction history.",
+  "author": "Logos Core Team",
+  "main": "eth_wallet_backend_plugin",
+  "dependencies": ["eth_rpc_module", "fee_module", "keystore_module", "token_list_module"],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": {
+      "crate": "rust-lib",
+      "trait": "EthWalletBackendModule",
+      "source": "src/glue.rs"
+    }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}
