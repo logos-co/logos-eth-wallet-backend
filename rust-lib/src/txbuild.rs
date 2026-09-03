@@ -71,6 +71,23 @@ pub fn erc20_symbol_calldata() -> Vec<u8> {
     IERC20::symbolCall {}.abi_encode()
 }
 
+/// Parse an EVM quantity written either as `0x`-hex or as decimal. Nodes answer hex,
+/// this wallet stores decimal, and both reach the same fields.
+///
+/// No digits is `None`, never zero: an empty balance means "we could not read it", and
+/// answering 0 would turn that into a number the user reads as a fact.
+pub fn parse_u256_any(s: &str) -> Option<U256> {
+    let t = s.trim();
+    let (digits, radix) = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(h) => (h, 16),
+        None => (t, 10),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    U256::from_str_radix(digits, radix).ok()
+}
+
 /// Decode a 32-byte ABI `uint256` return (balanceOf).
 pub fn decode_uint256(data: &[u8]) -> Option<U256> {
     if data.len() < 32 {
@@ -185,6 +202,17 @@ mod tests {
     const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 
     #[test]
+    fn a_quantity_parses_from_either_notation_and_nothing_parses_as_zero() {
+        assert_eq!(parse_u256_any("0x5208"), Some(U256::from(21_000u64)));
+        assert_eq!(parse_u256_any(" 21000 "), Some(U256::from(21_000u64)));
+        assert_eq!(parse_u256_any("0x0"), Some(U256::ZERO));
+        // An unread balance is empty. Answering 0 would report "you have none" as a fact.
+        assert_eq!(parse_u256_any(""), None);
+        assert_eq!(parse_u256_any("0x"), None);
+        assert_eq!(parse_u256_any("twenty"), None);
+    }
+
+    #[test]
     fn erc20_transfer_selector_and_args() {
         let data = erc20_transfer_calldata(ALICE, U256::from(1_000_000u64));
         // transfer(address,uint256) selector
@@ -233,6 +261,19 @@ mod tests {
         assert_eq!(tx["gas_limit"], "0x5208");
         assert_eq!(tx["fee_mode"], "eip1559");
         assert_eq!(tx["data"], "0x");
+    }
+
+    /// What the intent row records is the transaction's own `data`. A native send's is "0x",
+    /// which is a fact and not a missing value — it is what makes it a plain transfer.
+    #[test]
+    fn the_calldata_an_intent_row_records_is_the_transactions_own() {
+        let fee = Fee::Eip1559 {
+            max_fee_per_gas: U256::from(2_000_000_000u64),
+            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+        };
+        assert_eq!(unsigned_native_tx(ALICE, U256::from(1_000u64), 7, 21_000, &fee)["data"], "0x");
+        let erc20 = unsigned_erc20_tx(USDC, ALICE, U256::from(42u64), 7, 60_000, &fee);
+        assert!(erc20["data"].as_str().unwrap().starts_with("0xa9059cbb"), "transfer selector");
     }
 
     #[test]
