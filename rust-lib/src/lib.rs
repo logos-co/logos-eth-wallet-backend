@@ -10,17 +10,26 @@
 //! `cargo test --no-default-features`; the glue lives behind the default `logos_module`
 //! feature.
 
+pub mod budget;
+pub mod depinit;
+pub mod details;
+pub mod gate;
 pub mod history;
 pub mod networks;
+pub mod receipt;
 pub mod send;
 pub mod settings;
+pub mod sweep;
 pub mod tokens;
 pub mod txbuild;
+pub mod units;
+pub mod verified;
 
 pub use history::{History, TxRecord};
 pub use networks::Network;
-pub use send::{NonceReserver, SendJob, SendStatus};
-pub use settings::{NetworkSettings, Settings, SettingsError, SettingsStore, VerifiedProxyMode};
+pub use receipt::TokenTransfer;
+pub use send::{NonceReserver, SendJob, SendLedger, SendStatus};
+pub use settings::{NetworkSettings, Settings, SettingsError, SettingsStore};
 pub use tokens::Token;
 
 #[cfg(feature = "logos_module")]
