@@ -1,8 +1,10 @@
 //! A Tier A approver, so a send can be driven to a real signature without a GUI.
 //!
-//! Configure it as the keystore's approver (`{"approver":"approver_probe"}` in
-//! `keystore.json`) and it can do exactly what a human in `signer_ui` does: claim the
-//! request, read back the bundle id the keystore authored, and approve that exact id.
+//! Name it the keystore's approver — there is no config file, so a spec has to make the call
+//! itself: `configure({"approver":"approver_probe","custodian":"..."})`. That document is
+//! TOTAL, so a spec that names only the approver leaves Tier D held by nobody and its own
+//! setup then refuses. Named, the probe does exactly what a human in `signer_ui` does: claim
+//! the request, read back the bundle id the keystore authored, and approve that exact id.
 
 use serde_json::{json, Value};
 
