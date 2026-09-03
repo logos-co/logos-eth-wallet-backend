@@ -436,10 +436,10 @@ fn an_outbound_call_reached_through_a_helper_is_caught() {
     let mutant = mutate(
         GLUE,
         "guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
-        "let _ = self.verified_gate(1);\n        guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
+        "let _ = self.verified_gate_within(1, b);\n        guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
     );
     let e = check_no_call_under_a_lock(&mutant).unwrap_err();
-    assert!(e.contains("self.verified_gate()"), "{e}");
+    assert!(e.contains("self.verified_gate_within()"), "{e}");
 
     let code = code_only(&mutant);
     assert!(
@@ -514,17 +514,12 @@ fn handing_back_a_borrow_instead_of_a_handle_is_caught() {
 /// Every outbound call carries a deadline, except these — each one a decision, not an
 /// oversight. A new unbounded call fails this test and has to be argued for here.
 const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
-    // The gate probe, on the paths where a refusal IS the answer: an expiring budget there
-    // freezes the wallet by its own deadline rather than by anything the proxy said. The
-    // sweep and the two paths a BUTTON drives use the bounded twin — see section 9.
-    ("eth_rpc_module", "verified_proxy_status", "a deadline here refuses, it does not degrade"),
     // The one call that moves money. A deadline does not stop the transaction, it only stops
     // us learning its hash.
     ("eth_rpc_module", "send_raw_transaction", "a broadcast with an unknown outcome is worse"),
-    // One call each, so the per-call cap would be the whole allowance and the protocol
-    // default already is one. Untouched by the pass that budgeted the multi-call paths.
-    ("eth_rpc_module", "call", "get_balances is a single Multicall3 round trip"),
-    ("fee_module", "suggest_fees", "a passthrough, one call"),
+    // One call each, and neither sits behind a gate — "one call" stopped being an argument
+    // for the protocol's 20s default the moment a probe could already have spent twenty of
+    // its own in front of it. See section 12.
     ("keystore_module", "list_accounts", "a passthrough, one call"),
     ("keystore_module", "get_labels", "a passthrough, one call"),
     // Not a call at all: it arms an `EventSubscription` and the generated client emits no
@@ -532,6 +527,9 @@ const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
     // which is meant to outlive every call this module makes.
     ("keystore_module", "on_accounts_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_verified_proxy_mode_changed", "a subscription has no bounded twin"),
+    // Neither is the status watcher: it installs a callback and returns, and the C side
+    // replays the current state from inside the call rather than waiting on the provider.
+    ("eth_rpc_module", "on_subscription_status", "installs a callback; nothing is dispatched"),
     ("eth_rpc_module", "on_chain_config_changed", "a subscription has no bounded twin"),
     ("token_list_module", "on_tokens_updated", "a subscription has no bounded twin"),
 ];
@@ -1188,4 +1186,216 @@ fn a_reply_that_names_only_the_symbol_is_caught() {
     );
     let e = check_a_send_names_one_contract(&mutant).unwrap_err();
     assert!(e.contains("WHICH contract"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------
+// 12. Every gated path is bounded across its gate.
+// ---------------------------------------------------------------------------------------
+
+/// Section 9 bounded the two paths a BUTTON drives and left the other four gate sites on the
+/// unbounded probe, which the protocol ABI answers with its 20s default. `get_balances` was
+/// the worst: `READ_BUDGET`, then up to 20s of gate, then an untimed Multicall3 — some
+/// forty-four seconds of frozen wallet, and every gated read pays that probe now the cache is
+/// latched cold. So the rule is about every gated door, not two of them.
+const GATED: &[(&str, &str)] = &[
+    ("get_balances", "BALANCES_BUDGET"),
+    ("prepare_send", "SEND_BUDGET"),
+    ("send", "SEND_BUDGET"),
+    ("advance_send", "SEND_BUDGET"),
+    ("suggest_fees", "FEES_BUDGET"),
+    ("verified_proxy_state", "VERDICT_BUDGET"),
+    ("refresh_one", "REFRESH_BUDGET"),
+    ("tx_details", "DETAILS_BUDGET"),
+];
+
+fn check_gated_paths_are_bounded(src: &str) -> Result<(), String> {
+    let code = code_only(src);
+    let fns = functions(&code);
+    // The unbounded twins are deleted rather than merely unused, so a call to one is a
+    // compile error in the nix build. This is what says so under `cargo test`, which never
+    // compiles this file at all.
+    for call in ["self.verified_gate(", "self.verified_verdict("] {
+        if let Some(at) = sites(&code, call).first() {
+            return Err(format!(
+                "glue.rs:{} calls the unbounded `{call}`, which the protocol ABI answers with \
+                 its 20s default. Take a Budget and spend the gate out of it.",
+                line_of(src, *at)
+            ));
+        }
+    }
+    for (name, budget) in GATED {
+        for body in bodies_of(&fns, &code, name) {
+            let gate = body
+                .find("verified_gate_within")
+                .or_else(|| body.find("verified_verdict_within"))
+                .ok_or_else(|| format!("`{name}` no longer gates"))?;
+            let taken = body
+                .find(&format!("Budget::new({budget})"))
+                .ok_or_else(|| format!("`{name}` no longer takes a {budget}"))?;
+            if taken > gate {
+                return Err(format!(
+                    "`{name}` takes its {budget} AFTER the gate, so the gate is outside the \
+                     allowance and the method is bounded by nothing a user can feel."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_gated_path_takes_its_allowance_before_the_gate() {
+    check_gated_paths_are_bounded(GLUE).unwrap();
+}
+
+/// The finding itself: a gate site left on the unbounded probe.
+#[test]
+fn a_gate_site_left_on_the_unbounded_probe_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "if let Err(v) = self.verified_gate_within(chain_id, &b) {\n            return blocked(&v).to_string();\n        }\n        let owner",
+        "if let Err(v) = self.verified_gate(chain_id) {\n            return blocked(&v).to_string();\n        }\n        let owner",
+    );
+    let e = check_gated_paths_are_bounded(&mutant).unwrap_err();
+    assert!(e.contains("calls the unbounded"), "{e}");
+}
+
+/// And the subtler shape: the gate is bounded, but by an allowance opened after it — so it
+/// charges the gate nothing and covers only what follows.
+#[test]
+fn an_allowance_opened_after_the_gate_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "        let b = Budget::new(BALANCES_BUDGET);\n        self.ensure_eth_rpc(&b);",
+        "        self.ensure_eth_rpc(&Budget::new(READ_BUDGET));",
+    );
+    let mutant = mutate(
+        &mutant,
+        "        let owner = match address.trim()",
+        "        let b = Budget::new(BALANCES_BUDGET);\n        let owner = match address.trim()",
+    );
+    let e = check_gated_paths_are_bounded(&mutant).unwrap_err();
+    assert!(e.contains("AFTER the gate"), "{e}");
+}
+
+/// The read BEHIND the gate. One call, so a per-call cap and the aggregate are the same
+/// number — but "one call" was also the argument for leaving `get_balances`'s Multicall3 at
+/// the protocol default, on top of a gate that could already have spent twenty seconds.
+#[test]
+fn the_read_behind_the_gate_is_bounded_too() {
+    let mutant = mutate(
+        GLUE,
+        ".call_with_timeout(chain_id as i64, &payload, t)",
+        ".call(chain_id as i64, &payload)",
+    );
+    let e = check_calls_are_bounded(&mutant).unwrap_err();
+    assert!(e.contains("eth_rpc_module.call with no deadline"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------
+// 13. Nothing broadcasts through a gate that has closed.
+// ---------------------------------------------------------------------------------------
+
+/// The window. `send` passes the gate and the job then sits `awaitingApproval` while a human
+/// decides — seconds to minutes. If the proxy goes unusable in there, or the mode flips to
+/// `required`, the poll that finally broadcasts used to re-check nothing: the transaction
+/// left through a route the gate would refuse, carrying a nonce and a fee read taken while it
+/// was still open.
+///
+/// Two halves, and the second is the one that must not be got wrong. The gate sits between
+/// the signature and `claim_broadcast` — as late as a check can be and still be in front of
+/// the money. And its refusal touches NOTHING: no claim, no record, no settle, so the job
+/// stays `awaitingApproval` with its nonce reserved and the next poll resumes it. A refusal
+/// here is not a failed send; the transaction never left.
+fn check_the_broadcast_is_gated(src: &str) -> Result<(), String> {
+    let code = code_only(src);
+    let fns = functions(&code);
+    let body = bodies_of(&fns, &code, "advance_send")[0];
+    let gate = body.find("verified_gate_within").ok_or(
+        "`advance_send` reaches `broadcast` with no verified gate. The gate `send` passed can \
+         close while a human is approving, and this is the poll that moves the money.",
+    )?;
+    let claim = body.find("claim_broadcast").ok_or("`advance_send` no longer claims the broadcast")?;
+    if gate > claim {
+        return Err("`advance_send` gates AFTER the broadcast is claimed, so the claim — and \
+                    the burnt nonce with it — is taken on a route the gate would refuse."
+            .into());
+    }
+    let arm = &body[gate..block_end(body, gate)];
+    for (touch, why) in [
+        ("claim_broadcast", "claims the broadcast"),
+        ("record_intent", "writes the write-ahead record"),
+        ("settle", "settles the job"),
+    ] {
+        if arm.contains(touch) {
+            return Err(format!(
+                "the refusal arm {why}. A closed gate is not a failed send — the transaction \
+                 never left — so the job keeps its nonce and stays resumable."
+            ));
+        }
+    }
+    if arm.contains("blocked(") {
+        return Err("the refusal answers `ok: false`, which a poller reads as a failed send: \
+                    it drops the request id and orphans a job still holding its nonce. \
+                    `held_by_the_gate` is the shape that keeps the poll coming back."
+            .into());
+    }
+    if !arm.contains("job_reply") {
+        return Err("the refusal does not answer with the job as it stands, so a poller cannot \
+                    tell a held send from a lost one"
+            .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_broadcast_is_gated_and_a_refusal_leaves_the_send_resumable() {
+    check_the_broadcast_is_gated(GLUE).unwrap();
+}
+
+/// The defect as it stood: `send` gates, `send_status` does not, and the poll behind it
+/// broadcasts.
+#[test]
+fn an_ungated_broadcast_is_caught() {
+    let mutant = mutate(GLUE, "self.verified_gate_within(job.chain_id, &b)", "Ok::<(), Value>(())");
+    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
+    assert!(e.contains("no verified gate"), "{e}");
+}
+
+/// The gate present but behind the claim: the nonce is burnt and the job is unsettleable by
+/// anyone but the ticket holder before anything asks whether the send may go out at all.
+#[test]
+fn a_gate_taken_after_the_claim_is_caught() {
+    const ARM: &str = "if let Err(v) = self.verified_gate_within(job.chain_id, &b) {\n            // Re-read: a cancel may have landed while the probe was out.\n            let now_job = st.sends.get(request_id).unwrap_or(job);\n            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));\n        }\n";
+    let mutant = mutate(GLUE, ARM, "");
+    let mutant = mutate(&mutant, "        // WRITE AHEAD.", &format!("        {ARM}\n        // WRITE AHEAD."));
+    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
+    assert!(e.contains("AFTER the broadcast is claimed"), "{e}");
+}
+
+/// The refusal that corrupts the ledger: a closed gate reported as a failed send. The job
+/// goes terminal for a transaction that never left, and every later poll then reports a send
+/// that failed rather than one waiting on a proxy to come back.
+#[test]
+fn a_refusal_that_fails_the_send_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "            let now_job = st.sends.get(request_id).unwrap_or(job);\n            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));",
+        "            let reason = \"the verified proxy is not usable\".to_string();\n            return self.settle(&st, request_id, SendStatus::Failed { reason });",
+    );
+    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
+    assert!(e.contains("settles the job"), "{e}");
+}
+
+/// And the refusal that orphans it: `ok: false` stops the poll, so the job is left
+/// non-terminal, holding its nonce, with nothing left driving it.
+#[test]
+fn a_refusal_that_reads_as_a_failure_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "            let now_job = st.sends.get(request_id).unwrap_or(job);\n            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));",
+        "            return Ok(blocked(&v));",
+    );
+    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
+    assert!(e.contains("orphans a job"), "{e}");
 }

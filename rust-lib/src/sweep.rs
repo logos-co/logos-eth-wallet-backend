@@ -28,6 +28,10 @@ pub const GAS_PRICE_UNIT: &str = "gwei";
 pub struct SweepOutcome {
     pub polled: usize,
     pub changed: usize,
+    /// Receipts the store refused to write. The rows are unmoved and due again next sweep;
+    /// disclosed so a wallet stuck on a full or read-only disk says why rather than showing
+    /// `pending` for ever.
+    pub unstored: usize,
     /// Rows skipped because their own chain's proxy is blocking: chain -> (hashes, verdict).
     /// A bare count leaves a frozen row on a non-active chain with nothing to explain it.
     pub blocked: BTreeMap<u64, (Vec<String>, Value)>,
@@ -197,7 +201,7 @@ pub fn history_reply(
         .collect();
     json!({ "ok": true, "chainId": chain_id, "address": address,
             "transactions": transactions, "stillDue": still_due,
-            "stillDueAnyChain": out.still_due,
+            "stillDueAnyChain": out.still_due, "unstored": out.unstored,
             "unresolved": unresolved_json(&mine),
             "blockedChains": out.blocked_json() })
 }
@@ -283,6 +287,20 @@ mod tests {
         assert!(v["transactions"].as_array().unwrap().is_empty(), "the row is another chain's");
         assert_eq!(v["stillDue"], json!(false), "nothing on this screen can move");
         assert_eq!(v["stillDueAnyChain"], json!(true), "but the sweep still has work");
+    }
+
+    /// A receipt the store refused leaves its row pending and due again, so the count is
+    /// disclosed: without it a wallet on a full or read-only disk shows `pending` for ever
+    /// and says why nowhere at all.
+    #[test]
+    fn receipts_the_store_refused_are_counted_in_the_reply() {
+        let now = 1_000_000;
+        let out = SweepOutcome { unstored: 1, still_due: true, ..Default::default() };
+        let v = history_reply("0xaaaa", 1, &[pending(1, "0xaaa", now - 10)], now, &out, &[]);
+        assert_eq!(v["unstored"], json!(1));
+
+        let clean = history_reply("0xaaaa", 1, &[], now, &SweepOutcome::default(), &[]);
+        assert_eq!(clean["unstored"], json!(0), "and a clean sweep says zero, not nothing");
     }
 
     #[test]

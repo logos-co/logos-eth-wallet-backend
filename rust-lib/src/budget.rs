@@ -28,10 +28,26 @@ pub const RPC_BUDGET: Duration = Duration::from_secs(3);
 pub const READ_BUDGET: Duration = Duration::from_secs(4);
 pub const STARTUP_BUDGET: Duration = Duration::from_secs(6);
 
-/// A send's own outbound work: the quote's fee, balance and nonce reads plus registering the
-/// approval. Larger than a read because a wrong quote is worse than a slow one — the figure
-/// a human is about to approve must not be shortened into an error.
-pub const SEND_BUDGET: Duration = Duration::from_secs(12);
+/// A send's own outbound work: the verified gate, the quote's fee, balance and nonce reads,
+/// and registering the approval. Larger than a read because a wrong quote is worse than a
+/// slow one — the figure a human is about to approve must not be shortened into an error.
+/// It grew by exactly one `PROBE_BUDGET` when the gate moved inside it, so the quote kept
+/// the allowance it already had.
+pub const SEND_BUDGET: Duration = Duration::from_millis(13_500);
+
+/// One `get_balances`: the lazy eth_rpc retry, the verified gate, and the single Multicall3
+/// read that answers every row. The gate is INSIDE it — an unbounded probe in front of a
+/// read is time a user waits that no budget can see — and it is sized so the gate and the
+/// read both fit, because a balance list cannot degrade the way a network row can.
+pub const BALANCES_BUDGET: Duration = Duration::from_secs(6);
+
+/// One `suggest_fees`: the verified gate and one `fee_module` estimate.
+pub const FEES_BUDGET: Duration = Duration::from_secs(5);
+
+/// One `verified_proxy_state`: the verdict probe alone. A report rather than a gate — here
+/// the verdict IS the answer — but a chip polling every five seconds must not be able to
+/// outlast its own interval.
+pub const VERDICT_BUDGET: Duration = Duration::from_secs(2);
 
 /// One receipt sweep: up to `SWEEP_MAX` receipts plus a verdict per distinct chain. The
 /// worst offender before this existed — eleven calls at the 20s protocol default.
@@ -118,17 +134,45 @@ mod tests {
         assert!(walk(SWEEP_BUDGET, &calls) <= SWEEP_BUDGET);
     }
 
-    /// A send: the fee estimate, the native balance, a token balance, the nonce, then the
-    /// approval request.
+    /// A send: the gate, the fee estimate, the native balance, a token balance, the nonce,
+    /// then the approval request.
     #[test]
     fn a_send_is_bounded_across_its_quote_and_its_approval_request() {
-        let mut calls = vec![RPC_BUDGET; 4];
+        let mut calls = vec![PROBE_BUDGET];
+        calls.extend([RPC_BUDGET; 4]);
         calls.push(INIT_BUDGET);
         assert!(calls.iter().sum::<Duration>() > SEND_BUDGET, "the aggregate must bind");
         assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
         // And it must be long enough to make every call it needs, or the budget is the bug:
         // a send that times out mid-quote is a Send button that never works.
         assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
+        // The gate arrived inside the aggregate rather than in front of it, and took nothing
+        // from the quote: a probe's worth is exactly what the total grew by.
+        assert_eq!(SEND_BUDGET - PROBE_BUDGET, Duration::from_secs(12));
+    }
+
+    /// The four gate sites that ran the UNBOUNDED probe. `get_balances` was the worst:
+    /// `READ_BUDGET`, then up to 20s of gate, then an untimed Multicall3 on top.
+    #[test]
+    fn a_balance_read_is_bounded_across_its_gate_and_its_multicall() {
+        let mut calls = vec![INIT_BUDGET; 4];
+        calls.extend([PROBE_BUDGET, RPC_BUDGET]);
+        assert!(calls.iter().sum::<Duration>() > BALANCES_BUDGET, "the aggregate must bind");
+        assert!(walk(BALANCES_BUDGET, &calls) <= BALANCES_BUDGET);
+        // The two calls that actually answer must BOTH fit, gate included, or a wallet whose
+        // dependency is merely slow reports no balances at all.
+        assert!(PROBE_BUDGET + RPC_BUDGET <= BALANCES_BUDGET);
+    }
+
+    #[test]
+    fn the_two_one_call_paths_are_bounded_across_their_gates_too() {
+        for (total, calls) in
+            [(FEES_BUDGET, vec![PROBE_BUDGET, RPC_BUDGET]), (VERDICT_BUDGET, vec![PROBE_BUDGET])]
+        {
+            assert!(walk(total, &calls) <= total);
+            assert!(calls.iter().sum::<Duration>() <= total, "the gate must fit too");
+            assert!(calls.iter().all(|c| slice(total, Duration::ZERO, *c).is_some()));
+        }
     }
 
     /// F-4. The gate is INSIDE the aggregate. It used to run before `Budget::new` at the

@@ -422,3 +422,110 @@ fn a_row_written_before_the_broadcast_and_never_announced_is_caught() {
     let e = check_the_intent_row_is_announced(&mutant).unwrap_err();
     assert!(e.contains("announces 2 of the 3"), "{e}");
 }
+
+// ---------------------------------------------------------------------------------------
+// 6. A settle announces only the status it actually moved.
+// ---------------------------------------------------------------------------------------
+
+/// `settle_locked` answers with the live job on three paths, and only one of them wrote
+/// anything: an outsider settling a claimed broadcast, and a settle arriving after a
+/// terminal status, both get the job back unchanged. Announcing on `Some` alone made
+/// `send_status_changed` mean "someone tried", which is the one thing an event may not mean.
+fn check_a_settle_announces_only_a_move(src: &str) -> Result<(), String> {
+    let code = code_only(src);
+    let fns = functions(&code);
+    for name in ["settle", "settle_owned"] {
+        for body in bodies_of(&fns, &code, name) {
+            let emits = sites(body, "emit_send_status_changed(");
+            if emits.is_empty() {
+                return Err(format!("{name} settles a send and announces nothing"));
+            }
+            for at in emits {
+                let head = enclosing_head(body, at);
+                if !head.contains("changed") {
+                    return Err(format!(
+                        "{name} announces from a block headed `{}` — the ledger answers with \
+                         the live job whether or not this call moved it, so a settle the \
+                         broadcast owner refused, or one that arrived after a terminal \
+                         status, is announced as a state change that never happened.",
+                        head.trim()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn only_a_settle_that_moved_the_status_is_announced() {
+    check_a_settle_announces_only_a_move(GLUE).unwrap();
+}
+
+#[test]
+fn announcing_a_settle_that_lost_the_race_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "            .ok_or_else(|| format!(\"no send with id '{request_id}'\"))?;\n        if s.changed {\n            emit_send_status_changed(&s.job.request_id);\n        }\n",
+        "            .ok_or_else(|| format!(\"no send with id '{request_id}'\"))?;\n        emit_send_status_changed(&s.job.request_id);\n",
+    );
+    let e = check_a_settle_announces_only_a_move(&mutant).unwrap_err();
+    assert!(e.contains("never happened"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------
+// 7. A receipt is announced once it is STORED, not once it is decided.
+// ---------------------------------------------------------------------------------------
+
+/// `apply_receipt` decides the new status in memory and then writes it. Announcing on the
+/// in-memory verdict announces a settle that a refused write left on disk as `pending` — a
+/// subscriber re-reads the row it was told about and finds it unmoved, the sweep re-polls it
+/// forever, and the reply's `changed` count names a transaction nothing settled.
+fn check_a_receipt_is_announced_only_once_stored(src: &str) -> Result<(), String> {
+    let code = code_only(src);
+    let fns = functions(&code);
+    for name in ["sweep", "refresh_one"] {
+        for body in bodies_of(&fns, &code, name) {
+            if !body.contains("apply_receipt(") {
+                return Err(format!("{name} no longer applies receipts — the check is blind"));
+            }
+            for at in sites(body, "emit_tx_status_changed(") {
+                let head = enclosing_head(body, at);
+                if !head.contains("apply_receipt") {
+                    return Err(format!(
+                        "{name} announces a receipt from a block headed `{}`, which is not \
+                         the apply that stored it.",
+                        head.trim()
+                    ));
+                }
+                // `Ok(true)` and `?` are the two shapes that can only be reached by a write
+                // that landed; a bare bool cannot distinguish one from a full disk.
+                if !(head.contains("Ok(true)") || head.contains('?')) {
+                    return Err(format!(
+                        "{name} announces a receipt from a block headed `{}` — that answers \
+                         whether the row moved in memory, not whether the new status reached \
+                         disk, so a write the disk refused is announced as a settle.",
+                        head.trim()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_receipt_is_announced_only_once_it_is_on_disk() {
+    check_a_receipt_is_announced_only_once_stored(GLUE).unwrap();
+}
+
+#[test]
+fn announcing_a_receipt_whose_write_was_refused_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "if st.history.apply_receipt(&rec, &receipt, history::now_secs())? {",
+        "if st.history.apply_receipt(&rec, &receipt, history::now_secs()).unwrap_or_default() {",
+    );
+    let e = check_a_receipt_is_announced_only_once_stored(&mutant).unwrap_err();
+    assert!(e.contains("refused"), "{e}");
+}

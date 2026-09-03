@@ -14,7 +14,11 @@
 //! required without us hearing, and [`ModeCache`] is built so that every such window ends in
 //! [`Gate::Ask`]:
 //!
-//! * nothing is trusted until the subscription is actually live ([`ModeCache::feed_live`]);
+//! * nothing is trusted until the subscription is actually ARMED. Holding a subscription
+//!   handle is not that: the first arm is deferred whenever the provider is not yet
+//!   listening, which is exactly the case a module subscribing from `on_context_ready` is
+//!   in. Only the runtime's per-module status channel says when it happened, so a runtime
+//!   without one ([`status_channel`]) never opens this cache at all;
 //! * going live, and losing the feed, both bump the generation and drop what is held, so a
 //!   read already in flight cannot land its answer afterwards;
 //! * an event applies under the same lock that stamps the generation, so a read that raced it
@@ -24,12 +28,28 @@
 //!
 //! A miss is not a refusal: it falls through to the live read, which refuses on its own if it
 //! cannot be answered. Refusing outright on a cold cache would fail every wallet at startup.
+//!
+//! What arms it is `PluginProxy::on_subscription_status` reporting `SubStatus::Armed` while a
+//! mode subscription exists. That is ONE edge, in `glue.rs::arm_gate`, and a re-subscribe
+//! after a dead feed goes back through it rather than around it — a new subscription is
+//! unarmed at creation, so "the re-subscribe worked" opens nothing. A runtime with no status
+//! channel latches the cache cold instead, and there every gated read pays its own probe.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// eth_rpc's word for a gate that is not enforcing anything. The only mode worth caching.
 pub const MODE_OFF: &str = "off";
+
+/// Whether `protocol_version` has the per-module subscription status channel this cache is
+/// built on (logos-protocol 0.9). Below it the SDK's watcher installs and never fires, so a
+/// cache waiting on `Armed` would wait forever: the caller must latch it cold instead.
+pub fn status_channel(protocol_version: &str) -> bool {
+    let mut it = protocol_version.split('.');
+    let major: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let minor: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (major, minor) >= (0, 9)
+}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Gate {
@@ -46,6 +66,9 @@ struct Inner {
     generation: u64,
     /// Whether the mode subscription is established. False = trust nothing.
     live: bool,
+    /// Latched by [`ModeCache::no_status_channel`]: nothing may make this cache live again
+    /// for the rest of the process.
+    cold: bool,
     off: HashSet<u64>,
 }
 
@@ -70,15 +93,32 @@ impl ModeCache {
         f(&mut g)
     }
 
-    /// The subscription is established. Bumps the generation so a read issued while the feed
-    /// was still dark cannot be trusted retroactively — a mode change in that window was
-    /// announced to nobody.
+    /// The subscription ARMED. Bumps the generation so a read issued while the feed was still
+    /// dark cannot be trusted retroactively — a mode change in that window was announced to
+    /// nobody. Refused outright once [`Self::no_status_channel`] has latched.
     pub fn feed_live(&self) {
         self.with(|i| {
             i.generation += 1;
-            i.live = true;
+            i.live = !i.cold;
             i.off.clear();
         });
+    }
+
+    /// This runtime has no [`status_channel`], so no one can say when the subscription arms
+    /// or dies. Latched cold for the process: every gated read then pays its own live probe,
+    /// which is what it paid before this cache existed.
+    pub fn no_status_channel(&self) {
+        self.with(|i| {
+            i.generation += 1;
+            i.cold = true;
+            i.live = false;
+            i.off.clear();
+        });
+    }
+
+    /// Whether the cold latch has taken: past it nothing can make this cache live again.
+    pub fn latched_cold(&self) -> bool {
+        self.with(|i| i.cold)
     }
 
     /// The subscription ended or could not be built. Everything held is now unverifiable.
@@ -240,6 +280,34 @@ mod tests {
         // A removed chain reports `off`, and off is off — eth_rpc answers exactly that.
         c.told(1, MODE_OFF);
         assert_eq!(c.gate(1), Gate::Open);
+    }
+
+    /// The degradation that decides whether the fallback is a fallback or a dead wallet:
+    /// a runtime with no status channel can never open the cache, and cannot be talked into
+    /// it afterwards by a stray `feed_live` from a subscription handle that merely exists.
+    #[test]
+    fn a_runtime_without_the_status_channel_latches_the_cache_cold() {
+        let c = ModeCache::default();
+        assert!(!c.latched_cold());
+        c.no_status_channel();
+        assert!(c.latched_cold(), "and it is readable, which is what glue.rs is checked on");
+        c.feed_live();
+        c.told(1, MODE_OFF);
+        assert_eq!(c.gate(1), Gate::Ask, "no status channel means no cached answer, ever");
+        // Nor through the read path: an answer that lands cold is still an answer nobody
+        // is obliged to correct.
+        c.learned(1, Some(MODE_OFF), c.ticket());
+        assert_eq!(c.gate(1), Gate::Ask);
+    }
+
+    #[test]
+    fn the_status_channel_arrived_in_protocol_0_9() {
+        for v in ["0.9", "0.9.1", "0.10.0", "1.0.0"] {
+            assert!(status_channel(v), "{v} has the status channel");
+        }
+        for v in ["0.8", "0.8.9", "", "nonsense", "0"] {
+            assert!(!status_channel(v), "{v} has no status channel");
+        }
     }
 
     #[test]

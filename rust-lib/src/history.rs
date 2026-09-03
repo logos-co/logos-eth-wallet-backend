@@ -222,6 +222,17 @@ enum ReadFailure {
     NotHistory,
 }
 
+/// What one stored-row update did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wrote {
+    /// The merged list is on disk.
+    Landed,
+    /// Nothing matched, so nothing was written.
+    Untouched,
+    /// The rows could not be read, or could not be written: the change is NOT durable.
+    Failed,
+}
+
 /// A stored entry: a row we understand, or bytes we do not. An entry that does not parse
 /// costs itself alone — it is carried through every write untouched, so one corrupt entry
 /// can neither hide the file's other transactions nor be deleted by the next write.
@@ -441,9 +452,12 @@ impl History {
 
     /// Read, mutate, write — the shape every update here takes. `f` answers whether it
     /// changed the row; a pass that changed nothing writes nothing.
-    fn edit(&self, address: &str, mut f: impl FnMut(&mut TxRecord) -> bool) -> bool {
+    ///
+    /// The answer is three-valued because a bool cannot carry it: "nothing matched" and "the
+    /// disk refused the write" are both `false`, and only one of them may ever be announced.
+    fn edit(&self, address: &str, mut f: impl FnMut(&mut TxRecord) -> bool) -> Wrote {
         let _g = self.gate.lock();
-        let Ok(mut rows) = self.read(address) else { return false };
+        let Ok(mut rows) = self.read(address) else { return Wrote::Failed };
         let adopted = self.adopt_orphans(address, &mut rows);
         let mut touched = false;
         for r in rows.iter_mut() {
@@ -452,9 +466,13 @@ impl History {
             }
         }
         if !touched {
-            return false;
+            return Wrote::Untouched;
         }
-        self.landed(address, &rows, adopted)
+        if self.landed(address, &rows, adopted) {
+            Wrote::Landed
+        } else {
+            Wrote::Failed
+        }
     }
 
     /// Write the intent to broadcast, BEFORE the signed transaction leaves.
@@ -489,7 +507,7 @@ impl History {
             rec.status = "pending".into();
             rec.timestamp = now;
             true
-        })
+        }) == Wrote::Landed
     }
 
     /// The broadcast did not answer with a hash. The row STAYS `unknown` — an error is not
@@ -502,7 +520,7 @@ impl History {
             }
             rec.unknown_reason = Some(reason.to_string());
             true
-        })
+        }) == Wrote::Landed
     }
 
     /// One record by (address, hash). None when nothing matches. An empty hash matches
@@ -549,16 +567,25 @@ impl History {
         self.list(address).iter().any(|r| is_live(r, now))
     }
 
-    /// Apply a receipt to one record, keyed off the RECORD's own `from` and `hash`,
-    /// never the receipt's. Returns true only when the stored status actually changed.
-    /// Always stamps `last_polled_at`, so an unanswered poll still backs off.
-    pub fn apply_receipt(&self, record: &TxRecord, receipt: &Value, now: u64) -> bool {
+    /// Apply a receipt to one record, keyed off the RECORD's own `from` and `hash`, never
+    /// the receipt's. Always stamps `last_polled_at`, so an unanswered poll still backs off.
+    ///
+    /// `Ok(true)` is a stored status that moved AND reached disk — the only outcome a caller
+    /// may announce. `Err` is a row the disk refused: the receipt is not recorded, the row
+    /// stays as it was, and the next sweep polls it again. Reporting that as a settle is how
+    /// a subscriber gets told to re-read a row that still says `pending`.
+    pub fn apply_receipt(
+        &self,
+        record: &TxRecord,
+        receipt: &Value,
+        now: u64,
+    ) -> Result<bool, String> {
         if record.hash.is_empty() {
-            return false;
+            return Ok(false);
         }
         let status = classify_receipt(receipt);
         let mut changed = false;
-        self.edit(&record.from, |r| {
+        let wrote = self.edit(&record.from, |r| {
             if !r.hash.eq_ignore_ascii_case(&record.hash) {
                 return false;
             }
@@ -570,7 +597,15 @@ impl History {
             }
             true
         });
-        changed
+        match wrote {
+            Wrote::Landed => Ok(changed),
+            // The row is no longer in the store. Nothing moved and nothing failed here.
+            Wrote::Untouched => Ok(false),
+            Wrote::Failed => Err(format!(
+                "the receipt for {} could not be written to this account's history",
+                record.hash
+            )),
+        }
     }
 }
 
@@ -620,6 +655,32 @@ mod tests {
         }
     }
 
+    /// A receipt the store REFUSED is not a settle. `apply_receipt` answered from its
+    /// in-memory verdict and dropped the write's, so a read-only or full history directory
+    /// reported a confirmation the file never took: every emit gate downstream fired, a
+    /// subscriber re-read `pending`, and the row stayed due for ever.
+    #[test]
+    fn a_receipt_the_store_refused_is_not_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = History::new(dir.path().to_path_buf());
+        let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
+        h.add(addr, TxRecord { from: addr.into(), ..rec("0xdead") });
+        let row = h.find(addr, "0xdead").unwrap();
+
+        let hist = dir.path().join("history");
+        let was = std::fs::metadata(&hist).unwrap().permissions();
+        let mut ro = was.clone();
+        ro.set_readonly(true);
+        std::fs::set_permissions(&hist, ro).unwrap();
+        let out = h.apply_receipt(&row, &json!({"status": "0x1"}), 200);
+        // Restored before the assertions, or the failure takes the tempdir's cleanup with it.
+        std::fs::set_permissions(&hist, was).unwrap();
+
+        assert!(out.is_err(), "a receipt the disk refused was reported as a settle: {out:?}");
+        assert_eq!(h.find(addr, "0xdead").unwrap().status, "pending", "the row is unmoved");
+        assert_eq!(h.pending_due(addr, 200, 8).len(), 1, "and is due again on the next sweep");
+    }
+
     #[test]
     fn add_list_find_persist() {
         let dir = tempfile::tempdir().unwrap();
@@ -633,7 +694,7 @@ mod tests {
         assert_eq!(list[0].hash, "0xbeef"); // newest first
 
         let dead = h.find(addr, "0xDEAD").unwrap(); // case-insensitive
-        assert!(h.apply_receipt(&dead, &json!({"status": "0x1"}), 42));
+        assert!(h.apply_receipt(&dead, &json!({"status": "0x1"}), 42).unwrap());
         assert!(h.find(addr, "0xmissing").is_none());
 
         // reopen — persisted + status updated
@@ -725,7 +786,10 @@ mod tests {
             let handles: Vec<_> = (0..8)
                 .map(|_| s.spawn(move || h.apply_receipt(snapshot, confirmed, 1_000)))
                 .collect();
-            handles.into_iter().filter_map(|t| t.join().unwrap().then_some(())).count()
+            handles
+                .into_iter()
+                .filter_map(|t| t.join().unwrap().expect("the write landed").then_some(()))
+                .count()
         });
         assert_eq!(announced, 1, "only the applier that moved the status may emit the event");
         assert_eq!(h.find(addr, "0xrace").unwrap().status, "confirmed");
@@ -741,10 +805,10 @@ mod tests {
         h.add(addr, TxRecord { from: addr.into(), ..rec("0xstale") });
         let snapshot = h.find(addr, "0xstale").unwrap();
 
-        assert!(h.apply_receipt(&snapshot, &json!({ "status": "0x1" }), 1_000));
+        assert!(h.apply_receipt(&snapshot, &json!({ "status": "0x1" }), 1_000).unwrap());
         // The same pending row, applied late: a null receipt is "not mined yet", never a
         // status, so it stamps the poll and leaves `confirmed` alone.
-        assert!(!h.apply_receipt(&snapshot, &Value::Null, 2_000));
+        assert!(!h.apply_receipt(&snapshot, &Value::Null, 2_000).unwrap());
         let row = h.find(addr, "0xstale").unwrap();
         assert_eq!((row.status.as_str(), row.last_polled_at), ("confirmed", 2_000));
     }
@@ -816,12 +880,12 @@ mod tests {
 
         // A receipt with NO `from` must still land: the record's own `from` is the key.
         let one = due.iter().find(|r| r.chain_id == 1).unwrap();
-        assert!(h.apply_receipt(one, &json!({"status": "0x1"}), now));
+        assert!(h.apply_receipt(one, &json!({"status": "0x1"}), now).unwrap());
         assert_eq!(h.list(addr).iter().find(|r| r.chain_id == 1).unwrap().status, "confirmed");
 
         // A null receipt is not an answer: still pending, and last_polled_at moved so it backs off.
         let two = due.iter().find(|r| r.chain_id == 11155111).unwrap();
-        assert!(!h.apply_receipt(two, &Value::Null, now));
+        assert!(!h.apply_receipt(two, &Value::Null, now).unwrap());
         let after = h.list(addr).into_iter().find(|r| r.chain_id == 11155111).unwrap();
         assert_eq!(after.status, "pending");
         assert_eq!(after.last_polled_at, now);
@@ -852,7 +916,7 @@ mod tests {
 
         // A settled row is neither live nor stalled.
         let fresh = h.find(addr, "0xnew").unwrap();
-        h.apply_receipt(&fresh, &json!({"status": "0x1"}), now);
+        h.apply_receipt(&fresh, &json!({"status": "0x1"}), now).unwrap();
         let done = h.find(addr, "0xnew").unwrap();
         assert!(!is_live(&done, now) && !is_stalled(&done, now));
     }
@@ -867,7 +931,7 @@ mod tests {
         let r = h.find(addr, "0xaaa").unwrap();
         let receipt = json!({ "status": "0x1", "blockNumber": "0x4d2",
                               "gasUsed": "0x5208", "effectiveGasPrice": "0x3b9aca00" });
-        assert!(h.apply_receipt(&r, &receipt, 42));
+        assert!(h.apply_receipt(&r, &receipt, 42).unwrap());
 
         let got = h.find(addr, "0xaaa").unwrap();
         assert_eq!(got.block_number, Some(1234));
@@ -899,7 +963,7 @@ mod tests {
                                                     topic(addr), topic(them)],
                                          "data": format!("0x{:064x}", 1_000_000_000_000u64) }] });
         let r = h.find(addr, "0xaaa").unwrap();
-        assert!(h.apply_receipt(&r, &receipt, 42));
+        assert!(h.apply_receipt(&r, &receipt, 42).unwrap());
 
         let got = h.find(addr, "0xaaa").unwrap();
         assert_eq!(got.tx_to.as_deref(), Some(weth), "the transaction's own target");
@@ -924,7 +988,7 @@ mod tests {
                                              "gasUsed": "0x5208",
                                              "effectiveGasPrice": "0x3b9aca00" });
         let a = h.find(addr, "0xaaa").unwrap();
-        assert!(h.apply_receipt(&a, &receipt("0x0"), 42));
+        assert!(h.apply_receipt(&a, &receipt("0x0"), 42).unwrap());
         let got = h.find(addr, "0xaaa").unwrap();
         assert_eq!(got.status, "failed");
         assert_eq!(got.fee_wei.as_deref(), Some("21000000000000"), "the fee still left");
@@ -932,7 +996,7 @@ mod tests {
 
         // The control, on the same numbers: it is the STATUS that decides, not the arithmetic.
         let b = h.find(addr, "0xbbb").unwrap();
-        assert!(h.apply_receipt(&b, &receipt("0x1"), 42));
+        assert!(h.apply_receipt(&b, &receipt("0x1"), 42).unwrap());
         let got = h.find(addr, "0xbbb").unwrap();
         assert_eq!(got.total_wei.as_deref(), Some("31000000000000"), "value plus fee");
     }
@@ -949,14 +1013,14 @@ mod tests {
 
         let bare = json!({ "status": "0x1", "blockNumber": "0x1" });
         let r = h.find(addr, "0xaaa").unwrap();
-        assert!(h.apply_receipt(&r, &bare, 42));
+        assert!(h.apply_receipt(&r, &bare, 42).unwrap());
         assert_eq!(h.find(addr, "0xaaa").unwrap().tx_to, None);
 
         // The status does not change again, so `apply_receipt` answers false — and the row
         // still absorbs. A view keyed on the return value would never see the backfill.
         let full = json!({ "status": "0x1", "blockNumber": "0x1", "to": weth });
         let r = h.find(addr, "0xaaa").unwrap();
-        assert!(!h.apply_receipt(&r, &full, 43));
+        assert!(!h.apply_receipt(&r, &full, 43).unwrap());
         assert_eq!(h.find(addr, "0xaaa").unwrap().tx_to.as_deref(), Some(weth));
     }
 
@@ -971,7 +1035,7 @@ mod tests {
 
         let legacy = json!({ "status": "0x1", "blockNumber": "0x1", "gasUsed": "0x5208" });
         let a = h.find(addr, "0xaaa").unwrap();
-        h.apply_receipt(&a, &legacy, 42);
+        h.apply_receipt(&a, &legacy, 42).unwrap();
         let got = h.find(addr, "0xaaa").unwrap();
         assert_eq!(got.gas_used.as_deref(), Some("21000"));
         assert_eq!((got.effective_gas_price, got.fee_wei, got.total_wei), (None, None, None));
@@ -979,7 +1043,7 @@ mod tests {
         let full = json!({ "status": "0x1", "blockNumber": "0x1",
                            "gasUsed": "0x5208", "effectiveGasPrice": "0x1" });
         let b = h.find(addr, "0xbbb").unwrap();
-        h.apply_receipt(&b, &full, 42);
+        h.apply_receipt(&b, &full, 42).unwrap();
         let got = h.find(addr, "0xbbb").unwrap();
         assert_eq!(got.fee_wei.as_deref(), Some("21000"), "the fee is still wei");
         assert_eq!(got.total_wei, None, "but WETH and ETH do not add up");
@@ -1063,7 +1127,7 @@ mod tests {
         assert!(restarted.pending_due(addr, 1_000, 8).is_empty());
         assert!(!restarted.has_live(addr, 1_000));
         assert!(!is_live(&row, 1_000) && !is_stalled(&row, 1_000_000));
-        assert!(!restarted.apply_receipt(&row, &json!({"status": "0x1"}), 1_000));
+        assert!(!restarted.apply_receipt(&row, &json!({"status": "0x1"}), 1_000).unwrap());
 
         // The hash completes the row rather than adding one — the evidence was already there.
         assert!(h.resolve_broadcast(&proof, "0xdead", 1_000));
@@ -1201,9 +1265,9 @@ mod tests {
         assert_eq!(h.pending_due(addr, now, 3).len(), 3, "capped at the limit");
 
         let confirmed = h.pending_due(addr, now, 1).remove(0);
-        assert!(h.apply_receipt(&confirmed, &json!({"status": "0x1"}), now));
+        assert!(h.apply_receipt(&confirmed, &json!({"status": "0x1"}), now).unwrap());
         // Re-applying the same receipt is not a change, so nothing re-emits.
-        assert!(!h.apply_receipt(&confirmed, &json!({"status": "0x1"}), now + 1));
+        assert!(!h.apply_receipt(&confirmed, &json!({"status": "0x1"}), now + 1).unwrap());
         assert_eq!(h.pending_due(addr, now + 100, 8).len(), 4);
     }
 }

@@ -99,6 +99,23 @@ pub fn weakest_route(labels: &[Option<&str>]) -> String {
         .to_string()
 }
 
+/// A send the gate is holding: the job's own reply, plus why it did not go out.
+///
+/// `ok` stays TRUE and the status is untouched. A poller reads `ok: false` as a failed send —
+/// it drops the request id and stops polling — and that would orphan a job which is still
+/// holding its nonce and can still go out once the proxy is usable again. This says "not
+/// yet", in the one shape that keeps the poll coming back.
+pub fn held_by_the_gate(reply: &Value, verdict: &Value) -> Value {
+    let mut v = reply.clone();
+    v["blocked"] = json!(true);
+    v["reason"] = json!(verdict
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("the verified proxy is not usable"));
+    v["verifiedProxy"] = verdict.clone();
+    v
+}
+
 /// One chain whose blocking proxy froze rows during a sweep: what it cost, which rows, and
 /// the verdict that says why. A row on a NON-active chain is explainable nowhere else —
 /// the view's banner is keyed on the active chain and never mentions this one.
@@ -185,6 +202,26 @@ mod tests {
         assert_eq!(weakest_route(&[Some("verified"), None]), UNKNOWN_ROUTE);
         assert_eq!(weakest_route(&[Some("nonsense")]), UNKNOWN_ROUTE);
         assert_eq!(weakest_route(&[]), UNKNOWN_ROUTE);
+    }
+
+    /// A gate that closes while a human is approving must not read as a failed send: the
+    /// transaction never left, the nonce is still reserved, and the next poll can send it.
+    #[test]
+    fn a_send_the_gate_is_holding_is_still_a_live_send() {
+        let job = json!({ "ok": true, "requestId": "snd_1", "status": "awaitingApproval" });
+        let verdict = json!({ "state": "unhealthy", "blocking": true, "action": "restart_or_reload",
+                              "message": "The verified proxy is not usable." });
+        let held = held_by_the_gate(&job, &verdict);
+        assert_eq!(held["ok"], json!(true), "`ok: false` is what orphans the job");
+        assert_eq!(held["status"], json!("awaitingApproval"), "and what keeps the poll coming");
+        assert_eq!(held["requestId"], json!("snd_1"));
+        assert_eq!(held["blocked"], json!(true));
+        assert_eq!(held["reason"], json!("The verified proxy is not usable."));
+        assert_eq!(held["verifiedProxy"], verdict, "the whole verdict, so nothing is re-derived");
+
+        // A verdict with no sentence of its own still says something a view can render.
+        let bare = held_by_the_gate(&job, &json!({ "blocking": true }));
+        assert!(bare["reason"].as_str().is_some_and(|r| !r.is_empty()));
     }
 
     #[test]

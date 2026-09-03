@@ -124,6 +124,11 @@ exactly one fact, and errs in exactly one direction:
   the subscription stands; going live, losing the feed, and every event stamp a generation, so
   a read already in flight cannot land its answer over newer news; and a mode that is not
   exactly `off` — `required`, `unknown`, a value a future eth_rpc invents — removes the entry.
+* **One edge opens it, and recovery goes back through that edge.** `SubStatus::Armed` from the
+  runtime's per-module subscription status channel, reaching a watcher that already has a mode
+  subscription behind it (`glue.rs::arm_gate`). `Abandoned` is terminal, so a dead feed comes
+  back as a NEW subscription — unarmed at creation, so "the re-subscribe worked" opens nothing.
+  A runtime with no status channel latches the cache cold and pays a live probe per check.
 
 `tests/the_gate_cache_can_only_fail_closed.rs` holds `glue.rs` to that use, each check shipping
 the mutant it must kill; `gate.rs`'s own tests prove the cache's rules in isolation.
@@ -359,6 +364,30 @@ The gate opens on an explicit `blocking: false` and on nothing else. A verdict m
 `state`, missing `blocking`, or carrying either in a shape we do not recognise is a verdict
 we could not read, and an unread verdict blocks — the whole point of the unknown case is to
 fail closed on a shape it does not understand, so it may not have a hole in it.
+
+**Every gate is inside its method's own allowance.** The probe is a cross-process hop and the
+protocol answers an unbounded one with its 20s default, so a gate in FRONT of a budget bounds
+nothing a user can feel: `get_balances` could hold a view for its read budget, then twenty
+seconds of gate, then an untimed Multicall3 on top. There is now one allowance per entry
+point, taken before the gate and spent by everything behind it, and no unbounded probe left
+to reach for — a budget the probe outruns still refuses, because its verdict is `blocking`
+and a timeout is not permission.
+
+**The broadcast is gated in its own right.** `send` passing the gate proves nothing by the
+time the signature comes back: a human spends seconds or minutes in the signer, and the proxy
+can go unusable or the mode flip to `required` in that window. `send_status` checks again
+immediately before it claims the broadcast — as late as a check can be and still be in front
+of the money.
+
+A refusal there is **not** a failed send: the transaction never left. The job is left exactly
+as it stood — `awaitingApproval`, nothing claimed, nothing recorded, its nonce still reserved
+— and the reply carries `blocked: true`, a `reason` and the whole `verifiedProxy` verdict with
+`ok` still true and the status unchanged, which is what keeps a poller coming back. The next
+poll sends it once the proxy is usable; `cancel_send` is still open in the meantime, and is
+what stops a proxy that never returns from wedging the account. Marking it `failed` instead
+would hand its number to the next send while a transaction signed at that number is still
+waiting to leave — `tests/a_closed_gate_holds_a_send_it_does_not_lose_it.rs` drives the
+ledger through exactly that.
 
 ## What was actually proved
 

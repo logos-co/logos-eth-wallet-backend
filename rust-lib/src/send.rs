@@ -539,12 +539,12 @@ impl SendLedger {
     /// Apply a terminal status to the LIVE job. A job another dispatch already settled comes
     /// back untouched — the first terminal state wins — and so does one whose broadcast is
     /// claimed: past that point only the ticket holder may settle it.
-    pub fn settle(&self, request_id: &str, status: SendStatus) -> Option<SendJob> {
+    pub fn settle(&self, request_id: &str, status: SendStatus) -> Option<Settled> {
         settle_locked(&mut self.lock(), request_id, status, None)
     }
 
     /// Settle the job this ticket owns. The only door open once a broadcast is claimed.
-    pub fn settle_owned(&self, t: &BroadcastTicket, status: SendStatus) -> Option<SendJob> {
+    pub fn settle_owned(&self, t: &BroadcastTicket, status: SendStatus) -> Option<Settled> {
         settle_locked(&mut self.lock(), &t.request_id, status, Some(t.ticket))
     }
 
@@ -587,7 +587,10 @@ impl SendLedger {
         if job.broadcast_started() {
             return Err("this send is being broadcast and can no longer be cancelled".into());
         }
+        // Unconditionally a move: the two guards above are exactly the paths on which
+        // `settle_locked` writes nothing, so this door's caller always has something to say.
         settle_locked(&mut l, request_id, SendStatus::Cancelled, None)
+            .map(|s| s.job)
             .ok_or_else(|| format!("no send with id '{request_id}'"))
     }
 
@@ -625,6 +628,23 @@ impl SendLedger {
     }
 }
 
+/// What a settle did: whatever the ledger holds NOW, and whether this call is what moved it.
+/// Two of `settle_locked`'s three answers write nothing — an outsider settling a claimed
+/// broadcast, and a settle arriving after a terminal status — and both must still report the
+/// job, because that reply is what tells a stale caller the truth. Only `changed` may be
+/// announced.
+#[derive(Clone, Debug)]
+pub struct Settled {
+    pub job: SendJob,
+    pub changed: bool,
+}
+
+impl Settled {
+    fn unmoved(job: &SendJob) -> Self {
+        Self { job: job.clone(), changed: false }
+    }
+}
+
 /// Apply `status` to the live job. `ticket` is the broadcast owner's proof, `None` every
 /// other door.
 ///
@@ -637,22 +657,25 @@ fn settle_locked(
     request_id: &str,
     status: SendStatus,
     ticket: Option<u64>,
-) -> Option<SendJob> {
+) -> Option<Settled> {
     let is_broadcast = matches!(status, SendStatus::Broadcast { .. });
     let out = {
         let job = l.jobs.get_mut(request_id)?;
         let owner = job.broadcast.map(|b| b.ticket);
         if owner.is_some() && owner != ticket {
-            return Some(job.clone());
+            return Some(Settled::unmoved(job));
         }
         let correcting = is_broadcast
             && ticket.is_some()
             && !matches!(job.status, SendStatus::Broadcast { .. });
         if job.status.is_terminal() && !correcting {
-            return Some(job.clone());
+            return Some(Settled::unmoved(job));
         }
+        // Read before the write: re-affirming a status the job already holds moves nothing,
+        // and an event for it is a subscriber re-reading what it was already told.
+        let changed = job.status != status;
         job.status = status;
-        job.clone()
+        Settled { job: job.clone(), changed }
     };
     // The new status is already written, so this job counts itself out of `held` if it can
     // let go — and counts itself in for ever if it ever broadcast.
@@ -910,7 +933,7 @@ mod tests {
 
     /// What the claim owner does when `send_raw_transaction` comes back with a hash.
     fn broadcast(l: &SendLedger, t: &BroadcastTicket, hash: &str) -> SendJob {
-        l.settle_owned(t, bcast(hash)).unwrap()
+        l.settle_owned(t, bcast(hash)).unwrap().job
     }
 
     fn committed(l: &SendLedger, request_id: &str, nonce: u64) {
@@ -1092,15 +1115,48 @@ mod tests {
     fn the_first_terminal_state_wins_and_a_stale_caller_is_told_the_truth() {
         let l = SendLedger::default();
         committed(&l, "snd_1", 5);
-        assert_eq!(l.settle("snd_1", SendStatus::Rejected).unwrap().status, SendStatus::Rejected);
+        assert_eq!(l.settle("snd_1", SendStatus::Rejected).unwrap().job.status, SendStatus::Rejected);
         let late = l
             .settle("snd_1", SendStatus::Failed { reason: "the keystore lost it".into() })
-            .unwrap();
+            .unwrap()
+            .job;
         assert_eq!(late.status, SendStatus::Rejected, "the reply reports what actually happened");
         assert_eq!(l.outstanding(1, "0xaaaa"), 0, "and the nonce is released exactly once");
         assert!(l.settle("snd_missing", SendStatus::Cancelled).is_none());
     }
 
+
+    /// A settle that moved nothing is not a state change. `settle_locked` answers with the
+    /// live job on three paths and writes on only one of them, and announcing on `Some`
+    /// alone made `send_status_changed` mean "someone tried" — which is the one thing an
+    /// event may not mean.
+    #[test]
+    fn a_settle_onto_a_terminal_status_moved_nothing_and_is_not_announced() {
+        let l = SendLedger::default();
+        committed(&l, "snd_1", 5);
+        let moved = l.settle("snd_1", SendStatus::Rejected).unwrap();
+        assert!(moved.changed, "awaitingApproval -> rejected is a move, and is announced");
+
+        let again = l.settle("snd_1", SendStatus::Rejected).unwrap();
+        assert_eq!(again.job.status, SendStatus::Rejected, "the reply still tells the truth");
+        assert!(!again.changed, "but the second settle wrote nothing to announce");
+    }
+
+    /// The other unmoved path, and the one that never even reaches the terminal check: past
+    /// a claimed broadcast every settle but the ticket holder's is refused outright.
+    #[test]
+    fn a_settle_the_broadcast_owner_refused_is_not_announced() {
+        let l = SendLedger::default();
+        committed(&l, "snd_1", 5);
+        let BroadcastClaim::Claimed(t) = l.claim_broadcast("snd_1", 0) else { panic!() };
+
+        let outsider = l.settle("snd_1", SendStatus::Cancelled).unwrap();
+        assert_eq!(outsider.job.status, SendStatus::AwaitingApproval, "it is not theirs");
+        assert!(!outsider.changed, "and nothing moved, so nothing is announced");
+
+        // The owner's own door still moves it, so the check cannot pass by never announcing.
+        assert!(l.settle_owned(&t, bcast("0xdead")).unwrap().changed);
+    }
 
     /// FINDING 1, at the settle door. The suite asserted this for `claim_cancel` only, so a
     /// concurrent dispatch could still call a broadcast in flight `Failed`, hand its nonce to
@@ -1116,7 +1172,7 @@ mod tests {
         // The exact call the review demonstrated: a second dispatch whose `fetch_result` came
         // back empty because the first had already acked it.
         let reason = "the approval carried no signature".to_string();
-        let refused = l.settle("snd_1", SendStatus::Failed { reason }).unwrap();
+        let refused = l.settle("snd_1", SendStatus::Failed { reason }).unwrap().job;
         assert_eq!(refused.status, SendStatus::AwaitingApproval, "an outsider may not settle it");
         assert_eq!(refused.reported_status(0), "broadcasting", "and is told what it really is");
         assert_eq!(l.outstanding(1, "0xaaaa"), 1, "the nonce is not handed back mid-flight");
@@ -1156,7 +1212,7 @@ mod tests {
             let b = s.spawn(move || {
                 claimed_rx.recv().unwrap();
                 let reason = "the approval carried no signature".to_string();
-                let seen = l.settle("snd_1", SendStatus::Failed { reason }).unwrap();
+                let seen = l.settle("snd_1", SendStatus::Failed { reason }).unwrap().job;
                 let mid = l.outstanding(1, "0xaaaa");
                 b_done_tx.send(()).unwrap();
                 (seen, mid)
@@ -1208,7 +1264,7 @@ mod tests {
         assert_eq!(broadcast(&l, &t, "0xdead").status, bcast("0xdead"), "the hash corrects it");
         assert_eq!(l.outstanding(1, "0xaaaa"), 1, "and the corrected send still holds its nonce");
         // Only a hash may do that. Nothing walks a terminal status back the other way.
-        assert_eq!(l.settle_owned(&t, SendStatus::Cancelled).unwrap().status, bcast("0xdead"));
+        assert_eq!(l.settle_owned(&t, SendStatus::Cancelled).unwrap().job.status, bcast("0xdead"));
     }
 
     /// The latch. `send_raw_transaction` is deliberately unbounded, so a broadcast can simply
@@ -1233,7 +1289,7 @@ mod tests {
         assert!(l.switch(late, || Ok(())).is_ok(), "a stuck send stops wedging the wallet");
         assert_eq!(l.outstanding(1, "0xaaaa"), 1, "but its nonce is still spent");
         assert!(l.claim_cancel("snd_1").is_err(), "and it is still nobody else's to settle");
-        assert_eq!(l.settle("snd_1", SendStatus::Rejected).unwrap().reported_status(late), "stuck");
+        assert_eq!(l.settle("snd_1", SendStatus::Rejected).unwrap().job.reported_status(late), "stuck");
 
         // Recovery: the broadcast finally answers, hours late, and its hash still lands.
         assert_eq!(broadcast(&l, &t, "0xdead").reported_status(late), "broadcast");

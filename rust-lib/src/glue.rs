@@ -19,8 +19,9 @@ use alloy::primitives::U256;
 use serde_json::{json, Value};
 
 use crate::budget::{
-    Budget, CATALOGUE_BUDGET, DETAILS_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET,
-    REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET, SWEEP_BUDGET,
+    Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, INIT_BUDGET,
+    PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET,
+    SWEEP_BUDGET, VERDICT_BUDGET,
 };
 use crate::depinit::{self, Next};
 use crate::gate::{self, Gate};
@@ -199,6 +200,13 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// may be retried or cancelled, and only `stuck` carries a `reason` without failing.
     /// `route` accompanies a broadcast and is never `verified`: nothing proves a send was
     /// accepted.
+    ///
+    /// The broadcast is gated on the verified proxy in its own right, because the gate `send`
+    /// passed can close while a human is approving. A reply carrying `blocked: true` — with
+    /// `reason` and the whole `verifiedProxy` verdict beside it — is a send being HELD, not a
+    /// failed one: `ok` is still true, the status is still `awaitingApproval`, the nonce is
+    /// still reserved, and the next poll sends it once the proxy is usable. Keep polling, or
+    /// `cancel_send`.
     fn send_status(&self, request_id: String) -> String;
 
     /// Withdraw a send that has not been approved yet, releasing its reserved nonce.
@@ -302,6 +310,78 @@ fn listen<S: Send + 'static>(flag: Arc<AtomicBool>, sub: S, body: impl FnOnce(S)
         body(sub);
         flag.store(false, Ordering::SeqCst);
     });
+}
+
+/// How many new subscriptions a lost gate feed takes before giving up and leaving it to the
+/// next gated read, which arms one itself. Bounded so a provider that is gone for good is
+/// not spun on.
+const GATE_REARMS: u32 = 5;
+const GATE_REARM_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One arming of the mode feed: the status watcher first, then the subscription.
+///
+/// The watcher goes on first because the C side replays the current state synchronously from
+/// inside the install, so no arm can fall into the gap ahead of it. `subscribed` is what
+/// stops that replay opening the cache before there is a mode subscription for an arm to be
+/// about — the status is per TARGET, so a client already armed for the chain-config feed
+/// reports `Armed` the instant it is asked. Re-installing after the subscription exists is a
+/// second replay and not a second gate: same closure, same flag, one edge.
+fn arm_gate(cache: &Arc<gate::ModeCache>) -> Option<logos_rust_sdk::EventSubscription> {
+    let subscribed = Arc::new(AtomicBool::new(false));
+    let watcher = |cache: Arc<gate::ModeCache>, subscribed: Arc<AtomicBool>| {
+        move |s: logos_rust_sdk::SubStatus, _generation: u64| match s {
+            // The one edge that opens this cache, and never before there is a feed to open it
+            // for. `Lost`, `Held`, `Abandoned` and anything a later protocol adds close it.
+            logos_rust_sdk::SubStatus::Armed if subscribed.load(Ordering::Acquire) => {
+                cache.feed_live()
+            }
+            _ => cache.feed_dead(),
+        }
+    };
+    let mut w = modules().eth_rpc_module;
+    w.on_subscription_status(watcher(cache.clone(), subscribed.clone())).ok()?;
+    // Bound at function scope, so `w` still holds the client when this second proxy asks the
+    // cache for it: the cache is weak, and letting the last handle go destroys the client and
+    // silently discards the watcher just installed.
+    let mut c = modules().eth_rpc_module;
+    let Ok(sub) = c.on_verified_proxy_mode_changed() else {
+        return None;
+    };
+    subscribed.store(true, Ordering::Release);
+    let _ = w.on_subscription_status(watcher(cache.clone(), subscribed));
+    Some(sub)
+}
+
+/// Keep the mode feed running for as long as one can be had.
+///
+/// A stream now ENDS: `Abandoned` is terminal, and it wakes its reader rather than parking it
+/// for ever, so everything below the loop is reachable. Terminal is terminal — the way back
+/// is not a re-arm of this subscription but a NEW one, which is unarmed at creation. Nothing
+/// here opens the cache: taking a subscription is not an arm, and every re-subscribe waits
+/// on the same single edge in [`arm_gate`] the first one did.
+fn gate_feed(cache: &Arc<gate::ModeCache>) {
+    for attempt in 0..=GATE_REARMS {
+        if attempt > 0 {
+            std::thread::sleep(GATE_REARM_PAUSE);
+        }
+        let Some(sub) = arm_gate(cache) else {
+            cache.feed_dead();
+            continue;
+        };
+        for ev in sub {
+            let Some(e) =
+                eth_rpc_module::EthRpcModuleClient::decode_verified_proxy_mode_changed(&ev)
+            else {
+                // An event we cannot read is a contract we no longer share, and it names no
+                // chain to invalidate. Drop the lot, and do not go back for more of it.
+                cache.feed_dead();
+                return;
+            };
+            cache.told(e.chain_id as u64, &e.mode);
+            emit_networks_changed(e.chain_id);
+        }
+        cache.feed_dead();
+    }
 }
 
 /// One flag per dependency, set once its config is settled and never disturbed again.
@@ -518,35 +598,29 @@ impl EthWalletBackendImpl {
 
     /// Arm the gate feed. Everything the mode cache is allowed to remember rests on this
     /// subscription: it is what turns "verification is off for this chain" from a reading
-    /// taken once into a fact someone is obliged to correct. The cache goes live only inside
-    /// the thread, once the subscription exists, and dies with it — so the two windows where
-    /// nobody would tell us the user switched verification ON are both windows in which
-    /// nothing is trusted.
+    /// taken once into a fact someone is obliged to correct.
+    ///
+    /// Holding the subscription handle is NOT that fact. A subscription taken from
+    /// `on_context_ready` is deferred until eth_rpc listens, so the handle exists across a
+    /// window in which nobody would tell us the user switched verification ON. Only the
+    /// runtime's per-module status channel separates the two, so a runtime without one
+    /// latches the cache cold instead and every gated read pays its own probe.
     fn watch_gate(&self) {
         if self.feeds.gate.swap(true, Ordering::SeqCst) {
             return;
         }
-        let mut c = modules().eth_rpc_module;
-        let Ok(sub) = c.on_verified_proxy_mode_changed() else {
-            self.feeds.gate.store(false, Ordering::SeqCst);
-            return;
-        };
         let cache = self.gate.clone();
-        listen(self.feeds.gate.clone(), sub, move |sub| {
-            cache.feed_live();
-            for ev in sub {
-                let Some(e) =
-                    eth_rpc_module::EthRpcModuleClient::decode_verified_proxy_mode_changed(&ev)
-                else {
-                    // An event we cannot read is a contract we no longer share, and it names
-                    // no chain to invalidate. Drop the lot rather than guess.
-                    break;
-                };
-                cache.told(e.chain_id as u64, &e.mode);
-                emit_networks_changed(e.chain_id);
-            }
-            cache.feed_dead();
-        });
+        if !gate::status_channel(&logos_rust_sdk::protocol_version()) {
+            // No one here can say when a subscription arms or dies, and a handle that merely
+            // exists is not an arm. Latched for the process, which makes `feed_live` inert.
+            cache.no_status_channel();
+            eprintln!(
+                "eth_wallet_backend: logos-protocol {} carries no per-module subscription \
+                 status channel; the verified-proxy gate reads live on every check",
+                logos_rust_sdk::protocol_version()
+            );
+        }
+        listen(self.feeds.gate.clone(), cache, |cache| gate_feed(&cache));
     }
 
     /// Arm the chain-config feed. Freshness only — `list_networks` serves eth_rpc's record,
@@ -626,21 +700,11 @@ impl EthWalletBackendImpl {
     }
 
     /// eth_rpc's verified-proxy verdict for `chain_id`, or a synthetic blocking one when it
-    /// cannot be read. Never falls back to `off`. Unbounded, for the paths where a refusal IS
-    /// the whole answer — balances, the two send entry points, `suggest_fees` and the verdict
-    /// poll — so a slow probe there is not turned into one.
-    fn verified_verdict(&self, chain_id: u64) -> Value {
-        self.watch_gate();
-        let ticket = self.gate.ticket();
-        let raw = modules().eth_rpc_module.verified_proxy_status(chain_id as i64);
-        let v = Self::verdict_of(chain_id, raw);
-        self.gate.learned(chain_id, v.get("mode").and_then(Value::as_str), ticket);
-        v
-    }
-
-    /// The bounded twin, charged to a shared budget. For the paths that REPORT the verdict
-    /// rather than enforce it — there an `unknown` is a label on a screen, not a locked wallet
-    /// — and, through `verified_gate_within`, for the two a button drives.
+    /// cannot be read. Never falls back to `off`, and never unbounded: the probe is a
+    /// cross-process hop the protocol answers with a 20s default, which on any path a user is
+    /// watching is twenty seconds of frozen wallet. A probe the budget cuts short still
+    /// refuses — the verdict it returns carries its own reason, so a timeout is not read as
+    /// permission and not reported as a freeze.
     fn verified_verdict_within(&self, chain_id: u64, b: &Budget) -> Value {
         let Some(t) = b.take(PROBE_BUDGET) else {
             return verified::unknown_verdict(chain_id, "this read's budget ran out");
@@ -672,17 +736,9 @@ impl EthWalletBackendImpl {
     /// has told us is `off` — where its own `blocking` is `mode_required && !usable`, so the
     /// answer cannot depend on the proxy health this would have probed. Every other chain,
     /// and every chain we are not certain about, is read live and refuses on its own.
-    fn verified_gate(&self, chain_id: u64) -> Result<(), Value> {
-        if self.gate.gate(chain_id) == Gate::Open {
-            return Ok(());
-        }
-        Self::gate_of(self.verified_verdict(chain_id))
-    }
-
-    /// The bounded twin, charged to the SAME budget as the calls behind it. For the two paths
-    /// a button drives: there the gate is time a user is watching, and an unbounded probe puts
-    /// the method past the view's own deadline, which then reports a backend that never
-    /// answered. A probe that outruns the budget still refuses — it says so in `detail`.
+    ///
+    /// Charged to the SAME budget as the calls behind it, so the gate is time the method's
+    /// own allowance can see rather than twenty seconds in front of it.
     fn verified_gate_within(&self, chain_id: u64, b: &Budget) -> Result<(), Value> {
         if self.gate.gate(chain_id) == Gate::Open {
             return Ok(());
@@ -821,15 +877,24 @@ impl EthWalletBackendImpl {
             match receipt {
                 Ok(r) => {
                     failures.insert(rec.chain_id, 0);
-                    if st.history.apply_receipt(&rec, &r, now) {
-                        out.changed += 1;
-                        out.confirmed |= history::classify_receipt(&r) == "confirmed";
-                        emit_tx_status_changed(&rec.hash);
+                    // Counted and announced only where the new status reached DISK. A
+                    // subscriber re-reads from there, so a settle claimed over a refused
+                    // write is a row the view renders as pending for ever.
+                    match st.history.apply_receipt(&rec, &r, now) {
+                        Ok(true) => {
+                            out.changed += 1;
+                            out.confirmed |= history::classify_receipt(&r) == "confirmed";
+                            emit_tx_status_changed(&rec.hash);
+                        }
+                        Ok(false) => {}
+                        Err(_) => out.unstored += 1,
                     }
                 }
                 Err(_) => {
                     *failures.entry(rec.chain_id).or_insert(0) += 1;
-                    st.history.apply_receipt(&rec, &Value::Null, now);
+                    // The backoff stamp alone. A disk that refuses it refuses the status
+                    // too, and the row is simply due again on the next sweep.
+                    let _ = st.history.apply_receipt(&rec, &Value::Null, now);
                 }
             }
         }
@@ -853,9 +918,9 @@ impl EthWalletBackendImpl {
         st: &State,
         req: &SendRequest,
         chain_id: u64,
+        b: &Budget,
     ) -> Result<String, String> {
-        let b = Budget::new(SEND_BUDGET);
-        let mut q = self.quote(req, chain_id, &b)?;
+        let mut q = self.quote(req, chain_id, b)?;
 
         // `latest` does not count a broadcast-but-unmined transaction and the verified path
         // refuses `pending`, so this reservation is all that stops a clash. The guard owns it
@@ -926,7 +991,7 @@ impl EthWalletBackendImpl {
         Ok(request_id)
     }
 
-    /// Advance one pending send. Four outbound calls, none under a lock, and they need no
+    /// Advance one pending send. Five outbound calls, none under a lock, and they need no
     /// consistent view of each other: the claim belongs immediately before the one call that
     /// moves money. Taken before `fetch_result` instead, as it used to be, one transient
     /// failure left the job claimed and reporting `awaitingApproval` for ever.
@@ -1000,6 +1065,16 @@ impl EthWalletBackendImpl {
             let reason = "the approval carried no signature".to_string();
             return self.settle(&st, request_id, SendStatus::Failed { reason });
         };
+
+        // The gate again, as late as a check can be and still be in front of the money: the
+        // one `send` passed can close while a human sits in the signer. A refusal touches
+        // nothing — no claim, no record, no settle — so the job keeps its nonce and the next
+        // poll sends it once the proxy is usable. A closed gate is not a failed send.
+        if let Err(v) = self.verified_gate_within(job.chain_id, &b) {
+            // Re-read: a cancel may have landed while the probe was out.
+            let now_job = st.sends.get(request_id).unwrap_or(job);
+            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));
+        }
 
         // Claim, record, then broadcast. The ticket is the only key to this job from here on,
         // and it is the whole answer to a broadcast that never returns: the job cannot be
@@ -1136,7 +1211,7 @@ impl EthWalletBackendImpl {
         let status = history::classify_receipt(&receipt);
         // Exactly one of two concurrent refreshes of the same row sees `true` here — the
         // apply compares against what is on disk — so the event is announced once.
-        if st.history.apply_receipt(&rec, &receipt, history::now_secs()) {
+        if st.history.apply_receipt(&rec, &receipt, history::now_secs())? {
             emit_tx_status_changed(&rec.hash);
             if status == "confirmed" {
                 emit_balances_updated(&rec.from);
@@ -1463,14 +1538,17 @@ impl EthWalletBackendImpl {
 
     /// Settle a job and announce it. The ledger applies the status to the LIVE job and gives
     /// back whatever it now holds, so a status another dispatch settled first is reported
-    /// rather than overwritten from this caller's stale copy.
+    /// rather than overwritten from this caller's stale copy — and announced only when THIS
+    /// call is what moved it, because the reply is a truthful answer to a settle that lost.
     fn settle(&self, st: &State, request_id: &str, status: SendStatus) -> Result<Value, String> {
-        let job = st
+        let s = st
             .sends
             .settle(request_id, status)
             .ok_or_else(|| format!("no send with id '{request_id}'"))?;
-        emit_send_status_changed(&job.request_id);
-        Ok(Self::job_reply(&job, history::now_secs()))
+        if s.changed {
+            emit_send_status_changed(&s.job.request_id);
+        }
+        Ok(Self::job_reply(&s.job, history::now_secs()))
     }
 
     /// The broadcast owner's door — the only settle that lands once a broadcast is claimed.
@@ -1480,12 +1558,14 @@ impl EthWalletBackendImpl {
         t: &send::BroadcastTicket,
         status: SendStatus,
     ) -> Result<Value, String> {
-        let job = st
+        let s = st
             .sends
             .settle_owned(t, status)
             .ok_or_else(|| "the send vanished while it was being broadcast".to_string())?;
-        emit_send_status_changed(&job.request_id);
-        Ok(Self::job_reply(&job, history::now_secs()))
+        if s.changed {
+            emit_send_status_changed(&s.job.request_id);
+        }
+        Ok(Self::job_reply(&s.job, history::now_secs()))
     }
 
     /// The endpoint eth_rpc holds for `chain_id`, empty when it has none or when `b` had no
@@ -1610,8 +1690,9 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn verified_proxy_state(&self) -> String {
+        let b = Budget::new(VERDICT_BUDGET);
         match self.active_chain() {
-            Ok(id) => self.verified_verdict(id).to_string(),
+            Ok(id) => self.verified_verdict_within(id, &b).to_string(),
             Err(e) => err(e),
         }
     }
@@ -1737,13 +1818,16 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn get_balances(&self, address: String) -> String {
-        self.ensure_eth_rpc(&Budget::new(READ_BUDGET));
+        // ONE allowance across the retry, the gate and the Multicall3 read. An unbounded probe
+        // in front of a read is time a user waits that the method's own budget cannot see.
+        let b = Budget::new(BALANCES_BUDGET);
+        self.ensure_eth_rpc(&b);
         let settings = match self.settings() {
             Ok(s) => s,
             Err(e) => return err(e),
         };
         let chain_id = settings.active_chain_id;
-        if let Err(v) = self.verified_gate(chain_id) {
+        if let Err(v) = self.verified_gate_within(chain_id, &b) {
             return blocked(&v).to_string();
         }
         let owner = match address.trim().parse::<alloy::primitives::Address>() {
@@ -1771,7 +1855,11 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             "to": txbuild::multicall3_address().to_string(),
             "data": format!("0x{}", hex::encode(&data)),
         });
-        let raw = match modules().eth_rpc_module.call(chain_id as i64, &call.to_string()) {
+        let Some(t) = b.take(RPC_BUDGET) else {
+            return err("no time left to read the balances");
+        };
+        let payload = call.to_string();
+        let raw = match modules().eth_rpc_module.call_with_timeout(chain_id as i64, &payload, t) {
             Ok(r) => r,
             Err(e) => return err(format!("{e:?}")),
         };
@@ -1861,6 +1949,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
 
 
     fn prepare_send(&self, request_json: String) -> String {
+        let b = Budget::new(SEND_BUDGET);
         let req: SendRequest = match serde_json::from_str(&request_json) {
             Ok(r) => r,
             Err(e) => return err(format!("invalid send request: {e}")),
@@ -1869,10 +1958,10 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Ok(id) => id,
             Err(e) => return err(e),
         };
-        if let Err(v) = self.verified_gate(chain_id) {
+        if let Err(v) = self.verified_gate_within(chain_id, &b) {
             return blocked(&v).to_string();
         }
-        match self.quote(&req, chain_id, &Budget::new(SEND_BUDGET)) {
+        match self.quote(&req, chain_id, &b) {
             Ok(q) => {
                 let native = q.token.as_ref().map(|t| t.native).unwrap_or(true);
                 let charged = if native { q.amount } else { U256::ZERO };
@@ -1920,6 +2009,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn send(&self, request_json: String) -> String {
+        let b = Budget::new(SEND_BUDGET);
         let req: SendRequest = match serde_json::from_str(&request_json) {
             Ok(r) => r,
             Err(e) => return err(format!("invalid send request: {e}")),
@@ -1934,10 +2024,10 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Ok(s) => s.active_chain_id,
             Err(e) => return err(e.to_string()),
         };
-        if let Err(v) = self.verified_gate(chain_id) {
+        if let Err(v) = self.verified_gate_within(chain_id, &b) {
             return blocked(&v).to_string();
         }
-        match self.request_send(&st, &req, chain_id) {
+        match self.request_send(&st, &req, chain_id, &b) {
             // Deliberately no hash: nothing is signed or broadcast until a human approves.
             Ok(id) => json!({ "ok": true, "pending": true, "requestId": id }).to_string(),
             Err(e) => err(e),
@@ -1990,14 +2080,18 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn suggest_fees(&self) -> String {
+        let b = Budget::new(FEES_BUDGET);
         let chain_id = match self.active_chain() {
             Ok(id) => id,
             Err(e) => return err(e),
         };
-        if let Err(v) = self.verified_gate(chain_id) {
+        if let Err(v) = self.verified_gate_within(chain_id, &b) {
             return blocked(&v).to_string();
         }
-        match modules().fee_module.suggest_fees(chain_id as i64) {
+        let Some(t) = b.take(RPC_BUDGET) else {
+            return err("no time left to price the fee");
+        };
+        match modules().fee_module.suggest_fees_with_timeout(chain_id as i64, t) {
             Ok(reply) => reply,
             Err(e) => err(format!("{e:?}")),
         }
