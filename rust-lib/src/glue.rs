@@ -185,16 +185,25 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
 
     /// Ask a human to approve a send. Takes the same `request_json` as `prepare_send`.
     ///
-    /// Returns `{ ok, pending: true, requestId }` and **never a transaction hash** — nothing
-    /// has been signed or broadcast at this point. The human approves in `signer_ui`; drive
-    /// the rest with `send_status`.
+    /// Returns `{ ok, pending: true, requestId, handle }` and **never a transaction hash** —
+    /// nothing has been signed or broadcast at this point. The human approves in `signer_ui`;
+    /// drive the rest with `send_status`.
+    ///
+    /// `handle` is the KEYSTORE's name for the approval record, not ours. A caller that has
+    /// to point another surface at this specific request needs the keystore's word for it,
+    /// and reconstructing one from `requestId` would make our id format that caller's
+    /// business. Every reply that names a request carries it, so a caller that restarted
+    /// mid-send can recover it from `send_status` rather than losing the send.
     fn send(&self, request_json: String) -> String;
 
     /// Advance a pending send and report where it got to. Poll this.
     ///
     /// When the human has approved, this collects the signature, broadcasts it exactly once
-    /// and records it in history. `{ ok, requestId, status, hash?, route?, reason? }` where
-    /// `status` is `awaitingApproval` | `broadcasting` | `stuck` | `broadcast` | `rejected` |
+    /// and records it in history. `{ ok, requestId, handle, status, hash?, route?, reason? }`
+    /// where `handle` is the keystore's name for the approval record — carried on every reply
+    /// so a caller that restarted mid-send can point a signer at this request again instead
+    /// of stranding it — and `status` is
+    /// `awaitingApproval` | `broadcasting` | `stuck` | `broadcast` | `rejected` |
     /// `cancelled` | `failed`. The first three are not settled states: `broadcasting` means
     /// the signed transaction is with a node, and `stuck` that it has not answered — neither
     /// may be retried or cancelled, and only `stuck` carries a `reason` without failing.
@@ -919,7 +928,7 @@ impl EthWalletBackendImpl {
         req: &SendRequest,
         chain_id: u64,
         b: &Budget,
-    ) -> Result<String, String> {
+    ) -> Result<(String, String), String> {
         let mut q = self.quote(req, chain_id, b)?;
 
         // `latest` does not count a broadcast-but-unmined transaction and the verified path
@@ -987,8 +996,9 @@ impl EthWalletBackendImpl {
             replaces: None,
         };
         let request_id = job.request_id.clone();
+        let handle = job.handle.clone();
         guard.commit(job);
-        Ok(request_id)
+        Ok((request_id, handle))
     }
 
     /// Advance one pending send. Five outbound calls, none under a lock, and they need no
@@ -1518,7 +1528,8 @@ impl EthWalletBackendImpl {
     /// broadcast reads `broadcasting`, and one that has not answered reads `stuck`.
     fn job_reply(j: &SendJob, now: u64) -> Value {
         let status = j.reported_status(now);
-        let mut v = json!({ "ok": true, "requestId": j.request_id, "status": status });
+        let mut v = json!({ "ok": true, "requestId": j.request_id, "handle": j.handle,
+                            "status": status });
         match &j.status {
             SendStatus::Broadcast { hash, route } => {
                 v["hash"] = json!(hash);
@@ -2029,7 +2040,10 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         }
         match self.request_send(&st, &req, chain_id, &b) {
             // Deliberately no hash: nothing is signed or broadcast until a human approves.
-            Ok(id) => json!({ "ok": true, "pending": true, "requestId": id }).to_string(),
+            Ok((id, handle)) => {
+                json!({ "ok": true, "pending": true, "requestId": id, "handle": handle })
+                    .to_string()
+            }
             Err(e) => err(e),
         }
     }
