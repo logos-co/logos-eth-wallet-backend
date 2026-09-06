@@ -25,6 +25,7 @@ use crate::budget::{
 use crate::depinit::{self, Next};
 use crate::gate::{self, Gate};
 use crate::details;
+use crate::contacts::ContactsStore;
 use crate::history::{self, History, TxRecord};
 use crate::send::{self, BroadcastClaim, SendJob, SendLedger, SendStatus};
 use crate::settings::{Settings, SettingsStore};
@@ -150,6 +151,29 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// while `get_account_labels` keys are `vault_name` form, so a view reading both still
     /// has to normalise.
     fn get_account_wallets(&self) -> String;
+
+    /// The address book: `{ ok, contacts: [{ address, name }] }`, named rows first and then
+    /// unnamed, each ordered by name and address so a picker can show them without sorting
+    /// and the order does not move when an unrelated contact is added.
+    ///
+    /// These are COUNTERPARTIES and live here rather than in the keystore, which names
+    /// accounts it holds keys for. A contact carries no key material and is not a secret, so
+    /// putting it behind a surface whose whole point is guarding one would buy nothing and
+    /// cost every reader a dependency on it.
+    fn list_contacts(&self) -> String;
+
+    /// Add a contact, or rename one already there — an UPSERT, because a user who saves an
+    /// address they already have meant to name it, and refusing would send them to find a
+    /// row they cannot see from the form they are standing in.
+    ///
+    /// The address is stored EIP-55 and matched case-insensitively, so the same address typed
+    /// in two casings is one contact. `{ ok, contact: { address, name } }`. An empty name is
+    /// allowed: an address worth remembering is worth remembering before its owner has one.
+    fn save_contact(&self, address: String, name: String) -> String;
+
+    /// Forget a contact. Removing one that is not there SUCCEEDS — the caller's goal is that
+    /// the address is not in the book, and that is already true.
+    fn forget_contact(&self, address: String) -> String;
 
     /// Native and token balances for `address` on the active network, in one Multicall3
     /// round-trip. `{ ok, chainId, address, tokenSort, balances: [{ symbol, address?, raw,
@@ -427,6 +451,7 @@ struct DepInit {
 /// itself around local work only — so nothing in this file ever holds one across a call.
 struct State {
     settings: SettingsStore,
+    contacts: ContactsStore,
     history: History,
     /// Shared with the module, not owned here: see `EthWalletBackendImpl::sends`.
     sends: Arc<SendLedger>,
@@ -1638,6 +1663,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = PathBuf::from(&ctx.instance_persistence_path);
         let settings = SettingsStore::with_path(dir.join("settings.json"));
+        let contacts = ContactsStore::with_path(dir.join("contacts.json"));
         let history = History::new(dir);
 
         // R-1. The ledger is in-memory and `latest` does not count a broadcast that has not
@@ -1649,7 +1675,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         }
 
         if let Ok(mut g) = self.state.write() {
-            *g = Some(Arc::new(State { settings, history, sends: self.sends.clone() }));
+            *g = Some(Arc::new(State { settings, contacts, history, sends: self.sends.clone() }));
         }
         // eth_rpc first: every balance, fee and send goes through it while token_list only
         // decorates. Neither may fail startup, and neither writes over an existing config.
@@ -1888,6 +1914,39 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             }
         }
         json!({ "ok": true, "wallets": wallets }).to_string()
+    }
+
+    fn list_contacts(&self) -> String {
+        let st = match self.state() {
+            Ok(st) => st,
+            Err(e) => return err(e),
+        };
+        match st.contacts.list() {
+            Ok(all) => json!({ "ok": true, "contacts": all }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn save_contact(&self, address: String, name: String) -> String {
+        let st = match self.state() {
+            Ok(st) => st,
+            Err(e) => return err(e),
+        };
+        match st.contacts.save(&address, &name) {
+            Ok(c) => json!({ "ok": true, "contact": c }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn forget_contact(&self, address: String) -> String {
+        let st = match self.state() {
+            Ok(st) => st,
+            Err(e) => return err(e),
+        };
+        match st.contacts.remove(&address) {
+            Ok(()) => json!({ "ok": true, "address": address }).to_string(),
+            Err(e) => err(e),
+        }
     }
 
     fn get_balances(&self, address: String) -> String {
