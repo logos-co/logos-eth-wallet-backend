@@ -129,6 +129,28 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// addresses, so the two never match textually and a lookup must normalise.
     fn get_account_labels(&self) -> String;
 
+    /// The WALLET each account was derived under, and where in it:
+    /// `{ ok, wallets: { "<address>": { "wallet": "<name>", "index": <n> } } }`.
+    ///
+    /// Separate from `get_account_labels` because they are different things and a view must
+    /// tell them apart: an account's own name identifies THAT account, a wallet's name is
+    /// shared by every account under it. Folding the second into the first would put one
+    /// name on several rows of a picker with nothing to separate them — which is what
+    /// `index` is for.
+    ///
+    /// `index` is the DERIVATION index, straight off `m/44'/60'/0'/0/<index>`, and it is
+    /// stable for the life of the account. A positional counter would not be: it renumbers
+    /// when an account is added or removed, so a name built from one silently comes to mean
+    /// a different account. `get_account_labels` already refuses to invent one for that
+    /// reason, and this must not undo it.
+    ///
+    /// Absent for an account whose wallet has no name, and `index` is absent for one that
+    /// was imported rather than derived — both are ordinary, and an empty map is the normal
+    /// state rather than an error. Keys are whatever `get_provenance` answers — EIP-55 —
+    /// while `get_account_labels` keys are `vault_name` form, so a view reading both still
+    /// has to normalise.
+    fn get_account_wallets(&self) -> String;
+
     /// Native and token balances for `address` on the active network, in one Multicall3
     /// round-trip. `{ ok, chainId, address, tokenSort, balances: [{ symbol, address?, raw,
     /// decimals, native, builtin, display, exact, amountExact }], route }`. `display` is
@@ -1825,6 +1847,47 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Ok(reply) => reply,
             Err(e) => err(format!("{e:?}")),
         }
+    }
+
+    fn get_account_wallets(&self) -> String {
+        self.watch_keystore();
+        let provenance = match modules().keystore_module.get_provenance() {
+            Ok(r) => r,
+            Err(e) => return err(format!("{e:?}")),
+        };
+        let labels = match modules().keystore_module.get_group_labels() {
+            Ok(r) => r,
+            Err(e) => return err(format!("{e:?}")),
+        };
+        let provenance: Value = match serde_json::from_str(&provenance) {
+            Ok(v) => v,
+            Err(e) => return err(e.to_string()),
+        };
+        let labels: Value = match serde_json::from_str(&labels) {
+            Ok(v) => v,
+            Err(e) => return err(e.to_string()),
+        };
+        let by_group = labels.get("labels").and_then(Value::as_object);
+        let accounts = provenance.get("accounts").and_then(Value::as_object);
+        let mut wallets = serde_json::Map::new();
+        if let (Some(accounts), Some(by_group)) = (accounts, by_group) {
+            for (address, row) in accounts {
+                let Some(group) = row.get("group").and_then(Value::as_str) else { continue };
+                // An unnamed wallet contributes nothing: the view's fallback is the address,
+                // and an empty string here would read as a name that happens to be blank.
+                match by_group.get(group).and_then(Value::as_str) {
+                    Some(name) if !name.trim().is_empty() => {
+                        let mut entry = json!({ "wallet": name });
+                        if let Some(i) = row.get("index").and_then(Value::as_i64) {
+                            entry["index"] = json!(i);
+                        }
+                        wallets.insert(address.clone(), entry);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        json!({ "ok": true, "wallets": wallets }).to_string()
     }
 
     fn get_balances(&self, address: String) -> String {
