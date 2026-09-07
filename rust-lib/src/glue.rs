@@ -1880,12 +1880,17 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn get_account_wallets(&self) -> String {
+        // Bounded, unlike its two siblings: they are one passthrough call each, this is two,
+        // so an unbounded pair could hold the host for twice the protocol's own default.
+        let b = Budget::new(READ_BUDGET);
         self.watch_keystore();
-        let provenance = match modules().keystore_module.get_provenance() {
+        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to read the wallets") };
+        let provenance = match modules().keystore_module.get_provenance_with_timeout(t) {
             Ok(r) => r,
             Err(e) => return err(format!("{e:?}")),
         };
-        let labels = match modules().keystore_module.get_group_labels() {
+        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to name the wallets") };
+        let labels = match modules().keystore_module.get_group_labels_with_timeout(t) {
             Ok(r) => r,
             Err(e) => return err(format!("{e:?}")),
         };
