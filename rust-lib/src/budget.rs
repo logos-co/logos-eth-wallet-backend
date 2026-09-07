@@ -22,9 +22,21 @@ pub const CATALOGUE_BUDGET: Duration = Duration::from_secs(3);
 /// this crosses a network, so 3s is a working number rather than slack.
 pub const RPC_BUDGET: Duration = Duration::from_secs(3);
 
+/// eth_rpc's own per-request HTTP timeout, and the value THIS module seeds into the shared
+/// `chains.json`. It lives here because the grant sized against it lives here: the two used
+/// to be literals 1400 lines apart, and they disagreed.
+pub const ETH_RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The Multicall3 read that answers every balance row. STRICTLY greater than the timeout
+/// above: a caller that expires before its callee does not stop the request, it only stops
+/// us reading the answer — and it gives up at the moment eth_rpc was about to word a real
+/// refusal, so a wrong endpoint reads as a slow one. `RPC_BUDGET` stays 3s everywhere else,
+/// where giving up leaves a pending row or an em-dash. This read has nothing else to show.
+pub const BALANCES_RPC_BUDGET: Duration = Duration::from_secs(9);
+
 /// The aggregates. `READ_BUDGET` covers a whole consumer-facing read including the lazy
 /// dependency retry in front of it; `STARTUP_BUDGET` covers everything the load hook may
-/// spend seeding dependencies before it hands control back to the host.
+/// spend seeding dependencies — on its own worker, so the host waits for none of it.
 pub const READ_BUDGET: Duration = Duration::from_secs(4);
 pub const STARTUP_BUDGET: Duration = Duration::from_secs(6);
 
@@ -39,10 +51,12 @@ pub const SEND_BUDGET: Duration = Duration::from_millis(13_500);
 /// read that answers every row. The gate is INSIDE it — an unbounded probe in front of a
 /// read is time a user waits that no budget can see — and it is sized so the gate and the
 /// read both fit, because a balance list cannot degrade the way a network row can.
-pub const BALANCES_BUDGET: Duration = Duration::from_secs(6);
+pub const BALANCES_BUDGET: Duration = Duration::from_secs(12);
 
-/// One `suggest_fees`: the verified gate and one `fee_module` estimate.
-pub const FEES_BUDGET: Duration = Duration::from_secs(5);
+/// One `suggest_fees`: the verified gate, the lazy eth_rpc retry, and one `fee_module`
+/// estimate. It reaches eth_rpc through fee_module and used to seed nothing, so a first run
+/// answered `unknown chain` whenever the load hook had not landed.
+pub const FEES_BUDGET: Duration = Duration::from_secs(11);
 
 /// One `verified_proxy_state`: the verdict probe alone. A report rather than a gate — here
 /// the verdict IS the answer — but a chip polling every five seconds must not be able to
@@ -156,18 +170,19 @@ mod tests {
     #[test]
     fn a_balance_read_is_bounded_across_its_gate_and_its_multicall() {
         let mut calls = vec![INIT_BUDGET; 4];
-        calls.extend([PROBE_BUDGET, RPC_BUDGET]);
+        calls.extend([PROBE_BUDGET, BALANCES_RPC_BUDGET]);
         assert!(calls.iter().sum::<Duration>() > BALANCES_BUDGET, "the aggregate must bind");
         assert!(walk(BALANCES_BUDGET, &calls) <= BALANCES_BUDGET);
         // The two calls that actually answer must BOTH fit, gate included, or a wallet whose
         // dependency is merely slow reports no balances at all.
-        assert!(PROBE_BUDGET + RPC_BUDGET <= BALANCES_BUDGET);
+        assert!(PROBE_BUDGET + BALANCES_RPC_BUDGET <= BALANCES_BUDGET);
     }
 
     #[test]
     fn the_two_one_call_paths_are_bounded_across_their_gates_too() {
         for (total, calls) in
-            [(FEES_BUDGET, vec![PROBE_BUDGET, RPC_BUDGET]), (VERDICT_BUDGET, vec![PROBE_BUDGET])]
+            [(FEES_BUDGET, vec![PROBE_BUDGET, INIT_BUDGET, RPC_BUDGET]),
+             (VERDICT_BUDGET, vec![PROBE_BUDGET])]
         {
             assert!(walk(total, &calls) <= total);
             assert!(calls.iter().sum::<Duration>() <= total, "the gate must fit too");
@@ -198,12 +213,38 @@ mod tests {
     }
 
     #[test]
-    fn the_load_hook_is_bounded_too() {
-        // ensure_eth_rpc (3 seeds + init) then ensure_token_list (config_status + init).
+    fn the_startup_worker_is_bounded_too() {
+        // seed_eth_rpc (3 seeds + init) then seed_token_list (config_status + init). Still
+        // bounded, though nothing the host waits on is inside it any more — an unbounded
+        // worker would sit on the module's Qt loop and delay every read behind it.
         let calls =
             [INIT_BUDGET, INIT_BUDGET, INIT_BUDGET, INIT_BUDGET, PROBE_BUDGET, INIT_BUDGET];
         assert!(calls.iter().sum::<Duration>() > STARTUP_BUDGET);
         assert!(walk(STARTUP_BUDGET, &calls) <= STARTUP_BUDGET);
+    }
+
+    /// The assertion whose absence let a 3s cap ship against an 8s callee. The wallet was
+    /// timing out a request eth_rpc had not abandoned, then rendering its own Debug blob —
+    /// so a wrong endpoint and a slow one produced the same screen, ~3s early.
+    #[test]
+    fn a_balance_read_outlasts_the_timeout_the_wallet_itself_seeds() {
+        // ETH_RPC_HTTP_TIMEOUT mirrors eth-rpc/rust-lib/src/rpc.rs:18-23, which this module
+        // writes into chains.json at `seed_chain_config`.
+        assert!(
+            BALANCES_RPC_BUDGET > ETH_RPC_HTTP_TIMEOUT,
+            "a grant shorter than its callee's own timeout cannot produce the callee's refusal"
+        );
+    }
+
+    #[test]
+    fn a_balance_read_still_grants_its_multicall_the_cap_in_full_after_the_gate() {
+        // Real slack, not a zero-remainder partition: an exact fit means any drift in the
+        // gate silently shortens the read that follows it.
+        assert_eq!(
+            slice(BALANCES_BUDGET, PROBE_BUDGET, BALANCES_RPC_BUDGET),
+            Some(BALANCES_RPC_BUDGET)
+        );
+        assert!(BALANCES_BUDGET - PROBE_BUDGET - BALANCES_RPC_BUDGET >= Duration::from_secs(1));
     }
 
     #[test]

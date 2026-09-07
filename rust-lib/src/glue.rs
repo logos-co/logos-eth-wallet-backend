@@ -19,9 +19,9 @@ use alloy::primitives::U256;
 use serde_json::{json, Value};
 
 use crate::budget::{
-    Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, INIT_BUDGET,
-    PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET,
-    SWEEP_BUDGET, VERDICT_BUDGET,
+    Budget, BALANCES_BUDGET, BALANCES_RPC_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET,
+    ETH_RPC_HTTP_TIMEOUT, FEES_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET,
+    RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET, SWEEP_BUDGET, VERDICT_BUDGET,
 };
 use crate::depinit::{self, Next};
 use crate::gate::{self, Gate};
@@ -476,7 +476,7 @@ fn seed_chain_config(chain_id: u64, rpc_url: &str, b: &Budget) -> Result<(), Str
         return Ok(());
     }
     let t = b.take(INIT_BUDGET).ok_or_else(|| "no time left to seed a chain".to_string())?;
-    let cfg = json!({ "endpoint": rpc_url, "timeoutSecs": 8 });
+    let cfg = json!({ "endpoint": rpc_url, "timeoutSecs": ETH_RPC_HTTP_TIMEOUT.as_secs() });
     let raw = modules()
         .eth_rpc_module
         .ensure_chain_config_with_timeout(chain_id as i64, &cfg.to_string(), t)
@@ -640,6 +640,16 @@ fn seed_token_list(deps: &DepInit, b: &Budget) {
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
+}
+
+/// A refusal from the transport rather than from eth_rpc — our own deadline, or a dependency
+/// that is not there. The SDK's Debug render is a diagnostic and `error` is put on screen
+/// verbatim, so the sentence goes in `error` and the render goes in `detail`.
+fn transport_refusal(e: &impl std::fmt::Debug) -> String {
+    json!({ "ok": false,
+            "error": "the Ethereum RPC service did not answer",
+            "detail": format!("{e:?}") })
+    .to_string()
 }
 
 const NO_CONTEXT: &str = "module context not ready";
@@ -2028,13 +2038,16 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             "to": txbuild::multicall3_address().to_string(),
             "data": format!("0x{}", hex::encode(&data)),
         });
-        let Some(t) = b.take(RPC_BUDGET) else {
+        let Some(t) = b.take(BALANCES_RPC_BUDGET) else {
             return err("no time left to read the balances");
         };
         let payload = call.to_string();
         let raw = match modules().eth_rpc_module.call_with_timeout(chain_id as i64, &payload, t) {
             Ok(r) => r,
-            Err(e) => return err(format!("{e:?}")),
+            // Only OUR deadline or a missing eth_rpc reaches here: every network failure it
+            // has — DNS, refused, TLS, its own socket timeout — comes back as a reply below,
+            // in its own words. This arm has no words but ours.
+            Err(e) => return transport_refusal(&e),
         };
         let Answer { value: result, route } = match unwrap_answer(&raw) {
             Ok(a) => a,
@@ -2257,6 +2270,9 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
 
     fn suggest_fees(&self) -> String {
         let b = Budget::new(FEES_BUDGET);
+        // It reaches eth_rpc through fee_module, which seeds nothing, and eth_rpc has no
+        // call-time fallback — an unseeded chain answers `unknown chain` rather than slowly.
+        self.ensure_eth_rpc(&b);
         let chain_id = match self.active_chain() {
             Ok(id) => id,
             Err(e) => return err(e),
