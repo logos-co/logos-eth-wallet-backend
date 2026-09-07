@@ -78,6 +78,7 @@ impl ApproverProbeModule for ApproverProbeModuleImpl {
             Ok(v) => json!({
                 "ok": true, "handle": handle, "bundleId": bundle_id,
                 "signedCount": v.get("signed_count").cloned().unwrap_or(Value::Null),
+                "claimLines": ack.get("claim_lines").cloned().unwrap_or(Value::Null),
                 "renderLines": ack.get("render_lines").cloned().unwrap_or(Value::Null),
             })
             .to_string(),
