@@ -165,18 +165,35 @@ a `state: "unready"` means ask again, not "it has no config". **No whole-record 
 reaches a sibling's store**: this module calls `ensure_chain_config` and never
 `set_chain_config`, so another wallet's tuning cannot be revoked by our silence. And a
 dependency that is not up yet is **retried lazily** — one bounded attempt per `list_networks`,
-`list_tokens` or `get_balances` — because a module that crashed and restarted comes back after
-our startup, and a wallet that gave up at startup would stay broken until the app restarts.
+`list_tokens`, `list_available_tokens`, `get_balances` or `suggest_fees` — because a module
+that crashed and restarted comes back after our startup, and a wallet that gave up at startup
+would stay broken until the app restarts.
 
 Every one of these calls is bounded — 1.5 s to read a config, 5 s to write one, against a
 20 s protocol default — and so is their **sum**. A per-call bound says nothing about a method
 that makes ten of them: `list_networks` reached ~29 s with every call individually capped, and
 ~120 s without. Each entry point now spends one shared allowance — 4 s for a consumer-facing
-read, 6 s for the load hook, 12 s for a send's quote and approval request, 10 s for a receipt
-sweep — and a call that no longer fits is not made. `list_networks`
-reads the active network first, so a short allowance costs `verifiedProxyMode: "unknown"` and
-an empty `rpcUrl` on the other two rather than a stall. What the load hook could not finish is
-retried on the first read.
+read, 12 s for a balance read, 6 s for the startup worker, 12 s for a send's quote and
+approval request, 10 s for a receipt sweep — and a call that no longer fits is not made.
+`list_networks` reads the active network first, so a short allowance costs
+`verifiedProxyMode: "unknown"` and an empty `rpcUrl` on the other two rather than a stall.
+What the worker could not finish is retried on the first read.
+
+One of those allowances is sized against a number this module itself writes. The balance
+read's Multicall3 grant is **9 s against the 8 s socket timeout we seed into eth_rpc's
+`chains.json`** — strictly greater, because a caller that expires first does not stop the
+request, it only stops us reading the answer, and it gives up exactly where the dependency was
+about to word a real refusal. The two were literals 1400 lines apart and they disagreed, so a
+wrong endpoint and a slow one produced the same screen ~3 s early; they are one constant now,
+with a test for the inequality.
+
+**The load hook waits for nothing.** `on_context_ready` does its disk work — the nonce burn
+and the state install, in that order — and hands the host back its thread. The dependency
+seeding and the four feed subscriptions run on a worker. liblogos loads modules one at a time,
+so anything waited on in the hook delays every other module's load: measured at 3626 ms of a
+module that was loaded but unreachable, long enough for the capability token hand-off to give
+up. The worker does not make those calls in parallel — the SDK marshals every outbound call
+back onto this module's Qt main thread — it makes them once the loop is free.
 
 No outbound call runs under a lock, and that is checked rather than remembered:
 `state()` hands back an owned handle, so a guard cannot escape it, and
