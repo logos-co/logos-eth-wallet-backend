@@ -77,8 +77,14 @@ fn body_of<'a>(code: &'a str, name: &str) -> &'a str {
 #[test]
 fn the_relay_is_armed_at_startup_and_retried_from_the_account_reads() {
     let code = code_only(GLUE);
-    assert!(body_of(&code, "on_context_ready").contains("self.watch_keystore()"),
-            "nothing arms the relay at startup");
+    // In the startup worker, not on the host's plugin-load path: building the client and
+    // subscribing are cross-process hops, and liblogos loads modules one at a time.
+    let ctx = body_of(&code, "on_context_ready");
+    let (head, worker) = ctx
+        .split_once("std::thread::spawn")
+        .expect("the startup work must be handed to a thread");
+    assert!(worker.contains("arm_keystore("), "nothing arms the relay at startup");
+    assert!(!head.contains("arm_keystore("), "the relay arms before the host gets its thread back");
     // Startup is the only chance a module gets; a client that could not be built there would
     // otherwise leave the view deaf for the life of the process.
     for read in ["list_accounts", "get_account_labels"] {
@@ -112,7 +118,7 @@ fn closes_its_own_window(body: &str) -> bool {
 }
 
 fn relay() -> String {
-    body_of(&code_only(GLUE), "watch_keystore").to_string()
+    body_of(&code_only(GLUE), "arm_keystore").to_string()
 }
 
 #[test]
@@ -131,8 +137,8 @@ fn an_unguarded_resubscribe_is_rejected() {
     // parked on a channel nothing closes.
     assert!(!arms_once(&relay().replace("swap(true", "load(")));
     // A flag read AFTER the subscribe is not a gate either: two callers both subscribe.
-    let late = relay().replacen("if self.watching_keystore.swap(true, Ordering::SeqCst) {", "if false {", 1)
-        + "self.watching_keystore.swap(true, Ordering::SeqCst);";
+    let late = relay().replacen("if flag.swap(true, Ordering::SeqCst) {", "if false {", 1)
+        + "flag.swap(true, Ordering::SeqCst);";
     assert!(!arms_once(&late));
 }
 

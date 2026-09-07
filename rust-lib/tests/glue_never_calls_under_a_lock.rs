@@ -233,7 +233,19 @@ fn reaches_modules(code: &str, fns: &[Func]) -> BTreeSet<String> {
 }
 
 fn calls(body: &str, name: &str) -> bool {
-    body.contains(&format!("self.{name}(")) || body.contains(&format!("Self::{name}("))
+    if body.contains(&format!("self.{name}(")) || body.contains(&format!("Self::{name}(")) {
+        return true;
+    }
+    // A bare call too, since the startup work lives in free functions: a helper that
+    // reaches `modules()` would otherwise be invisible to the transitive walk exactly
+    // where it was moved to. The preceding byte rules out `estate(` matching `state`,
+    // and the two receiver forms above from being counted twice.
+    let needle = format!("{name}(");
+    body.match_indices(&needle).any(|(i, _)| {
+        i == 0
+            || !matches!(body.as_bytes()[i - 1],
+                         b'.' | b':' | b'_' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9')
+    })
 }
 
 /// A copy of the source with one regression applied, for the mutant tests.
@@ -446,6 +458,19 @@ fn an_outbound_call_reached_through_a_helper_is_caught() {
         guard_scopes(&code).into_iter().all(|(a, e)| !code[a..e].contains("modules()")),
         "the literal-token scan this replaces would have rejected the mutant after all"
     );
+}
+
+/// The startup work lives in free functions now, so a bare call is a way to reach `modules()`
+/// from inside a guard. The receiver-only scan this replaces let one straight through.
+#[test]
+fn an_outbound_call_reached_through_a_free_function_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
+        "keystore_account_count();\n        guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
+    );
+    let e = check_no_call_under_a_lock(&mutant).unwrap_err();
+    assert!(e.contains("keystore_account_count()"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -688,6 +713,93 @@ fn seeding_after_the_state_is_installed_is_caught() {
     );
     let e = check_the_reserver_is_seeded(&mutant).unwrap_err();
     assert!(e.contains("seeded after the state is installed"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------
+// 6b. The load hook returns to the host before it talks to anybody.
+// ---------------------------------------------------------------------------------------
+
+/// `on_context_ready` runs inside the host's plugin-load path, and liblogos loads modules one
+/// at a time — so every millisecond waited here delays every other module. MEASURED before
+/// this split: the module was loaded but unreachable for 3626 ms, long enough that
+/// capability_module gave up handing it the token for `eth_wallet_ui` and never retried.
+fn hook_head_and_worker(src: &str) -> (String, String) {
+    let code = code_only(src);
+    let ctx = enclosing_body(&code, "fn on_context_ready");
+    let (head, worker) = ctx
+        .split_once("std::thread::spawn")
+        .expect("the startup work must be handed to a thread");
+    (head.to_string(), worker.to_string())
+}
+
+/// The body of the named function, brace-matched. The LONGEST match, because the trait
+/// declares an empty default `on_context_ready` above the one that does the work.
+fn enclosing_body(code: &str, sig: &str) -> String {
+    code.match_indices(sig)
+        .map(|(at, _)| {
+            let open = at + code[at..].find('{').expect("no body");
+            code[open..closes(code, open)].to_string()
+        })
+        .max_by_key(String::len)
+        .unwrap_or_else(|| panic!("no `{sig}`"))
+}
+
+fn closes(code: &str, open: usize) -> usize {
+    let (b, mut depth) = (code.as_bytes(), 0i32);
+    for i in open..b.len() {
+        match b[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    code.len()
+}
+
+#[test]
+fn the_load_hook_hands_the_host_back_before_it_calls_anybody() {
+    let (head, worker) = hook_head_and_worker(GLUE);
+    assert!(!head.contains("modules()"), "the hook calls out before returning:\n{head}");
+    for call in ["seed_eth_rpc(", "seed_token_list(", "arm_keystore(", "arm_gate_feed("] {
+        assert!(!head.contains(call), "`{call}` runs on the host's thread");
+        assert!(worker.contains(call), "`{call}` was dropped rather than moved");
+    }
+}
+
+#[test]
+fn hoisting_the_seeding_back_onto_the_host_thread_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "        std::thread::spawn(move || {\n            let b = Budget::new(STARTUP_BUDGET);\n            seed_eth_rpc(&deps, &st, &b);",
+        "        seed_eth_rpc(&deps, &st, &Budget::new(STARTUP_BUDGET));\n        std::thread::spawn(move || {\n            let b = Budget::new(STARTUP_BUDGET);",
+    );
+    let (head, _) = hook_head_and_worker(&mutant);
+    assert!(head.contains("seed_eth_rpc("), "the mutant did not land where the rule looks");
+}
+
+#[test]
+fn the_startup_worker_seeds_before_it_arms() {
+    // A feed armed ahead of the seeds relays our own writes back to us as a change.
+    let (_, worker) = hook_head_and_worker(GLUE);
+    let seed = worker.find("seed_eth_rpc(").expect("no seeding");
+    let arm = worker.find("arm_gate_feed(").expect("no arming");
+    assert!(seed < arm, "the worker arms before it seeds");
+}
+
+#[test]
+fn the_state_is_installed_before_the_worker_can_reach_it() {
+    // The worker holds an `Arc<State>` cloned from the install. Spawning first would hand it
+    // a state the R-1 nonce seed had not yet burned.
+    let code = code_only(GLUE);
+    let ctx = enclosing_body(&code, "fn on_context_ready");
+    let at = |n: &str| ctx.find(n).unwrap_or_else(|| panic!("no `{n}` in the hook"));
+    assert!(at("sends.seed_spent(") < at("self.state.write()"));
+    assert!(at("self.state.write()") < at("std::thread::spawn("));
 }
 
 // ---------------------------------------------------------------------------------------

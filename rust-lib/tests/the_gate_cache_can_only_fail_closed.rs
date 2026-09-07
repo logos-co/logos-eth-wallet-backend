@@ -369,10 +369,10 @@ fn a_watcher_installed_after_the_flag_is_raised_is_rejected() {
 
 #[test]
 fn a_runtime_without_the_status_channel_latches_the_cache_cold() {
-    let b = body("watch_gate");
+    let b = body("arm_gate_feed");
     assert!(
         latches_cold_only_without_a_status_channel(&b),
-        "`watch_gate` must latch cold exactly when the runtime cannot report an arm"
+        "`arm_gate_feed` must latch cold exactly when the runtime cannot report an arm"
     );
     assert!(b.contains("eprintln!"), "and say so where an operator would see it");
 }
@@ -432,8 +432,8 @@ fn a_lost_feed_comes_back_by_taking_a_new_subscription() {
         "`gate_feed` must re-subscribe through `arm_gate`, boundedly, and open nothing itself"
     );
     // The flag is released when the thread exits, which is what lets a gated read try again
-    // after the retries run out. `listen` owns that, and `watch_gate` hands the feed to it.
-    assert!(body("watch_gate").contains("listen(self.feeds.gate.clone()"));
+    // after the retries run out. `listen` owns that, and `arm_gate_feed` hands the feed to it.
+    assert!(body("arm_gate_feed").contains("listen(flag, cache,"));
 }
 
 #[test]
@@ -466,8 +466,14 @@ fn nothing_else_writes_the_cache() {
 #[test]
 fn every_feed_is_armed_at_startup_and_retried_from_a_read() {
     let ctx = body("on_context_ready");
-    for arm in ["self.watch_gate()", "self.watch_chain_config()", "self.watch_token_list()"] {
-        assert!(ctx.contains(arm), "nothing arms `{arm}` at startup");
+    // Inside the worker, not on the host's plugin-load path: the arms are three cross-process
+    // subscribes and the host loads modules one at a time.
+    let (head, worker) = ctx
+        .split_once("std::thread::spawn")
+        .expect("the startup work must be handed to a thread");
+    for arm in ["arm_gate_feed(", "arm_chain_config(", "arm_token_list("] {
+        assert!(worker.contains(arm), "nothing arms `{arm}` at startup");
+        assert!(!head.contains(arm), "`{arm}` runs before the host gets its thread back");
     }
     // A feed that ended releases its flag, so the read that needs it arms a fresh one.
     assert!(body("verified_verdict_within").contains("self.watch_gate()"));

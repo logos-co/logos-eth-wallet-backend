@@ -335,14 +335,14 @@ struct EthWalletBackendImpl {
     /// borrowing through it. That is what makes holding it across an outbound call
     /// unexpressible: the state a method works on outlives the lock by construction.
     state: RwLock<Option<Arc<State>>>,
-    deps: DepInit,
+    deps: Arc<DepInit>,
     /// Built once with the module and never replaced. `on_context_ready` can be called
     /// again — a re-init installs a fresh `State` — and a second ledger would drop every
     /// reservation at once, including those protecting transactions already on chain.
     sends: Arc<SendLedger>,
     /// Whether the keystore relay is armed. `on_context_ready` can run again, and a second
     /// listener thread would sit on a channel nothing closes for the life of the process.
-    watching_keystore: AtomicBool,
+    watching_keystore: Arc<AtomicBool>,
     feeds: Feeds,
     /// Which chains may be gated without asking eth_rpc at all. Shared with the listener
     /// thread that keeps it honest; see [`crate::gate`] for why only `off` is ever held.
@@ -352,7 +352,7 @@ struct EthWalletBackendImpl {
 /// The subscriptions this module keeps open on its dependencies. Each flag is held for as
 /// long as its thread runs, so a feed that ends re-arms on the next read rather than going
 /// quiet for the life of the process — unlike `watching_keystore`, which is armed once.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Feeds {
     gate: Arc<AtomicBool>,
     chains: Arc<AtomicBool>,
@@ -469,6 +469,175 @@ fn keystore_account_count() -> i64 {
     v.get("accounts").and_then(Value::as_array).map(|a| a.len() as i64).unwrap_or(-1)
 }
 
+/// Seed a network's transport where eth_rpc has none. `chains.json` is shared with other
+/// wallets on this device: seeding is ours to do, overwriting is not.
+fn seed_chain_config(chain_id: u64, rpc_url: &str, b: &Budget) -> Result<(), String> {
+    if rpc_url.trim().is_empty() {
+        return Ok(());
+    }
+    let t = b.take(INIT_BUDGET).ok_or_else(|| "no time left to seed a chain".to_string())?;
+    let cfg = json!({ "endpoint": rpc_url, "timeoutSecs": 8 });
+    let raw = modules()
+        .eth_rpc_module
+        .ensure_chain_config_with_timeout(chain_id as i64, &cfg.to_string(), t)
+        .map_err(|e| format!("{e:?}"))?;
+    expect_ok(&raw).map(|_| ())
+}
+
+/// Give eth_rpc a transport for every network without ever overwriting one. Runs at
+/// startup and, if it did not land, at most once per consumer-facing read after that.
+/// Four calls, all charged to `b`: the retry must not outlast the read that triggered it.
+fn seed_eth_rpc(deps: &DepInit, state: &State, b: &Budget) {
+    if deps.eth_rpc.load(Ordering::Relaxed) {
+        return;
+    }
+    // A url the user set while eth_rpc was down goes in first, so it claims an absent
+    // slot ahead of the built-in default. Both writes only ever fill an absent field.
+    // The settings are copied out first — none of these calls runs under the guard.
+    for n in state.settings.try_load().map(|s| s.networks).unwrap_or_default() {
+        let _ = seed_chain_config(n.chain_id, &n.rpc_url, b);
+    }
+    // Keyed and idempotent per chain, so no gate: a store with one chain configured and
+    // another missing still needs seeding.
+    let Some(t) = b.take(INIT_BUDGET) else { return };
+    let Ok(raw) = modules().eth_rpc_module.init_defaults_with_timeout(t) else {
+        return;
+    };
+    if depinit::reply_ok(&raw) {
+        deps.eth_rpc.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Relay the keystore's account changes to this module's own subscribers, so a view one
+/// hop further out learns about a rename it can see but cannot subscribe to. The
+/// subscription is a blocking iterator, so it needs a thread of its own; `concurrency:
+/// "multi"` is what makes that safe.
+fn arm_keystore(flag: &AtomicBool) {
+    if flag.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut ks = modules().keystore_module;
+    let Ok(sub) = ks.on_accounts_changed() else {
+        // Only a client that could not be built lands here; lp defers a module that is
+        // merely not up yet. Un-arm so the next account read tries again.
+        flag.store(false, Ordering::SeqCst);
+        return;
+    };
+    std::thread::spawn(move || {
+        // Arming is not retroactive and nothing buffers, so a change made before this
+        // point is lost. One read closes that window — off the host thread, because
+        // `on_context_ready` is time-budgeted and this is not part of startup.
+        emit_accounts_changed(keystore_account_count());
+        for ev in sub {
+            let count = keystore_module::KeystoreModuleClient::decode_accounts_changed(&ev)
+                .map(|e| e.count)
+                .unwrap_or(-1);
+            emit_accounts_changed(count);
+        }
+    });
+}
+
+/// Arm the gate feed. Everything the mode cache is allowed to remember rests on this
+/// subscription: it is what turns "verification is off for this chain" from a reading
+/// taken once into a fact someone is obliged to correct.
+///
+/// Holding the subscription handle is NOT that fact. A subscription taken from
+/// `on_context_ready` is deferred until eth_rpc listens, so the handle exists across a
+/// window in which nobody would tell us the user switched verification ON. Only the
+/// runtime's per-module status channel separates the two, so a runtime without one
+/// latches the cache cold instead and every gated read pays its own probe.
+fn arm_gate_feed(flag: Arc<AtomicBool>, cache: Arc<gate::ModeCache>) {
+    if flag.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if !gate::status_channel(&logos_rust_sdk::protocol_version()) {
+        // No one here can say when a subscription arms or dies, and a handle that merely
+        // exists is not an arm. Latched for the process, which makes `feed_live` inert.
+        cache.no_status_channel();
+        eprintln!(
+            "eth_wallet_backend: logos-protocol {} carries no per-module subscription \
+             status channel; the verified-proxy gate reads live on every check",
+            logos_rust_sdk::protocol_version()
+        );
+    }
+    listen(flag, cache, |cache| gate_feed(&cache));
+}
+
+/// Arm the chain-config feed. Freshness only — `list_networks` serves eth_rpc's record,
+/// and this is how a view learns the other app moved an endpoint. The gate invalidation
+/// is belt and braces: a config change that did not move the mode cannot alter a verdict,
+/// since `off` is never blocking whatever the endpoint is.
+fn arm_chain_config(flag: Arc<AtomicBool>, cache: Arc<gate::ModeCache>) {
+    if flag.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut c = modules().eth_rpc_module;
+    let Ok(sub) = c.on_chain_config_changed() else {
+        flag.store(false, Ordering::SeqCst);
+        return;
+    };
+    listen(flag, sub, move |sub| {
+        for ev in sub {
+            if let Some(e) = eth_rpc_module::EthRpcModuleClient::decode_chain_config_changed(&ev)
+            {
+                cache.invalidate(e.chain_id as u64);
+                emit_networks_changed(e.chain_id);
+            }
+        }
+    });
+}
+
+/// Relay token_list's catalogue changes as this module's own `tokens_changed`. Same
+/// argument as the keystore relay: the rows this wallet OFFERS on a chain are that
+/// catalogue filtered by local settings, so a token another app imported moves them, and
+/// the view can subscribe to us but not to token_list. `config_changed` is deliberately
+/// not relayed — a proxy or interval edit moves no row, and the one field that does
+/// (`useEmbeddedList`) already comes back as `tokens_updated` per chain that moved.
+fn arm_token_list(flag: Arc<AtomicBool>) {
+    if flag.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut t = modules().token_list_module;
+    let Ok(sub) = t.on_tokens_updated() else {
+        flag.store(false, Ordering::SeqCst);
+        return;
+    };
+    listen(flag, sub, |sub| {
+        for ev in sub {
+            if let Some(e) =
+                token_list_module::TokenListModuleClient::decode_tokens_updated(&ev)
+            {
+                emit_tokens_changed(e.chain_id);
+            }
+        }
+    });
+}
+
+/// Ask token_list whether it holds a config and, only if it says it holds none, tell it
+/// to apply its own defaults. Unkeyed, so the gate is mandatory; an `Err` or an `unready`
+/// initializes nothing — a call that did not arrive is not an empty config.
+fn seed_token_list(deps: &DepInit, b: &Budget) {
+    if deps.token_list.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(t) = b.take(PROBE_BUDGET) else { return };
+    let Ok(status) = modules().token_list_module.config_status_with_timeout(t) else {
+        return;
+    };
+    match depinit::next_step(&status) {
+        Next::Settled => deps.token_list.store(true, Ordering::Relaxed),
+        Next::Initialize => {
+            let Some(t) = b.take(INIT_BUDGET) else { return };
+            let applied = modules().token_list_module.init_defaults_with_timeout(t);
+            // `applied: false` is another consumer having got there first, not a failure.
+            if applied.map(|raw| depinit::reply_ok(&raw)).unwrap_or(false) {
+                deps.token_list.store(true, Ordering::Relaxed);
+            }
+        }
+        Next::AskAgain => {}
+    }
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
 }
@@ -582,177 +751,31 @@ impl EthWalletBackendImpl {
         Ok(self.settings()?.active_chain_id)
     }
 
-    /// Seed a network's transport where eth_rpc has none. `chains.json` is shared with other
-    /// wallets on this device: seeding is ours to do, overwriting is not.
-    fn seed_chain_config(&self, chain_id: u64, rpc_url: &str, b: &Budget) -> Result<(), String> {
-        if rpc_url.trim().is_empty() {
-            return Ok(());
-        }
-        let t = b.take(INIT_BUDGET).ok_or_else(|| "no time left to seed a chain".to_string())?;
-        let cfg = json!({ "endpoint": rpc_url, "timeoutSecs": 8 });
-        let raw = modules()
-            .eth_rpc_module
-            .ensure_chain_config_with_timeout(chain_id as i64, &cfg.to_string(), t)
-            .map_err(|e| format!("{e:?}"))?;
-        expect_ok(&raw).map(|_| ())
-    }
 
-    /// Give eth_rpc a transport for every network without ever overwriting one. Runs at
-    /// startup and, if it did not land, at most once per consumer-facing read after that.
-    /// Four calls, all charged to `b`: the retry must not outlast the read that triggered it.
     fn ensure_eth_rpc(&self, b: &Budget) {
-        if self.deps.eth_rpc.load(Ordering::Relaxed) {
-            return;
-        }
-        // A url the user set while eth_rpc was down goes in first, so it claims an absent
-        // slot ahead of the built-in default. Both writes only ever fill an absent field.
-        // The settings are copied out first — none of these calls runs under the guard.
         if let Ok(st) = self.state() {
-            for n in st.settings.try_load().map(|s| s.networks).unwrap_or_default() {
-                let _ = self.seed_chain_config(n.chain_id, &n.rpc_url, b);
-            }
-        }
-        // Keyed and idempotent per chain, so no gate: a store with one chain configured and
-        // another missing still needs seeding.
-        let Some(t) = b.take(INIT_BUDGET) else { return };
-        let Ok(raw) = modules().eth_rpc_module.init_defaults_with_timeout(t) else {
-            return;
-        };
-        if depinit::reply_ok(&raw) {
-            self.deps.eth_rpc.store(true, Ordering::Relaxed);
+            seed_eth_rpc(&self.deps, &st, b)
         }
     }
 
-    /// Relay the keystore's account changes to this module's own subscribers, so a view one
-    /// hop further out learns about a rename it can see but cannot subscribe to. The
-    /// subscription is a blocking iterator, so it needs a thread of its own; `concurrency:
-    /// "multi"` is what makes that safe.
     fn watch_keystore(&self) {
-        if self.watching_keystore.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let mut ks = modules().keystore_module;
-        let Ok(sub) = ks.on_accounts_changed() else {
-            // Only a client that could not be built lands here; lp defers a module that is
-            // merely not up yet. Un-arm so the next account read tries again.
-            self.watching_keystore.store(false, Ordering::SeqCst);
-            return;
-        };
-        std::thread::spawn(move || {
-            // Arming is not retroactive and nothing buffers, so a change made before this
-            // point is lost. One read closes that window — off the host thread, because
-            // `on_context_ready` is time-budgeted and this is not part of startup.
-            emit_accounts_changed(keystore_account_count());
-            for ev in sub {
-                let count = keystore_module::KeystoreModuleClient::decode_accounts_changed(&ev)
-                    .map(|e| e.count)
-                    .unwrap_or(-1);
-                emit_accounts_changed(count);
-            }
-        });
+        arm_keystore(&self.watching_keystore)
     }
 
-    /// Arm the gate feed. Everything the mode cache is allowed to remember rests on this
-    /// subscription: it is what turns "verification is off for this chain" from a reading
-    /// taken once into a fact someone is obliged to correct.
-    ///
-    /// Holding the subscription handle is NOT that fact. A subscription taken from
-    /// `on_context_ready` is deferred until eth_rpc listens, so the handle exists across a
-    /// window in which nobody would tell us the user switched verification ON. Only the
-    /// runtime's per-module status channel separates the two, so a runtime without one
-    /// latches the cache cold instead and every gated read pays its own probe.
     fn watch_gate(&self) {
-        if self.feeds.gate.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let cache = self.gate.clone();
-        if !gate::status_channel(&logos_rust_sdk::protocol_version()) {
-            // No one here can say when a subscription arms or dies, and a handle that merely
-            // exists is not an arm. Latched for the process, which makes `feed_live` inert.
-            cache.no_status_channel();
-            eprintln!(
-                "eth_wallet_backend: logos-protocol {} carries no per-module subscription \
-                 status channel; the verified-proxy gate reads live on every check",
-                logos_rust_sdk::protocol_version()
-            );
-        }
-        listen(self.feeds.gate.clone(), cache, |cache| gate_feed(&cache));
+        arm_gate_feed(self.feeds.gate.clone(), self.gate.clone())
     }
 
-    /// Arm the chain-config feed. Freshness only — `list_networks` serves eth_rpc's record,
-    /// and this is how a view learns the other app moved an endpoint. The gate invalidation
-    /// is belt and braces: a config change that did not move the mode cannot alter a verdict,
-    /// since `off` is never blocking whatever the endpoint is.
     fn watch_chain_config(&self) {
-        if self.feeds.chains.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let mut c = modules().eth_rpc_module;
-        let Ok(sub) = c.on_chain_config_changed() else {
-            self.feeds.chains.store(false, Ordering::SeqCst);
-            return;
-        };
-        let cache = self.gate.clone();
-        listen(self.feeds.chains.clone(), sub, move |sub| {
-            for ev in sub {
-                if let Some(e) = eth_rpc_module::EthRpcModuleClient::decode_chain_config_changed(&ev)
-                {
-                    cache.invalidate(e.chain_id as u64);
-                    emit_networks_changed(e.chain_id);
-                }
-            }
-        });
+        arm_chain_config(self.feeds.chains.clone(), self.gate.clone())
     }
 
-    /// Relay token_list's catalogue changes as this module's own `tokens_changed`. Same
-    /// argument as the keystore relay: the rows this wallet OFFERS on a chain are that
-    /// catalogue filtered by local settings, so a token another app imported moves them, and
-    /// the view can subscribe to us but not to token_list. `config_changed` is deliberately
-    /// not relayed — a proxy or interval edit moves no row, and the one field that does
-    /// (`useEmbeddedList`) already comes back as `tokens_updated` per chain that moved.
     fn watch_token_list(&self) {
-        if self.feeds.tokens.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let mut t = modules().token_list_module;
-        let Ok(sub) = t.on_tokens_updated() else {
-            self.feeds.tokens.store(false, Ordering::SeqCst);
-            return;
-        };
-        listen(self.feeds.tokens.clone(), sub, |sub| {
-            for ev in sub {
-                if let Some(e) =
-                    token_list_module::TokenListModuleClient::decode_tokens_updated(&ev)
-                {
-                    emit_tokens_changed(e.chain_id);
-                }
-            }
-        });
+        arm_token_list(self.feeds.tokens.clone())
     }
 
-    /// Ask token_list whether it holds a config and, only if it says it holds none, tell it
-    /// to apply its own defaults. Unkeyed, so the gate is mandatory; an `Err` or an `unready`
-    /// initializes nothing — a call that did not arrive is not an empty config.
     fn ensure_token_list(&self, b: &Budget) {
-        if self.deps.token_list.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(t) = b.take(PROBE_BUDGET) else { return };
-        let Ok(status) = modules().token_list_module.config_status_with_timeout(t) else {
-            return;
-        };
-        match depinit::next_step(&status) {
-            Next::Settled => self.deps.token_list.store(true, Ordering::Relaxed),
-            Next::Initialize => {
-                let Some(t) = b.take(INIT_BUDGET) else { return };
-                let applied = modules().token_list_module.init_defaults_with_timeout(t);
-                // `applied: false` is another consumer having got there first, not a failure.
-                if applied.map(|raw| depinit::reply_ok(&raw)).unwrap_or(false) {
-                    self.deps.token_list.store(true, Ordering::Relaxed);
-                }
-            }
-            Next::AskAgain => {}
-        }
+        seed_token_list(&self.deps, b)
     }
 
     /// eth_rpc's verified-proxy verdict for `chain_id`, or a synthetic blocking one when it
@@ -1678,24 +1701,33 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             eprintln!("eth_wallet_backend: {seeded} unsettled nonces carried over from disk");
         }
 
+        let st = Arc::new(State { settings, contacts, history, sends: self.sends.clone() });
         if let Ok(mut g) = self.state.write() {
-            *g = Some(Arc::new(State { settings, contacts, history, sends: self.sends.clone() }));
+            *g = Some(st.clone());
         }
         // eth_rpc first: every balance, fee and send goes through it while token_list only
         // decorates. Neither may fail startup, and neither writes over an existing config.
-        // ONE budget across both: the host is blocked in here, and six individually bounded
-        // calls still add up to ~26s. What does not fit is retried on the first read.
-        let b = Budget::new(STARTUP_BUDGET);
-        self.ensure_eth_rpc(&b);
-        self.ensure_token_list(&b);
-        // After the state above exists: the relay's first act is a `list_accounts`, and a
-        // consumer must never be told to re-read before this module can answer.
-        self.watch_keystore();
-        // Arm before the first gated read rather than on it: the gate cache may only trust an
-        // answer read after its feed existed, so arming late costs a live read per chain.
-        self.watch_gate();
-        self.watch_chain_config();
-        self.watch_token_list();
+        // ONE budget across both. What does not fit is retried on the first read.
+        //
+        // Off the host thread, because this runs inside the host's plugin-load path and
+        // liblogos loads modules one at a time — anything waited on here delays every other
+        // module's load. The worker does not make these calls in PARALLEL: the SDK marshals
+        // every outbound call back onto this module's Qt main thread. It makes them once the
+        // loop is free, which is the whole win. Do not "optimise" this on a parallelism
+        // model that does not exist.
+        let (deps, feeds, gate, ks) =
+            (self.deps.clone(), self.feeds.clone(), self.gate.clone(), self.watching_keystore.clone());
+        std::thread::spawn(move || {
+            let b = Budget::new(STARTUP_BUDGET);
+            seed_eth_rpc(&deps, &st, &b);
+            seed_token_list(&deps, &b);
+            // After the seeds, not before: a feed is worth arming on a dependency that has a
+            // config to change, and arming first would relay our own writes back as a change.
+            arm_keystore(&ks);
+            arm_gate_feed(feeds.gate.clone(), gate.clone());
+            arm_chain_config(feeds.chains.clone(), gate);
+            arm_token_list(feeds.tokens);
+        });
     }
 
     fn list_networks(&self) -> String {
