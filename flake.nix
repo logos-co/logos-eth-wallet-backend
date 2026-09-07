@@ -6,7 +6,8 @@
     # Every dependency must build against THIS module-builder. Without the follows each
     # drags its own, and a skewed generated ABI segfaults the module inside provider init.
     eth_rpc_module = {
-      url = "github:logos-co/logos-evm-eth-rpc-module";
+      # TEMPORARY PIN — revert to the bare URL when the caller deadline merges.
+      url = "github:logos-co/logos-evm-eth-rpc-module/feat/caller-deadline-on-call";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     fee_module = {

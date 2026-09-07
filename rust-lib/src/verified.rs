@@ -20,11 +20,15 @@ pub struct Answer {
 pub fn unwrap_answer(reply: &str) -> Result<Answer, String> {
     let v: Value = serde_json::from_str(reply).map_err(|e| e.to_string())?;
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(v
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("eth_rpc call failed")
-            .to_string());
+        let why = v.get("error").and_then(Value::as_str).unwrap_or("eth_rpc call failed");
+        // eth_rpc's `code` separates a slow endpoint from a dead one; its prose cannot,
+        // because a body-phase expiry and a malformed body word themselves identically.
+        // Said here rather than left implicit: a user retries the first and replaces the
+        // second, and the two used to reach the screen looking the same.
+        return Err(match v.get("code").and_then(Value::as_str) {
+            Some("timeout") => format!("{why} — the endpoint is reachable but slow"),
+            _ => why.to_string(),
+        });
     }
     Ok(Answer {
         value: v.get("result").or_else(|| v.get("hash")).cloned().unwrap_or(Value::Null),
@@ -134,6 +138,26 @@ pub fn blocked_chain_json(chain_id: u64, network: &str, hashes: &[String], verdi
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_slow_endpoint_and_a_dead_one_no_longer_read_the_same() {
+        // The user-visible half of the defect: both used to arrive as one sentence, and the
+        // action differs — you retry a slow endpoint and you replace a wrong one.
+        let slow = r#"{"ok":false,"code":"timeout","error":"no answer within 2700ms: stalled"}"#;
+        let dead = r#"{"ok":false,"code":"http","error":"http: connection refused"}"#;
+        let s = unwrap_answer(slow).err().expect("a refusal is not an answer");
+        let d = unwrap_answer(dead).err().expect("a refusal is not an answer");
+        assert!(s.contains("reachable but slow"), "{s}");
+        assert!(!d.contains("reachable but slow"), "{d}");
+        assert_ne!(s, d);
+    }
+
+    #[test]
+    fn a_refusal_from_an_eth_rpc_that_sends_no_code_is_carried_through_unchanged() {
+        // Every other refusal on that module, and any binary predating the code field.
+        let old = r#"{"ok":false,"error":"no configuration for chain 1"}"#;
+        assert_eq!(unwrap_answer(old).err().unwrap(), "no configuration for chain 1");
+    }
     use super::*;
 
     /// The one shape `unknown_verdict` did not check. `state` alone used to open every gated

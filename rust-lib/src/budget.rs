@@ -22,18 +22,6 @@ pub const CATALOGUE_BUDGET: Duration = Duration::from_secs(3);
 /// this crosses a network, so 3s is a working number rather than slack.
 pub const RPC_BUDGET: Duration = Duration::from_secs(3);
 
-/// eth_rpc's own per-request HTTP timeout, and the value THIS module seeds into the shared
-/// `chains.json`. It lives here because the grant sized against it lives here: the two used
-/// to be literals 1400 lines apart, and they disagreed.
-pub const ETH_RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// The Multicall3 read that answers every balance row. STRICTLY greater than the timeout
-/// above: a caller that expires before its callee does not stop the request, it only stops
-/// us reading the answer — and it gives up at the moment eth_rpc was about to word a real
-/// refusal, so a wrong endpoint reads as a slow one. `RPC_BUDGET` stays 3s everywhere else,
-/// where giving up leaves a pending row or an em-dash. This read has nothing else to show.
-pub const BALANCES_RPC_BUDGET: Duration = Duration::from_secs(9);
-
 /// The aggregates. `READ_BUDGET` covers a whole consumer-facing read including the lazy
 /// dependency retry in front of it; `STARTUP_BUDGET` covers everything the load hook may
 /// spend seeding dependencies — on its own worker, so the host waits for none of it.
@@ -51,12 +39,31 @@ pub const SEND_BUDGET: Duration = Duration::from_millis(13_500);
 /// read that answers every row. The gate is INSIDE it — an unbounded probe in front of a
 /// read is time a user waits that no budget can see — and it is sized so the gate and the
 /// read both fit, because a balance list cannot degrade the way a network row can.
-pub const BALANCES_BUDGET: Duration = Duration::from_secs(12);
+pub const BALANCES_BUDGET: Duration = Duration::from_secs(6);
 
 /// One `suggest_fees`: the verified gate, the lazy eth_rpc retry, and one `fee_module`
 /// estimate. It reaches eth_rpc through fee_module and used to seed nothing, so a first run
 /// answered `unknown chain` whenever the load hook had not landed.
 pub const FEES_BUDGET: Duration = Duration::from_secs(11);
+
+/// One IPC hop out, the callee's reply serialization, and one hop back.
+const CALLEE_MARGIN: Duration = Duration::from_millis(300);
+
+/// The deadline handed to a callee that takes one, derived from the transport bound carrying
+/// the same call. STRICTLY shorter, and `None` when too little is left to be worth asking:
+/// the two race, and the callee must lose — otherwise its worded refusal arrives after we
+/// stopped listening, which is the whole defect.
+///
+/// `None` must NOT be spelled `0` on the wire. eth_rpc reads `0` as "use your configured
+/// timeout", so an underflow to zero would silently authorize 8s — the exact mismatch this
+/// removes. `slice` grants anything at or above `MIN_SLICE`, so a flat subtraction would
+/// underflow for every grant below the margin.
+pub fn callee_deadline(transport: Duration) -> Option<i64> {
+    transport
+        .checked_sub(CALLEE_MARGIN)
+        .filter(|d| *d >= MIN_SLICE)
+        .map(|d| d.as_millis() as i64)
+}
 
 /// One `verified_proxy_state`: the verdict probe alone. A report rather than a gate — here
 /// the verdict IS the answer — but a chip polling every five seconds must not be able to
@@ -170,12 +177,12 @@ mod tests {
     #[test]
     fn a_balance_read_is_bounded_across_its_gate_and_its_multicall() {
         let mut calls = vec![INIT_BUDGET; 4];
-        calls.extend([PROBE_BUDGET, BALANCES_RPC_BUDGET]);
+        calls.extend([PROBE_BUDGET, RPC_BUDGET]);
         assert!(calls.iter().sum::<Duration>() > BALANCES_BUDGET, "the aggregate must bind");
         assert!(walk(BALANCES_BUDGET, &calls) <= BALANCES_BUDGET);
         // The two calls that actually answer must BOTH fit, gate included, or a wallet whose
         // dependency is merely slow reports no balances at all.
-        assert!(PROBE_BUDGET + BALANCES_RPC_BUDGET <= BALANCES_BUDGET);
+        assert!(PROBE_BUDGET + RPC_BUDGET <= BALANCES_BUDGET);
     }
 
     #[test]
@@ -223,28 +230,32 @@ mod tests {
         assert!(walk(STARTUP_BUDGET, &calls) <= STARTUP_BUDGET);
     }
 
-    /// The assertion whose absence let a 3s cap ship against an 8s callee. The wallet was
-    /// timing out a request eth_rpc had not abandoned, then rendering its own Debug blob —
-    /// so a wrong endpoint and a slow one produced the same screen, ~3s early.
+    /// The rule that replaces the constant this file used to mirror from eth_rpc: the callee
+    /// is bounded BY us rather than predicted by us, so it structurally cannot outlive the
+    /// grant that carries it.
     #[test]
-    fn a_balance_read_outlasts_the_timeout_the_wallet_itself_seeds() {
-        // ETH_RPC_HTTP_TIMEOUT mirrors eth-rpc/rust-lib/src/rpc.rs:18-23, which this module
-        // writes into chains.json at `seed_chain_config`.
-        assert!(
-            BALANCES_RPC_BUDGET > ETH_RPC_HTTP_TIMEOUT,
-            "a grant shorter than its callee's own timeout cannot produce the callee's refusal"
-        );
+    fn a_callee_deadline_is_always_strictly_shorter_than_the_transport_bound_that_carries_it() {
+        for ms in [50u64, 51, 299, 300, 301, 350, 500, 3_000, 9_000, 20_000] {
+            let t = Duration::from_millis(ms);
+            match callee_deadline(t) {
+                Some(d) => {
+                    let d = Duration::from_millis(d as u64);
+                    assert!(d < t, "{ms}ms granted the callee {d:?}, which is not shorter");
+                }
+                None => assert!(t < CALLEE_MARGIN + MIN_SLICE, "{ms}ms should have granted"),
+            }
+        }
     }
 
+    /// `0` is eth_rpc's spelling of "use your own configured timeout" — 8 seconds. A grant
+    /// that underflowed to zero would therefore authorize the very mismatch this removes,
+    /// and `slice` hands out grants as small as MIN_SLICE.
     #[test]
-    fn a_balance_read_still_grants_its_multicall_the_cap_in_full_after_the_gate() {
-        // Real slack, not a zero-remainder partition: an exact fit means any drift in the
-        // gate silently shortens the read that follows it.
-        assert_eq!(
-            slice(BALANCES_BUDGET, PROBE_BUDGET, BALANCES_RPC_BUDGET),
-            Some(BALANCES_RPC_BUDGET)
-        );
-        assert!(BALANCES_BUDGET - PROBE_BUDGET - BALANCES_RPC_BUDGET >= Duration::from_secs(1));
+    fn a_grant_too_small_to_carry_a_deadline_sends_none_rather_than_zero() {
+        for ms in [50u64, 100, 299, 349] {
+            assert_eq!(callee_deadline(Duration::from_millis(ms)), None, "{ms}ms");
+        }
+        assert_eq!(callee_deadline(Duration::from_millis(350)), Some(50));
     }
 
     #[test]

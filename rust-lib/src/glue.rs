@@ -19,9 +19,9 @@ use alloy::primitives::U256;
 use serde_json::{json, Value};
 
 use crate::budget::{
-    Budget, BALANCES_BUDGET, BALANCES_RPC_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET,
-    ETH_RPC_HTTP_TIMEOUT, FEES_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET,
-    RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET, SWEEP_BUDGET, VERDICT_BUDGET,
+    callee_deadline, Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET,
+    INIT_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET,
+    STARTUP_BUDGET, SWEEP_BUDGET, VERDICT_BUDGET,
 };
 use crate::depinit::{self, Next};
 use crate::gate::{self, Gate};
@@ -476,7 +476,10 @@ fn seed_chain_config(chain_id: u64, rpc_url: &str, b: &Budget) -> Result<(), Str
         return Ok(());
     }
     let t = b.take(INIT_BUDGET).ok_or_else(|| "no time left to seed a chain".to_string())?;
-    let cfg = json!({ "endpoint": rpc_url, "timeoutSecs": ETH_RPC_HTTP_TIMEOUT.as_secs() });
+    // Endpoint only. `ensure_chain_config` fills per FIELD, so leaving `timeoutSecs` out
+    // makes eth_rpc's own default the single owner of it — a wallet writing its copy of
+    // another module's number into a device-shared file was the original mismatch.
+    let cfg = json!({ "endpoint": rpc_url });
     let raw = modules()
         .eth_rpc_module
         .ensure_chain_config_with_timeout(chain_id as i64, &cfg.to_string(), t)
@@ -1562,7 +1565,7 @@ impl EthWalletBackendImpl {
         let t = b.take(RPC_BUDGET).ok_or("no time left to read the token balance")?;
         let raw = modules()
             .eth_rpc_module
-            .call_with_timeout(chain_id as i64, &call.to_string(), t)
+            .call_with_timeout(chain_id as i64, &call.to_string(), callee_deadline(t), t)
             .map_err(|e| format!("{e:?}"))?;
         let a = unwrap_answer(&raw)?;
         let v = a.value.as_str()
@@ -2038,11 +2041,19 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             "to": txbuild::multicall3_address().to_string(),
             "data": format!("0x{}", hex::encode(&data)),
         });
-        let Some(t) = b.take(BALANCES_RPC_BUDGET) else {
+        let Some(t) = b.take(RPC_BUDGET) else {
             return err("no time left to read the balances");
         };
         let payload = call.to_string();
-        let raw = match modules().eth_rpc_module.call_with_timeout(chain_id as i64, &payload, t) {
+        // One `t`, two slots: the transport bound we wait for, and a strictly shorter
+        // deadline eth_rpc bounds ITSELF by. The callee losing that race is what makes its
+        // own worded refusal reach the screen instead of our Debug render of a timeout.
+        let raw = match modules().eth_rpc_module.call_with_timeout(
+            chain_id as i64,
+            &payload,
+            callee_deadline(t),
+            t,
+        ) {
             Ok(r) => r,
             // Only OUR deadline or a missing eth_rpc reaches here: every network failure it
             // has — DNS, refused, TLS, its own socket timeout — comes back as a reply below,

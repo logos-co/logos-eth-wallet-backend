@@ -160,15 +160,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1788438410,
-        "narHash": "sha256-82nQOmHBV+lKm3sEpdrr4pbEmYU4Qas0F/xFsXMbgYQ=",
+        "lastModified": 1788802606,
+        "narHash": "sha256-EM3Fy9rBl07ecYMkdYct6cFswT5cK9F3uoAt5SQycCc=",
         "owner": "logos-co",
         "repo": "logos-evm-eth-rpc-module",
-        "rev": "d171a1719d7414aa666409af432ee6628779690f",
+        "rev": "045af33e555bf5a86a17dea5873bc932868630ab",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
+        "ref": "feat/caller-deadline-on-call",
         "repo": "logos-evm-eth-rpc-module",
         "type": "github"
       }

@@ -802,22 +802,6 @@ fn the_state_is_installed_before_the_worker_can_reach_it() {
     assert!(at("self.state.write()") < at("std::thread::spawn("));
 }
 
-/// The socket timeout this module SEEDS and the grant it reads under must be one number.
-/// They were two literals 1400 lines apart, and they disagreed: a 3s grant against the 8s
-/// this very function writes, so the wallet gave up on a request eth_rpc was still serving.
-#[test]
-fn the_seeded_socket_timeout_and_the_grant_are_one_number() {
-    let seed = enclosing_body(&code_only(GLUE), "fn seed_chain_config");
-    assert!(
-        seed.contains("ETH_RPC_HTTP_TIMEOUT.as_secs()"),
-        "the seeded timeout must name the constant the grant is sized against:\n{seed}"
-    );
-    assert!(
-        !seed.contains("\"timeoutSecs\": 8"),
-        "a bare literal here is how the two drifted apart"
-    );
-}
-
 // ---------------------------------------------------------------------------------------
 // 7. The ledger's invariant check has exactly one installation, and one way in.
 // ---------------------------------------------------------------------------------------
@@ -1413,7 +1397,7 @@ fn an_allowance_opened_after_the_gate_is_caught() {
 fn the_read_behind_the_gate_is_bounded_too() {
     let mutant = mutate(
         GLUE,
-        ".call_with_timeout(chain_id as i64, &payload, t)",
+        ".call_with_timeout(\n            chain_id as i64,\n            &payload,\n            callee_deadline(t),\n            t,\n        )",
         ".call(chain_id as i64, &payload)",
     );
     let e = check_calls_are_bounded(&mutant).unwrap_err();
