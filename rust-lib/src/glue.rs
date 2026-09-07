@@ -992,9 +992,12 @@ impl EthWalletBackendImpl {
         // token's own units. Nobody can check a figure denominated in wei.
         let amount = units::format_exact(&q.amount.to_string(), q.decimals)
             .unwrap_or_else(|| q.amount.to_string());
+        // For an ERC-20 send the recipient is nowhere else on the signing screen — the
+        // transaction's own `to` is the token contract — so `q.to` carries it. Still a
+        // claim; the leg below is what is actually signed.
         let intent = json!({
             "address": q.from.to_string(),
-            "purpose": format!("Send {amount} {}", q.symbol),
+            "purpose": format!("Send {amount} {} to {}", q.symbol, q.to),
             "legs": [{ "kind": "tx", "chain_id": chain_id, "tx": tx }],
         });
 
