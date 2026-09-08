@@ -3,8 +3,13 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # Every dependency must build against THIS module-builder. Without the follows each
-    # drags its own, and a skewed generated ABI segfaults the module inside provider init.
+    # The follows is for LOCK SIZE: without it each dependency drags its own module-builder
+    # subtree and this lock goes 753 -> 3741 nodes.
+    #
+    # It is NOT a compatibility measure, despite what this comment used to claim. Measured both
+    # ways: the dependencies' published `.lidl` and the consumer code generated from it are
+    # BYTE-IDENTICAL whether a dependency builds against its own module-builder or this one, and
+    # both trees build. There is no ABI skew here to protect against.
     eth_rpc_module = {
       url = "github:logos-co/logos-evm-eth-rpc-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
