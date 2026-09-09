@@ -22,10 +22,10 @@ use crate::budget::{
     Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, INIT_BUDGET,
     PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET,
     SWEEP_BUDGET, VERDICT_BUDGET, callee_deadline};
+use crate::contacts::ContactsStore;
 use crate::depinit::{self, Next};
 use crate::gate::{self, Gate};
 use crate::details;
-use crate::contacts::ContactsStore;
 use crate::history::{self, History, TxRecord};
 use crate::send::{self, BroadcastClaim, SendJob, SendLedger, SendStatus};
 use crate::settings::{Settings, SettingsStore};
@@ -1876,12 +1876,17 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn get_account_wallets(&self) -> String {
+        // Bounded, unlike its two siblings: they are one passthrough call each, this is two,
+        // so an unbounded pair could hold the host for twice the protocol's own default.
+        let b = Budget::new(READ_BUDGET);
         self.watch_keystore();
-        let provenance = match modules().keystore_module.get_provenance() {
+        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to read the wallets") };
+        let provenance = match modules().keystore_module.get_provenance_with_timeout(t) {
             Ok(r) => r,
             Err(e) => return err(format!("{e:?}")),
         };
-        let labels = match modules().keystore_module.get_group_labels() {
+        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to name the wallets") };
+        let labels = match modules().keystore_module.get_group_labels_with_timeout(t) {
             Ok(r) => r,
             Err(e) => return err(format!("{e:?}")),
         };
