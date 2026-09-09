@@ -496,6 +496,93 @@ all-or-nothing meant a single legacy row hid every transaction — and every non
 A file that cannot be read at all still does not swallow the write: the row goes to a sidecar
 beside it, which the nonce sweep already reads and the next successful write folds back in.
 
+## Headless operation (logosctl)
+
+Everything above can be driven from a `logosctl` daemon, with `evm_signer_cli` standing in for
+`evm_signer_ui` and `evm_keystore_cli` for `evm_keystore_ui`. This is the sequence that mined a
+send on a local Anvil (chain id 11155111); the hermetic form, with a requester fixture in place
+of this module, is `doctests/evm-signer-cli-headless.test.yaml` in `logos-evm-signer-cli`.
+
+**Roles, once per daemon.** `configure` is TOTAL — a role the document does not name is held
+by nobody — so restate both roles, GUI surfaces included. Then import a key through the
+custodian:
+
+```bash
+logosctl call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}'
+logosctl module load evm_keystore_cli
+logosctl module load evm_signer_cli
+umask 077; printf '%s\n' 'vault password' > /run/user/501/pw
+logosctl call evm_keystore_cli import_private_key <hex> @/run/user/501/pw
+```
+
+**Load `evm_signer_cli` before the first `send`.** The keystore offers a request to its
+approvers and sweeps an `Offered` record nobody claims after `ABANDONED_OFFER_TTL` — 60 s,
+`approval.rs` — settling it `expired_no_ack`. Every settled reason other than `approved` and
+`rejected` is reported here as `failed`, with the keystore's word as `reason`. A send made
+with no approver loaded is lost, not queued; a loaded one claims the offer at once and waits
+for the human indefinitely.
+
+**The endpoint and the verified mode are read-only here** (see *Configuration this module
+cannot change*). Set them on `eth_rpc_module` directly:
+
+```bash
+logosctl call eth_rpc_module patch_chain_endpoint 11155111 http://127.0.0.1:8545
+logosctl call eth_rpc_module set_verified_proxy_mode 11155111 off        # or required
+```
+
+**Send.** `send` takes ONE argument, the request as text — a quoted JSON document or a bare
+`@file`, never `json:`, which hands the dispatcher an object where the method takes a string.
+The reply is `{ok, pending, requestId, handle}` and never a hash. The prompt arrives on the
+signer's event plane, and the approval is typed there:
+
+```bash
+logosctl call eth_wallet_backend send '{"from":"0xf39F…","to":"0x7099…","amountUnits":"1"}'
+# → {"ok":true,"pending":true,"requestId":"snd_ksh_b524…","handle":"ksh_b524…"}
+logosctl watch evm_signer_cli --event prompt
+logosctl call evm_signer_cli approve ksh_b524… e1c9d03f… @/run/user/501/pw
+```
+
+**`send_status` IS the broadcast.** There is no background thread on this side either: the
+poll that finds the approval collects the signature, broadcasts it exactly once and records
+it. Nothing moves between polls, so poll it after the approval and keep polling until it
+settles:
+
+```bash
+logosctl call eth_wallet_backend send_status snd_ksh_b524…
+# → {"status":"broadcast","route":"direct","hash":"0x5736…"}
+```
+
+Poll a rejection within 120 s as well. The keystore keeps a settled record it holds no
+signatures for only for `SETTLED_RETENTION`; past that, `approval_status` answers
+`not authorized` — an unknown handle is not told apart from a foreign one — and this module
+settles the send as `failed` with that reason. It reads `rejected` only if asked in time.
+
+**Confirmation.** A receipt is fetched by the sweep and by nothing else, and two reads drive
+it. Loop on either until `stillDue` is false; that is the schedule under *Transaction status*
+saying it has stopped. `refresh_tx_status` re-reads one row: the hash must keep its `0x`, it is
+matched case-insensitively against the stored `0x` form; the address may drop it.
+
+```bash
+logosctl call eth_wallet_backend refresh_pending str:0xf39F…
+logosctl call eth_wallet_backend get_history str:0xf39F…
+logosctl call eth_wallet_backend refresh_tx_status str:0xf39F… str:0x5736…
+```
+
+**What `logosctl` does to an argument.** A bare `0x…` is read as a hexadecimal number and
+reaches the module as one — `refresh_tx_status 0xf39F… <hash>` dies with
+`dispatch_failed: expected string at arg0, got number`. Prefix addresses and hashes with
+`str:`, and any other string that happens to look numeric: an account label, a picker query.
+A quoted JSON document and a bare `@file` are already strings.
+
+**Tokens on a testnet.** The embedded Uniswap list is all but empty off mainnet — two sepolia
+rows (UNI, WETH), none on hoodi — and `set_token_enabled` refuses an address
+`token_list_module` does not hold on that chain. Add the token there first:
+
+```bash
+logosctl call token_list_module add_custom_token '{"chainId":11155111,"address":"0x…","name":"…","symbol":"…","decimals":18}'
+logosctl call eth_wallet_backend set_token_enabled 11155111 str:0x… true
+```
+
 ## Building and testing
 
 ```bash
