@@ -1285,8 +1285,8 @@ fn an_allowance_opened_after_the_gate_is_caught() {
 fn the_read_behind_the_gate_is_bounded_too() {
     let mutant = mutate(
         GLUE,
-        ".call_with_timeout(chain_id as i64, &payload, t)",
-        ".call(chain_id as i64, &payload)",
+        ".call_with_timeout(chain_id as i64, &payload, callee_deadline(t), t)",
+        ".call(chain_id as i64, &payload, None)",
     );
     let e = check_calls_are_bounded(&mutant).unwrap_err();
     assert!(e.contains("eth_rpc_module.call with no deadline"), "{e}");
