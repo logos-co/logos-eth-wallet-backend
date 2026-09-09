@@ -1,7 +1,7 @@
 {
   "name": "approver_probe",
   "version": "1.0.0",
-  "description": "Doc-test fixture: a Tier A approver. Stands in for signer_ui so a send can be driven to a real signature without a GUI.",
+  "description": "Doc-test fixture: a Tier A approver. Stands in for evm_signer_ui so a send can be driven to a real signature without a GUI.",
   "author": "Logos Core Team",
   "type": "core",
   "interface": "cdylib",

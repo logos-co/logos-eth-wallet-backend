@@ -11,7 +11,7 @@ over and no L2s.
 ## What this module is not allowed to do
 
 It never sees key material. Signatures are *requested* from `keystore_module` and authorised
-by a human in `signer_ui`; account creation, import and export belong to `keystore_ui` and
+by a human in `evm_signer_ui`; account creation, import and export belong to `evm_keystore_ui` and
 are refused to everyone else. This module can read which accounts exist, and nothing more.
 
 ## Dependencies
@@ -69,7 +69,7 @@ send has `send_status_changed`; a plain history view has this.
 `accounts_changed` is not this module's own: it is `keystore_module`'s, subscribed here and
 re-emitted verbatim.
 
-The relay exists because the keystore is mutated from a **different app** — `keystore_ui` —
+The relay exists because the keystore is mutated from a **different app** — `evm_keystore_ui` —
 and the wallet view has to learn about it. The view could subscribe to the keystore directly,
 but only by naming it a dependency, which hands a renderer a token for the keystore's whole
 surface including `request_approval`. Relaying keeps the view's dependency set at exactly this
