@@ -22,6 +22,25 @@ pub const CATALOGUE_BUDGET: Duration = Duration::from_secs(3);
 /// this crosses a network, so 3s is a working number rather than slack.
 pub const RPC_BUDGET: Duration = Duration::from_secs(3);
 
+/// The deadline to hand a callee that this caller will wait `transport` for.
+///
+/// Shorter than the transport bound on purpose. The two clocks start together, so a callee
+/// given the SAME budget finishes exactly as the caller stops listening, and its error
+/// sentence -- the one naming which endpoint failed and why -- is lost to a bare timeout.
+/// The margin buys the reply its trip home.
+///
+/// None when there is not enough left to be worth bounding: below `MIN_SLICE` the callee
+/// would spend its whole allowance failing, so it is better told nothing and left to its own
+/// default than handed a deadline it cannot meet.
+pub fn callee_deadline(transport: Duration) -> Option<i64> {
+    transport
+        .checked_sub(CALLEE_MARGIN)
+        .filter(|d| *d >= MIN_SLICE)
+        .map(|d| d.as_millis() as i64)
+}
+
+const CALLEE_MARGIN: Duration = Duration::from_millis(300);
+
 /// The aggregates. `READ_BUDGET` covers a whole consumer-facing read including the lazy
 /// dependency retry in front of it; `STARTUP_BUDGET` covers everything the load hook may
 /// spend seeding dependencies before it hands control back to the host.

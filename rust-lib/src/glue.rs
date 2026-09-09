@@ -21,8 +21,7 @@ use serde_json::{json, Value};
 use crate::budget::{
     Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, INIT_BUDGET,
     PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET,
-    SWEEP_BUDGET, VERDICT_BUDGET,
-};
+    SWEEP_BUDGET, VERDICT_BUDGET, callee_deadline};
 use crate::depinit::{self, Next};
 use crate::gate::{self, Gate};
 use crate::details;
@@ -1479,7 +1478,7 @@ impl EthWalletBackendImpl {
         let t = b.take(RPC_BUDGET).ok_or("no time left to read the token balance")?;
         let raw = modules()
             .eth_rpc_module
-            .call_with_timeout(chain_id as i64, &call.to_string(), t)
+            .call_with_timeout(chain_id as i64, &call.to_string(), callee_deadline(t), t)
             .map_err(|e| format!("{e:?}"))?;
         let a = unwrap_answer(&raw)?;
         let v = a.value.as_str()
@@ -1870,7 +1869,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             return err("no time left to read the balances");
         };
         let payload = call.to_string();
-        let raw = match modules().eth_rpc_module.call_with_timeout(chain_id as i64, &payload, t) {
+        let raw = match modules().eth_rpc_module.call_with_timeout(chain_id as i64, &payload, callee_deadline(t), t) {
             Ok(r) => r,
             Err(e) => return err(format!("{e:?}")),
         };
