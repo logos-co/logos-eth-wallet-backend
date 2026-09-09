@@ -81,7 +81,7 @@ fn the_relay_is_armed_at_startup_and_retried_from_the_account_reads() {
             "nothing arms the relay at startup");
     // Startup is the only chance a module gets; a client that could not be built there would
     // otherwise leave the view deaf for the life of the process.
-    for read in ["list_accounts", "get_account_labels"] {
+    for read in ["list_accounts", "get_account_labels", "get_account_wallets"] {
         assert!(body_of(&code, read).contains("self.watch_keystore()"),
                 "`{read}` does not retry the relay");
     }
