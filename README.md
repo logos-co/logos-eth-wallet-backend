@@ -563,16 +563,18 @@ saying it has stopped. `refresh_tx_status` re-reads one row: the hash must keep 
 matched case-insensitively against the stored `0x` form; the address may drop it.
 
 ```bash
-logosctl call eth_wallet_backend refresh_pending str:0xf39F…
-logosctl call eth_wallet_backend get_history str:0xf39F…
-logosctl call eth_wallet_backend refresh_tx_status str:0xf39F… str:0x5736…
+logosctl call eth_wallet_backend refresh_pending 0xf39F…
+logosctl call eth_wallet_backend get_history 0xf39F…
+logosctl call eth_wallet_backend refresh_tx_status 0xf39F… 0x5736…
 ```
 
-**What `logosctl` does to an argument.** A bare `0x…` is read as a hexadecimal number and
-reaches the module as one — `refresh_tx_status 0xf39F… <hash>` dies with
-`dispatch_failed: expected string at arg0, got number`. Prefix addresses and hashes with
-`str:`, and any other string that happens to look numeric: an account label, a picker query.
-A quoted JSON document and a bare `@file` are already strings.
+**What `logosctl` does to an argument.** Only decimal notation becomes a number, so an
+address or a hash reaches the module verbatim. That is logos-logoscore-cli#127: a `logosctl`
+at 0.2.3 or older reads a bare `0x…` as a hexadecimal number, and
+`refresh_tx_status 0xf39F… <hash>` dies with `dispatch_failed: expected string at arg0, got
+number` — `str:0x…` works on both. A string that IS decimal still needs `str:` to arrive as
+text: an account label, a picker query. A quoted JSON document and a bare `@file` are already
+strings.
 
 **Tokens on a testnet.** The embedded Uniswap list is all but empty off mainnet — two sepolia
 rows (UNI, WETH), none on hoodi — and `set_token_enabled` refuses an address
@@ -580,7 +582,7 @@ rows (UNI, WETH), none on hoodi — and `set_token_enabled` refuses an address
 
 ```bash
 logosctl call token_list_module add_custom_token '{"chainId":11155111,"address":"0x…","name":"…","symbol":"…","decimals":18}'
-logosctl call eth_wallet_backend set_token_enabled 11155111 str:0x… true
+logosctl call eth_wallet_backend set_token_enabled 11155111 0x… true
 ```
 
 ## Building and testing
