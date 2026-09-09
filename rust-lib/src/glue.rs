@@ -119,7 +119,7 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     fn set_token_sort(&self, order: String) -> String;
 
     /// Accounts the keystore holds. Read-only: this module can never create, import or
-    /// export one — those are the custodian's, and reach the keystore only via `keystore_ui`.
+    /// export one — those are the custodian's, and reach the keystore only via `evm_keystore_ui`.
     fn list_accounts(&self) -> String;
 
     /// Account names, `{ ok, labels: { "<lowercase hex, no 0x>": "<name>" } }`, relayed from
@@ -231,7 +231,7 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// Ask a human to approve a send. Takes the same `request_json` as `prepare_send`.
     ///
     /// Returns `{ ok, pending: true, requestId, handle }` and **never a transaction hash** —
-    /// nothing has been signed or broadcast at this point. The human approves in `signer_ui`;
+    /// nothing has been signed or broadcast at this point. The human approves in `evm_signer_ui`;
     /// drive the rest with `send_status`.
     ///
     /// `handle` is the KEYSTORE's name for the approval record, not ours. A caller that has

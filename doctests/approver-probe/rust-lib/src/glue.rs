@@ -1,7 +1,7 @@
 //! A Tier A approver, so a send can be driven to a real signature without a GUI.
 //!
 //! Configure it as the keystore's approver (`{"approver":"approver_probe"}` in
-//! `keystore.json`) and it can do exactly what a human in `signer_ui` does: claim the
+//! `keystore.json`) and it can do exactly what a human in `evm_signer_ui` does: claim the
 //! request, read back the bundle id the keystore authored, and approve that exact id.
 
 use serde_json::{json, Value};

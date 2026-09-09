@@ -4,7 +4,7 @@
 //! token table is fixed (native ETH plus WETH where its address has been verified) and
 //! there are no user-added tokens. Fees come from `fee_module`, JSON-RPC from
 //! `eth_rpc_module`, and signatures are *requested* from `keystore_module` and authorised
-//! by a human in `signer_ui` — no key material reaches this module.
+//! by a human in `evm_signer_ui` — no key material reaches this module.
 //!
 //! Everything below is plain Rust with no Logos runtime and is unit-tested with
 //! `cargo test --no-default-features`; the glue lives behind the default `logos_module`
