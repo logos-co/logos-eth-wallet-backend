@@ -1,0 +1,397 @@
+name: "Sending ETH Headlessly with eth_wallet_backend"
+output: headless-send.md
+release: ""
+
+intro: |
+  `eth_wallet_backend` never signs. A `send` reserves a nonce, hands the keystore an
+  approval request and answers `pending` — no hash, because nothing exists to hash. In
+  Basecamp the human then approves in `evm_signer_ui`. On a headless `logosctl` daemon
+  there is no window, and `logosctl call keystore_module approve …` is refused by design:
+  the CLI is the host anchor, not a named module.
+
+  This doc-test runs the whole send against a local **Anvil** chain with nothing but
+  `logosctl`: `evm_keystore_cli` imports the key, `eth_wallet_backend` asks, the request
+  appears on `logosctl watch evm_signer_cli` in the keystore's own words, the approval is
+  typed, and the wallet collects the signature, broadcasts, and sees the receipt. Then a
+  second send is refused.
+
+what_you_learn:
+  - Which seven modules a headless eth wallet needs, and the order to load them in
+  - How to point `eth_rpc_module` at a local chain
+  - Why `send` returns no hash, and how to prove it
+  - How the approval prompt reaches an operator, and what it says
+  - How `send_status` drives the broadcast, and how to read the receipt back
+  - What a rejected send looks like from the wallet's side
+  - Where `logosctl` mistypes a `0x…` argument, and the `str:` prefix that stops it
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled. Install from [nixos.org](https://nixos.org/download.html), then enable flakes:
+
+    ```bash
+    mkdir -p ~/.config/nix
+    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+    ```
+
+sections:
+  - title: "Build logosctl and Foundry"
+    step: true
+    text: |
+      `logosctl` is the daemon and its client. Foundry supplies `anvil`, the local chain,
+      and `cast`, used here only to read the chain back independently of the wallet.
+    steps:
+      - title: "Build the CLI"
+        run: 'nix build "github:logos-co/logos-logoscore-cli{release}#ctl" --out-link ./logos'
+        code_block: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+      - run: "./logos/bin/logosctl --version"
+        expect_contains:
+          - "logosctl"
+      - title: "Build Foundry"
+        run: 'nix build "nixpkgs#foundry" --out-link ./foundry'
+        code_block: "nix build 'nixpkgs#foundry' --out-link ./foundry"
+      - run: "./foundry/bin/cast --version"
+        expect_contains:
+          - "cast"
+
+  - title: "Build the seven modules"
+    step: true
+    text: |
+      `eth_wallet_backend` and its four providers — `keystore_module` for keys and the
+      approval queue, `eth_rpc_module` for the chain, `fee_module` for the fee estimate,
+      `token_list_module` for token metadata — plus the two headless surfaces:
+      `evm_keystore_cli`, the custodian that imports the key, and `evm_signer_cli`, the
+      approver that shows the request and takes the decision. Each `#install` output is
+      copied into the session's `modules/` directory next to the bundled
+      `capability_module`, made writable because a Nix store path is not.
+    steps:
+      - title: "Build eth_wallet_backend"
+        run: 'nix build "github:logos-co/logos-eth-wallet-backend{release}#install" --out-link ./result-ewb'
+        code_block: |
+          # From inside the clone this is simply: nix build '.#install'
+          nix build 'github:logos-co/logos-eth-wallet-backend#install' --out-link ./result-ewb
+      - title: "Build the four providers"
+        run: |
+          set -e
+          nix build "github:logos-co/logos-evm-keystore-module#install" --out-link ./result-keystore
+          nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
+          nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
+          nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
+        code_block: |
+          nix build 'github:logos-co/logos-evm-keystore-module#install' --out-link ./result-keystore
+          nix build 'github:logos-co/logos-evm-eth-rpc-module#install' --out-link ./result-rpc
+          nix build 'github:logos-co/logos-evm-fee-module#install' --out-link ./result-fee
+          nix build 'github:logos-co/logos-evm-token-list-module#install' --out-link ./result-tl
+      - title: "Build the two headless surfaces"
+        run: |
+          set -e
+          nix build "github:logos-co/logos-evm-signer-cli#install" --out-link ./result-signer
+          nix build "github:logos-co/logos-evm-keystore-cli#install" --out-link ./result-kcli
+        code_block: |
+          nix build 'github:logos-co/logos-evm-signer-cli#install' --out-link ./result-signer
+          nix build 'github:logos-co/logos-evm-keystore-cli#install' --out-link ./result-kcli
+      - title: "Lay out the session"
+        run: |
+          mkdir -p session/modules
+          cp -RL ./logos/modules/. ./session/modules/
+          for r in result-keystore result-rpc result-fee result-tl result-ewb result-signer result-kcli; do
+            cp -RL ./$r/modules/. ./session/modules/
+          done
+          chmod -R u+w session/modules
+          ls session/modules
+        code_block: |
+          mkdir -p session/modules
+          cp -RL ./logos/modules/. ./session/modules/
+          cp -RL ./result-*/modules/. ./session/modules/
+          chmod -R u+w session/modules
+        expect_contains:
+          - "keystore_module"
+          - "eth_rpc_module"
+          - "fee_module"
+          - "token_list_module"
+          - "eth_wallet_backend"
+          - "evm_signer_cli"
+          - "evm_keystore_cli"
+
+  - title: "Start the chain and the daemon"
+    step: true
+    text: |
+      Anvil is started with Sepolia's chain id, because `eth_wallet_backend` accepts only
+      the chains in its fixed table and a test chain id is not one of them. It funds ten
+      well-known accounts with 10000 ETH each and mines every transaction on arrival.
+    steps:
+      - title: "Start Anvil"
+        run: "sh -c './foundry/bin/anvil --chain-id 11155111 --port 8545 > anvil.log 2>&1 & echo $! > anvil.pid'"
+        code_block: "anvil --chain-id 11155111 --port 8545      # in its own terminal"
+      - title: "Wait for it to answer"
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            ./foundry/bin/cast chain-id --rpc-url http://127.0.0.1:8545 2>/dev/null && break
+            sleep 1
+          done
+        code_block: "cast chain-id --rpc-url http://127.0.0.1:8545"
+        expect_contains:
+          - "11155111"
+      - title: "Start the daemon"
+        run: "./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "logosctl daemon start --detach"
+      - run: "sleep 3"
+      - title: "Load the modules"
+        text: |
+          Providers first, then the wallet, then the two surfaces. `evm_signer_cli` must be
+          up **before** the first `send`: an approval request nobody claims is swept after
+          60 seconds, and the wallet reports that send as `failed`.
+        run: |
+          for m in keystore_module eth_rpc_module fee_module token_list_module eth_wallet_backend evm_signer_cli evm_keystore_cli; do
+            ./logos/bin/logosctl --config-dir ./session module load $m || exit 1
+          done
+        code_block: |
+          for m in keystore_module eth_rpc_module fee_module token_list_module \
+                   eth_wallet_backend evm_signer_cli evm_keystore_cli; do
+            logosctl module load $m
+          done
+      - run: "sleep 2"
+      - title: "All seven are up"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status --json"
+        code_block: "logosctl daemon status --json"
+        expect_contains:
+          - '"name":"keystore_module","status":"loaded"'
+          - '"name":"eth_rpc_module","status":"loaded"'
+          - '"name":"fee_module","status":"loaded"'
+          - '"name":"token_list_module","status":"loaded"'
+          - '"name":"eth_wallet_backend","status":"loaded"'
+          - '"name":"evm_signer_cli","status":"loaded"'
+          - '"name":"evm_keystore_cli","status":"loaded"'
+
+  - title: "Configure"
+    step: true
+    steps:
+      - title: "Name the two roles"
+        text: |
+          The keystore admits approvals only from a configured **approver** and mutations
+          only from a configured **custodian**. `configure` is total — a document that
+          omits a name strips it — so the Basecamp surfaces are kept alongside the two
+          headless ones.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}' --human
+        code_block: |
+          logosctl call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}'
+        expect_contains:
+          - '"evm_signer_cli"'
+          - '"evm_keystore_cli"'
+          - '"ok":true'
+      - title: "Point eth_rpc at Anvil"
+        text: |
+          `eth_rpc_module` owns the endpoint table for every wallet on the device. The
+          Sepolia row is repointed at the local chain, and the chain is asked to confirm
+          it is who the row says.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}' --human
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module verify_chain_id 11155111 --human
+        code_block: |
+          logosctl call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}'
+          logosctl call eth_rpc_module verify_chain_id 11155111
+        expect_contains:
+          - '"chainId":11155111'
+          - '"ok":true'
+      - title: "Import Anvil's account 0"
+        text: |
+          Foundry's published test key, under the vault password `doctest-pw`. The
+          password travels as `@file` so it stays out of `ps` and shell history.
+        run: |
+          echo doctest-pw > pw.txt
+          ./logos/bin/logosctl --config-dir ./session call evm_keystore_cli import_private_key ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 @pw.txt --human
+        code_block: "logosctl call evm_keystore_cli import_private_key <privkey> @pw.txt"
+        expect_contains:
+          - "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+          - '"ok":true'
+      - title: "Select the network; the wallet sees the account"
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend set_active_chain 11155111 --human
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend list_accounts --human
+        code_block: |
+          logosctl call eth_wallet_backend set_active_chain 11155111
+          logosctl call eth_wallet_backend list_accounts
+        expect_contains:
+          - '"activeChainId":11155111'
+          - '"accounts":["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]'
+      - title: "The recipient's balance, before"
+        run: "./foundry/bin/cast balance 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://127.0.0.1:8545 --ether"
+        code_block: "cast balance 0x7099…79C8 --rpc-url http://127.0.0.1:8545 --ether"
+        expect_contains:
+          - "10000.000000000000000000"
+
+  - title: "Send 1 ETH"
+    step: true
+    text: |
+      In a real session the watcher runs in its own terminal for as long as the operator
+      is on duty. Here it runs in the background and writes to a file, armed **before**
+      the request is made: the event plane buffers nothing. `--event prompt` narrows it
+      to the prompts; a bare `watch` also relays every method reply made against the
+      module.
+    steps:
+      - title: "Watch the approver"
+        run: "sh -c './logos/bin/logosctl --config-dir ./session watch evm_signer_cli --event prompt --json > watch.jsonl 2>&1 & echo $! > watch.pid'"
+        code_block: "logosctl watch evm_signer_cli --event prompt      # in its own terminal"
+      - run: "sleep 2"
+      - title: "The wallet asks"
+        text: |
+          `amountUnits` is in ETH, as a user would type it. The reply is a request id and
+          the keystore's handle for the approval record — and nothing else.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send '{"from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","amountUnits":"1"}' --human | tee send.json
+          python3 -c 'import json; open("rid.txt","w").write(json.load(open("send.json"))["requestId"])'
+        code_block: |
+          logosctl call eth_wallet_backend send '{"from":"0xf39F…2266","to":"0x7099…79C8","amountUnits":"1"}'
+        expect_contains:
+          - '"pending":true'
+          - '"requestId":"snd_ksh_'
+      - title: "Nothing is signed yet"
+        text: |
+          `send_status` is the wallet's word on where a send got to. Before the human has
+          answered it says `awaitingApproval`, and carries no `hash` — checked explicitly,
+          because a hash here would mean a signature existed before anyone approved it.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send_status "$(cat rid.txt)" --human | tee status0.json
+          python3 -c 'import json; d=json.load(open("status0.json")); print("HASH_BEFORE_APPROVAL=" + ("yes" if d.get("hash") else "no"))'
+        code_block: "logosctl call eth_wallet_backend send_status <requestId>"
+        expect_contains:
+          - '"status":"awaitingApproval"'
+          - "HASH_BEFORE_APPROVAL=no"
+      - run: "sleep 3"
+      - title: "The prompt, in the keystore's words"
+        text: |
+          `evm_signer_cli` claimed the request and published the keystore's two lists,
+          kept apart: what the requester *claims* the signature is for, and what will
+          actually be signed. The requester is named — `eth_wallet_backend`, not the
+          human's shell — and the last two lines are the commands to type.
+        run: |
+          python3 -c '
+          import json
+          for line in open("watch.jsonl"):
+              d = json.loads(line)
+              if d.get("event") == "prompt": print(d["data"]["arg1"])'
+        code_block: "# the watcher's terminal"
+        expect_contains:
+          - "Requested by: eth_wallet_backend"
+          - "Purpose (claimed by the requester): Send 1 ETH"
+          - "Account: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+          - "Transaction on chain 11155111"
+          - "To: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+          - "Value: 0xde0b6b3a7640000 (1000000000000000000)"
+          - "approve:  logosctl call evm_signer_cli approve ksh_"
+      - title: "Note the handle and the bundle id"
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call evm_signer_cli status --human \
+            | python3 -c 'import sys,json; r=json.load(sys.stdin)["rendered"]; open("handle.txt","w").write(r["handle"]); open("bundle.txt","w").write(r["bundle_id"]); print(r["requester"], r["handle"], r["bundle_id"])'
+        code_block: "logosctl call evm_signer_cli status"
+        expect_contains:
+          - "eth_wallet_backend ksh_"
+      - title: "The human says yes"
+        text: |
+          The reply is a **count**. The approver causes a signature to exist and never
+          receives it; only the wallet can collect it, with the receipt it was handed
+          when it asked.
+        run: "./logos/bin/logosctl --config-dir ./session call evm_signer_cli approve \"$(cat handle.txt)\" \"$(cat bundle.txt)\" @pw.txt --human"
+        code_block: "logosctl call evm_signer_cli approve <handle> <bundle_id> @pw.txt"
+        expect_contains:
+          - '"ok":true'
+          - '"signed_count":1'
+      - title: "The wallet collects the signature and broadcasts"
+        text: |
+          There is no background advancer: `send_status` **is** the broadcast. The first
+          poll after the approval collects the signature, sends the transaction exactly
+          once, records it, and answers `broadcast` with the hash.
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            out=$(./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send_status "$(cat rid.txt)" --human)
+            case "$out" in *'"status":"broadcast"'*|*'"status":"failed"'*|*'"status":"rejected"'*) break;; esac
+            sleep 2
+          done
+          echo "$out" | tee status1.json
+          python3 -c 'import json; open("hash.txt","w").write(json.load(open("status1.json"))["hash"])'
+        code_block: "logosctl call eth_wallet_backend send_status <requestId>"
+        expect_contains:
+          - '"status":"broadcast"'
+          - '"route":"direct"'
+          - '"hash":"0x'
+
+  - title: "On the chain"
+    step: true
+    steps:
+      - title: "The receipt"
+        text: |
+          Read with `cast`, so the wallet is not grading its own work. Older releases of
+          `cast` print the status field as `1`, newer ones as `true`; both are a success.
+        run: |
+          ./foundry/bin/cast receipt "$(cat hash.txt)" --rpc-url http://127.0.0.1:8545
+          st=$(./foundry/bin/cast receipt "$(cat hash.txt)" status --rpc-url http://127.0.0.1:8545)
+          case "$st" in 1|true) echo "receipt_status=success";; *) echo "receipt_status=$st";; esac
+          echo "gas_used=$(./foundry/bin/cast receipt "$(cat hash.txt)" gasUsed --rpc-url http://127.0.0.1:8545)"
+        code_block: |
+          cast receipt <hash> --rpc-url http://127.0.0.1:8545
+          cast receipt <hash> status --rpc-url http://127.0.0.1:8545
+        expect_contains:
+          - "receipt_status=success"
+          - "gas_used=21000"
+      - title: "The recipient's balance, after"
+        run: "./foundry/bin/cast balance 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://127.0.0.1:8545 --ether"
+        code_block: "cast balance 0x7099…79C8 --rpc-url http://127.0.0.1:8545 --ether"
+        expect_contains:
+          - "10001.000000000000000000"
+      - title: "The wallet's own record"
+        text: |
+          `refresh_tx_status` re-reads the receipt and settles the wallet's history row.
+          Both arguments are `0x…` strings, and `logosctl` would read a bare one as a
+          hexadecimal **number** and refuse the call before it reached the module
+          (`expected string at arg0, got number`). `str:` pins them as text.
+        run: "./logos/bin/logosctl --config-dir ./session call eth_wallet_backend refresh_tx_status str:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \"str:$(cat hash.txt)\" --human"
+        code_block: "logosctl call eth_wallet_backend refresh_tx_status str:0xf39F…2266 str:<hash>"
+        expect_contains:
+          - '"status":"confirmed"'
+
+  - title: "Refusal"
+    step: true
+    steps:
+      - title: "Ask for 2 ETH, and say no"
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send '{"from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","amountUnits":"2"}' --human \
+            | python3 -c 'import sys,json; open("rid2.txt","w").write(json.load(sys.stdin)["requestId"])'
+          sleep 3
+          ./logos/bin/logosctl --config-dir ./session call evm_signer_cli status --human \
+            | python3 -c 'import sys,json; open("h2.txt","w").write(json.load(sys.stdin)["rendered"]["handle"])'
+          ./logos/bin/logosctl --config-dir ./session call evm_signer_cli reject "$(cat h2.txt)" --human
+        code_block: |
+          logosctl call eth_wallet_backend send '{"from":"0xf39F…2266","to":"0x7099…79C8","amountUnits":"2"}'
+          logosctl call evm_signer_cli reject <handle>
+        expect_contains:
+          - "true"
+      - run: "sleep 2"
+      - title: "The send settles rejected"
+        text: |
+          Polled promptly: a rejected send is remembered for two minutes, after which the
+          keystore has forgotten the record and the wallet can only report `failed`.
+        run: "./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send_status \"$(cat rid2.txt)\" --human"
+        code_block: "logosctl call eth_wallet_backend send_status <requestId>"
+        expect_contains:
+          - '"status":"rejected"'
+      - title: "Nothing moved"
+        run: "./foundry/bin/cast balance 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://127.0.0.1:8545 --ether"
+        code_block: "cast balance 0x7099…79C8 --rpc-url http://127.0.0.1:8545 --ether"
+        expect_contains:
+          - "10001.000000000000000000"
+
+  - title: "Stop"
+    step: true
+    steps:
+      - title: "Stop the watcher, the chain and the daemon"
+        run: |
+          kill "$(cat watch.pid)" 2>/dev/null || true
+          kill "$(cat anvil.pid)" 2>/dev/null || true
+          ./logos/bin/logosctl --config-dir ./session daemon stop
+        code_block: "logosctl daemon stop"
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
+        expect_contains:
+          - "not_running"
