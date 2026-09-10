@@ -177,6 +177,8 @@ const READERS: &[&str] = &[
     "get_balances",
     "get_tx_details",
     "suggest_fees",
+    "get_account_wallets",
+    "list_contacts",
 ];
 
 // ---------------------------------------------------------------------------------------

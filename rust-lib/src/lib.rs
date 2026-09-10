@@ -11,6 +11,7 @@
 //! feature.
 
 pub mod budget;
+pub mod contacts;
 pub mod depinit;
 pub mod details;
 pub mod gate;
