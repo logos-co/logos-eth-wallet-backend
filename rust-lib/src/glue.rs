@@ -993,7 +993,8 @@ impl EthWalletBackendImpl {
             .unwrap_or_else(|| q.amount.to_string());
         let intent = json!({
             "address": q.from.to_string(),
-            "purpose": format!("Send {amount} {}", q.symbol),
+            "purpose": crate::send::purpose(&amount, &q.symbol, &q.from.to_string(),
+                                            &q.to.to_string()),
             "legs": [{ "kind": "tx", "chain_id": chain_id, "tx": tx }],
         });
 

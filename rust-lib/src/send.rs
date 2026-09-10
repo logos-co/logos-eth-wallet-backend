@@ -883,8 +883,49 @@ pub fn token_affordable(
     ))
 }
 
+/// What the requester CLAIMS a signature is for, in one line.
+///
+/// The signer prints this under a heading saying it cannot check any of it, and prints the
+/// keystore's own reading of the same transaction directly below. So it names both ends, in the
+/// same checksummed form those lines use: a claim a human can compare against the reading is
+/// worth more than one they have to take on trust. Neither address is shortened — an elided
+/// claim cannot be compared character for character with a full reading.
+pub fn purpose(amount: &str, symbol: &str, from: &str, to: &str) -> String {
+    format!("Send {amount} {symbol} from {from} to {to}")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::purpose;
+
+    const FROM: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+    const TO: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+
+    #[test]
+    fn the_claim_names_the_amount_the_token_and_both_ends() {
+        assert_eq!(
+            purpose("1", "ETH", FROM, TO),
+            format!("Send 1 ETH from {FROM} to {TO}")
+        );
+    }
+
+    #[test]
+    fn both_addresses_survive_verbatim() {
+        // The point of the line: it is compared against the keystore's own reading below it.
+        // Lower-casing either end throws away the EIP-55 checksum that makes that comparison
+        // mean something, and shortening one makes it impossible.
+        let s = purpose("0.0001", "DAI", FROM, TO);
+        assert!(s.contains(FROM), "{s}");
+        assert!(s.contains(TO), "{s}");
+        assert!(!s.contains('…'), "{s}");
+    }
+
+    #[test]
+    fn an_exact_amount_is_carried_through_unrounded() {
+        let s = purpose("0.000000000000000001", "ETH", FROM, TO);
+        assert!(s.starts_with("Send 0.000000000000000001 ETH from "), "{s}");
+    }
+
     use std::sync::{mpsc, Barrier, Mutex};
 
     use super::*;

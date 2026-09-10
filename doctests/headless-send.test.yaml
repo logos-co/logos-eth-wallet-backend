@@ -273,7 +273,11 @@ sections:
         code_block: "# the watcher's terminal"
         expect_contains:
           - "Requested by: eth_wallet_backend"
-          - "Purpose (claimed by the requester): Send 1 ETH"
+          # The WHOLE claim, both ends included. `expect_contains` is a substring match, so
+          # asserting "Send 1 ETH" alone would keep passing against a line that named nobody —
+          # and naming both ends is the point: the two lines below are the keystore's own
+          # reading of the same transaction, and this is what a human compares them against.
+          - "Purpose (claimed by the requester): Send 1 ETH from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
           - "Account: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
           - "Transaction on chain 11155111"
           - "To: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
