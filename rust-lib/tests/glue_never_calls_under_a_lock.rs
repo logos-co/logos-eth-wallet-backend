@@ -1,30 +1,18 @@
-//! A source-shape guard on `glue.rs`: `with_state` used to run a closure under
-//! `self.state.read()`, and six entry points made an IPC round trip inside it.
+//! A source-shape guard on `glue.rs`: no outbound call is made under a lock, every call is
+//! bounded or argued for, a send names one contract, and money leaves ONLY through
+//! `tx_sender_module`.
 //!
 //! `glue.rs` is behind the `logos_module` feature and `--no-default-features` cannot compile
-//! it, so it is read as text. That is a BUILD constraint and not a law — the standing fix is
-//! to lift the policy in `advance_send` out into a function over plain data and assert on a
-//! real `SendLedger` instead. Until then, two rules hold these honest:
+//! it, so it is read as text. Two rules keep these honest:
 //!
 //! 1. A `contains` over a region asserts that SOME line in the region matches; the property
 //!    is about the line on ONE path. Every check below pins the site, not the vocabulary.
 //! 2. Every check ships with the mutant it is meant to kill, and the mutant test asserts the
 //!    check REJECTS it — so the check's discriminating power is itself under test.
-//! 3. A rule anchored to ONE function is a rule about that function. Section 1 scanned
-//!    `advance_send` alone and a ticketless broadcast settle in `refresh_one` walked past it,
-//!    so a rule about the file is now checked over the file.
-//!
-//! Sections 6 and 7 read `send.rs`, which IS compiled here. Its behaviour is asserted in its
-//! own module; what is read as text is the SHAPE the compiler has no opinion about — which
-//! function a rule is installed in, and how many there are.
 
 use std::collections::BTreeSet;
 
 const GLUE: &str = include_str!("../src/glue.rs");
-/// `send.rs` IS compiled by `cargo test`, so its behaviour is asserted in its own module.
-/// What is read as text here is its SHAPE: which function a rule is installed in, which the
-/// compiler has no opinion about.
-const SEND: &str = include_str!("../src/send.rs");
 
 /// The file with comments and string literals blanked out, byte offsets preserved. Brace
 /// counting and call-site scanning must not be fooled by a `{` inside a `json!` string.
@@ -60,8 +48,7 @@ fn line_of(src: &str, at: usize) -> usize {
     src[..at].matches('\n').count() + 1
 }
 
-/// The file above its own test module. A check about installation sites must not count the
-/// tests that drive them.
+/// The file above its own test module.
 fn non_test(code: &str) -> &str {
     match code.find("mod tests") {
         Some(at) => &code[..at],
@@ -205,9 +192,9 @@ fn guard_scopes(code: &str) -> Vec<(usize, usize)> {
 }
 
 /// Every method of the glue that reaches `modules()`, directly or through another of its own
-/// methods. A scan for the literal token cannot see `self.verified_gate(..)`, `self.quote(..)`,
-/// `self.chain_nonce(..)` or `self.chain_endpoint(..)` — each an IPC round trip one level down,
-/// and each invisible to the check that was supposed to keep calls out of a lock scope.
+/// methods. A scan for the literal token cannot see `self.verified_gate_within(..)` or
+/// `self.resolve(..)` — each an IPC round trip one level down, and each invisible to the
+/// check that was supposed to keep calls out of a lock scope.
 fn reaches_modules(code: &str, fns: &[Func]) -> BTreeSet<String> {
     let mut reaching: BTreeSet<String> = fns
         .iter()
@@ -243,159 +230,7 @@ fn mutate(src: &str, from: &str, to: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------------------
-// 1. The success path settles through its ticket.
-// ---------------------------------------------------------------------------------------
-
-/// `advance_send` from the broadcast claim to the end of the function.
-fn claim_tail(code: &str) -> (usize, String) {
-    let at = code.find("fn advance_send").expect("advance_send is where a send is broadcast");
-    let end = block_end(code, at);
-    let claim =
-        at + code[at..end].find("claim_broadcast(").expect("the broadcast is claimed in there");
-    (claim, code[claim..end].to_string())
-}
-
-const OWNED: &str = "self.settle_owned(&st, &ticket";
-
-/// How many of them there are. Four: the record that would not write, the answer with no
-/// hash, the broadcast that errored, and the one that lands the hash.
-const OWNED_SITES: usize = 4;
-
-/// Past the claim the ticket is the only key to the job — and the site that matters is the
-/// one that lands the HASH. The others are failure arms, so `tail.contains(OWNED)` is
-/// satisfied by them alone: deleting the success site and replying by hand builds clean, runs
-/// green, and in production latches the job at `broadcasting` for the life of the process.
-fn check_settles_through_the_ticket(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let (claim, tail) = claim_tail(&code);
-    if let Some(rel) = tail.find("self.settle(") {
-        return Err(format!(
-            "glue.rs:{} settles by request id after claiming the broadcast. Past the claim \
-             the ticket is the only key: `self.settle_owned(&st, &ticket, ..)`.",
-            line_of(src, claim + rel)
-        ));
-    }
-    let found = sites(&tail, OWNED);
-    if found.len() != OWNED_SITES {
-        return Err(format!(
-            "advance_send has {} settles through the ticket, not the {OWNED_SITES} this \
-             pins: the three failure arms and the one that lands the hash. Lines {:?}.",
-            found.len(),
-            found.iter().map(|s| line_of(src, claim + s)).collect::<Vec<_>>()
-        ));
-    }
-    let last = found[OWNED_SITES - 1];
-    if !tail[last..].starts_with(&format!("{OWNED}, SendStatus::Broadcast")) {
-        return Err("the last settle through the ticket is not the one carrying the hash".into());
-    }
-    if tail[..last].contains("SendStatus::Broadcast") {
-        return Err("a hash is settled before the end of advance_send; the success path must \
-                    be the function's last act"
-            .into());
-    }
-    if !tail[call_end(&tail, last)..].trim().is_empty() {
-        return Err("advance_send does something after landing the hash; the reply the caller \
-                    gets must be the one the ledger produced"
-            .into());
-    }
-    Ok(())
-}
-
-#[test]
-fn the_broadcast_success_path_settles_through_its_ticket() {
-    check_settles_through_the_ticket(GLUE).unwrap();
-}
-
-/// The re-anchor. The check above scans `advance_send` alone, so a ticketless `Broadcast`
-/// settle added ANYWHERE else — a receipt poller, a new door — walked straight past it. A
-/// hash means the signed transaction left, which only the ticket holder is in a position to
-/// know, so the rule is about the file and not about one function.
-fn check_no_ticketless_broadcast(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    for at in sites(&code, "self.settle(") {
-        if code[at..call_end(&code, at)].contains("SendStatus::Broadcast") {
-            return Err(format!(
-                "glue.rs:{} settles a Broadcast by request id, in `{}`. Only the ticket \
-                 holder knows a transaction left: use `settle_owned`.",
-                line_of(src, at),
-                enclosing_fn(&fns, at)
-            ));
-        }
-    }
-    for at in sites(&code, ".sends.settle(") {
-        let who = enclosing_fn(&fns, at);
-        if who != "settle" {
-            return Err(format!(
-                "glue.rs:{} reaches the ledger's ticketless settle from `{who}`. One door, \
-                 so a new caller cannot quietly become a second.",
-                line_of(src, at)
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn no_broadcast_is_ever_settled_by_request_id() {
-    check_no_ticketless_broadcast(GLUE).unwrap();
-}
-
-/// M12 verbatim: `refresh_one` learns a hash from a receipt and settles the send with it.
-/// It is nowhere near `advance_send`, which is exactly why the tail scan could not see it.
-#[test]
-fn a_ticketless_broadcast_settle_anywhere_in_the_file_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "        let status = history::classify_receipt(&receipt);",
-        "        let status = history::classify_receipt(&receipt);\n        let _ = \
-         self.settle(&st, hash_hex, SendStatus::Broadcast { hash: rec.hash.clone(), route: \
-         \"proxied\".into() });",
-    );
-    let e = check_no_ticketless_broadcast(&mutant).unwrap_err();
-    assert!(e.contains("in `refresh_one`"), "{e}");
-    assert!(
-        check_settles_through_the_ticket(&mutant).is_ok(),
-        "the tail scan is supposed to miss M12 — that it does is the whole finding"
-    );
-}
-
-/// NEW-3's exact mutant: delete the site that lands the hash, reply by hand. The check must
-/// reject it — and the region `contains` it replaces would not have.
-#[test]
-fn deleting_the_site_that_lands_the_hash_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "self.settle_owned(&st, &ticket, SendStatus::Broadcast { hash, route })",
-        "Ok(Self::job_reply(&job, now))",
-    );
-    let e = check_settles_through_the_ticket(&mutant).unwrap_err();
-    assert!(e.contains("not the 4 this pins"), "{e}");
-
-    let (_, tail) = claim_tail(&code_only(&mutant));
-    assert!(
-        tail.contains(OWNED),
-        "the region `contains` this replaces would have rejected the mutant after all — the \
-         failure arms are supposed to keep it green, which is the whole finding"
-    );
-}
-
-/// And the other half: a hash landed early, with work after it.
-#[test]
-fn settling_the_hash_before_the_end_of_advance_send_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "        if took_hash {\n            emit_tx_status_changed(&hash);\n        }\n        \
-         self.settle_owned(&st, &ticket, SendStatus::Broadcast { hash, route })",
-        "        let out = self.settle_owned(&st, &ticket, SendStatus::Broadcast { hash, \
-         route });\n        if took_hash {\n            emit_tx_status_changed(&hash);\n        }\n        out",
-    );
-    let e = check_settles_through_the_ticket(&mutant).unwrap_err();
-    assert!(e.contains("does something after landing the hash"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 2. No outbound call shares a scope with a lock guard.
+// 1. No outbound call shares a scope with a lock guard.
 // ---------------------------------------------------------------------------------------
 
 fn check_no_call_under_a_lock(src: &str) -> Result<(), String> {
@@ -428,9 +263,7 @@ fn no_outbound_call_shares_a_scope_with_a_lock_guard() {
     check_no_call_under_a_lock(GLUE).unwrap();
 }
 
-/// The weakness the transitive scan removes: an IPC call reached through one of the glue's
-/// own methods is not the token `modules()`, and the check that looked for that token saw
-/// nothing at all.
+/// An IPC call reached through one of the glue's own methods is not the token `modules()`.
 #[test]
 fn an_outbound_call_reached_through_a_helper_is_caught() {
     let mutant = mutate(
@@ -449,11 +282,9 @@ fn an_outbound_call_reached_through_a_helper_is_caught() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 3. The glue takes exactly the two locks that are argued for, in the two named places.
+// 2. The glue takes exactly the two locks that are argued for, in the two named places.
 // ---------------------------------------------------------------------------------------
 
-/// A COUNT is not a location: `taken.len() == 2` is satisfied by any two locks anywhere, so
-/// deleting one of these and adding two inside `advance_send` used to pass.
 fn check_lock_sites(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let fns = functions(&code);
@@ -464,8 +295,8 @@ fn check_lock_sites(src: &str) -> Result<(), String> {
         return Err(format!(
             "glue.rs should take exactly two locks — `state()` reading the handle and \
              `on_context_ready` installing it. Found them in {taken:?}. Every other lock \
-             belongs inside `History` or `SendLedger`, taken around local work and released \
-             before anything is called."
+             belongs inside a store, taken around local work and released before anything \
+             is called."
         ));
     }
     if code.contains("with_state") {
@@ -473,8 +304,6 @@ fn check_lock_sites(src: &str) -> Result<(), String> {
                     `hold a read lock across whatever the closure does`"
             .into());
     }
-    // Whitespace-stripped, so splitting the signature over lines is not a failure. A `&State`
-    // borrowed through the guard would keep the guard alive for as long as the caller uses it.
     let sig = no_ws(&code[fns.iter().find(|f| f.name == "state").expect("fn state").sig.0..]);
     if !sig.starts_with("fnstate(&self)->Result<Arc<State>,String>") {
         return Err("`state()` must hand back an owned handle".into());
@@ -488,15 +317,14 @@ fn the_glue_takes_no_lock_except_the_one_that_hands_back_a_handle() {
 }
 
 #[test]
-fn a_third_lock_anywhere_else_is_caught_even_where_a_count_would_balance() {
-    // The count stays at two: one of the argued-for locks goes, two appear in the send path.
+fn a_third_lock_anywhere_else_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        let st = self.state()?;\n        let b = Budget::new(SEND_BUDGET);\n        let now = history::now_secs();",
-        "        let st = self.state()?;\n        let _a = self.state.read();\n        let b = Budget::new(SEND_BUDGET);\n        let now = history::now_secs();",
+        "        // A send this wallet made and a human has not answered names the network it was\n",
+        "        let _a = self.state.read();\n        // A send this wallet made and a human has not answered names the network it was\n",
     );
     let e = check_lock_sites(&mutant).unwrap_err();
-    assert!(e.contains("advance_send"), "{e}");
+    assert!(e.contains("set_active_chain"), "{e}");
 }
 
 #[test]
@@ -508,21 +336,16 @@ fn handing_back_a_borrow_instead_of_a_handle_is_caught() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 4. Every outbound call is bounded, or argued for.
+// 3. Every outbound call is bounded, or argued for.
 // ---------------------------------------------------------------------------------------
 
 /// Every outbound call carries a deadline, except these — each one a decision, not an
 /// oversight. A new unbounded call fails this test and has to be argued for here.
 const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
-    // The one call that moves money. A deadline does not stop the transaction, it only stops
-    // us learning its hash.
-    ("eth_rpc_module", "send_raw_transaction", "a broadcast with an unknown outcome is worse"),
-    // One call each, and neither sits behind a gate — "one call" stopped being an argument
-    // for the protocol's 20s default the moment a probe could already have spent twenty of
-    // its own in front of it. See section 12.
+    // One call each, and neither sits behind a gate.
     ("keystore_module", "list_accounts", "a passthrough, one call"),
     ("keystore_module", "get_labels", "a passthrough, one call"),
-    // Not a call at all: it arms an `EventSubscription` and the generated client emits no
+    // Not calls at all: each arms an `EventSubscription` and the generated client emits no
     // bounded twin for one. A deadline on arming would be a deadline on the SUBSCRIPTION,
     // which is meant to outlive every call this module makes.
     ("keystore_module", "on_accounts_changed", "a subscription has no bounded twin"),
@@ -532,6 +355,9 @@ const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
     ("eth_rpc_module", "on_subscription_status", "installs a callback; nothing is dispatched"),
     ("eth_rpc_module", "on_chain_config_changed", "a subscription has no bounded twin"),
     ("token_list_module", "on_tokens_updated", "a subscription has no bounded twin"),
+    ("tx_sender_module", "on_send_status_changed", "a subscription has no bounded twin"),
+    ("tx_sender_module", "on_tx_status_changed", "a subscription has no bounded twin"),
+    ("tx_sender_module", "on_history_changed", "a subscription has no bounded twin"),
 ];
 
 fn check_calls_are_bounded(src: &str) -> Result<(), String> {
@@ -576,474 +402,43 @@ fn every_outbound_call_is_bounded_except_the_ones_argued_for_here() {
 fn a_new_unbounded_call_is_caught() {
     let mutant = mutate(
         GLUE,
-        ".get_transaction_count_with_timeout(chain_id as i64, address, t)",
-        ".get_transaction_count(chain_id as i64, address)",
+        "modules().token_list_module.get_tokens_with_timeout(chain_id, t)",
+        "modules().token_list_module.get_tokens(chain_id)",
     );
     let e = check_calls_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("eth_rpc_module.get_transaction_count with no deadline"), "{e}");
+    assert!(e.contains("token_list_module.get_tokens with no deadline"), "{e}");
+}
+
+/// The delegated send is a call across a process boundary too, and the one that registers
+/// an approval — it is bounded, and it hands the sender its own deadline.
+#[test]
+fn an_unbounded_delegated_send_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "relay(modules().tx_sender_module.send_with_timeout(&request.to_string(), t))",
+        "relay(modules().tx_sender_module.send(&request.to_string()))",
+    );
+    let e = check_calls_are_bounded(&mutant).unwrap_err();
+    assert!(e.contains("tx_sender_module.send with no deadline"), "{e}");
 }
 
 #[test]
 fn an_entry_the_glue_no_longer_calls_is_caught() {
     let mutant = mutate(
         GLUE,
-        ".send_raw_transaction(chain_id as i64, raw_tx)",
-        ".send_raw_transaction_with_timeout(chain_id as i64, raw_tx, RPC_BUDGET)",
+        "let Ok(sub) = ks.on_accounts_changed() else {",
+        "let Ok(sub) = ks.on_accounts_changed_with_timeout(RPC_BUDGET) else {",
     );
     let e = check_calls_are_bounded(&mutant).unwrap_err();
     assert!(e.contains("no longer calls it"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------
-// 5. The send ledger is built once, with the module.
-// ---------------------------------------------------------------------------------------
-
-/// NEW-5. `on_context_ready` can be called again, and it installs a fresh `State`. A fresh
-/// `SendLedger` with it discards every reservation at once — including the ones protecting
-/// transactions already on chain — without breaking a single rule inside the ledger. The
-/// guard belongs at the construction site, where the reserver cannot see.
-fn check_ledger_built_once(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    if bodies_of(&fns, &code, "on_context_ready").iter().any(|b| b.contains("SendLedger")) {
-        return Err("on_context_ready builds a SendLedger. A re-init would drop every \
-                    reservation, on-chain ones included; clone the module's handle instead."
-            .into());
-    }
-    let at = code.find("struct EthWalletBackendImpl").ok_or("the module struct")?;
-    if !no_ws(&code[at..block_end(&code, at)]).contains("sends:Arc<SendLedger>") {
-        return Err("the module must own the ledger, so nothing per-context can replace it".into());
-    }
-    Ok(())
-}
-
-#[test]
-fn the_send_ledger_outlives_a_second_on_context_ready() {
-    check_ledger_built_once(GLUE).unwrap();
-}
-
-#[test]
-fn rebuilding_the_ledger_on_re_init_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "sends: self.sends.clone()",
-        "sends: Arc::new(SendLedger::default())",
-    );
-    let e = check_ledger_built_once(&mutant).unwrap_err();
-    assert!(e.contains("builds a SendLedger"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 6. The reserver is seeded from the durable evidence, before anything can ask it.
-// ---------------------------------------------------------------------------------------
-
-/// R-1. `SendLedger` is in-memory, and `latest` does not count a broadcast that has not
-/// mined, so a fresh process hands the next send a number a pending row is already using.
-/// The persisted `nonce` was written and never read back; this pins the read.
-fn check_the_reserver_is_seeded(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    let bodies = bodies_of(&fns, &code, "on_context_ready");
-    let body = bodies
-        .iter()
-        .find(|b| b.contains("instance_persistence_path"))
-        .ok_or("on_context_ready no longer opens the persistence directory")?;
-    let seed = body.find("sends.seed_spent(").ok_or(
-        "on_context_ready does not seed the reserver from history. The ledger does not \
-         survive the process: without this a restart signs at a nonce a pending transaction \
-         is already using, and the user is told the first send was made.",
-    )?;
-    let install = body.find("self.state.write()").ok_or("the state is no longer installed")?;
-    if seed > install {
-        return Err("the reserver is seeded after the state is installed. A send dispatched \
-                    between the two reaches `state()` and gets an unprotected nonce."
-            .into());
-    }
-    Ok(())
-}
-
-#[test]
-fn the_reserver_is_seeded_from_history_before_the_state_is_reachable() {
-    check_the_reserver_is_seeded(GLUE).unwrap();
-}
-
-#[test]
-fn dropping_the_seed_is_caught() {
-    let mutant = mutate(GLUE, "let seeded = self.sends.seed_spent(history.unsettled_nonces());", "let seeded = 0;");
-    let e = check_the_reserver_is_seeded(&mutant).unwrap_err();
-    assert!(e.contains("does not seed the reserver"), "{e}");
-}
-
-#[test]
-fn seeding_after_the_state_is_installed_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "        let seeded = self.sends.seed_spent(history.unsettled_nonces());",
-        "        let pending = history.unsettled_nonces();",
-    );
-    let mutant = mutate(
-        &mutant,
-        "        // eth_rpc first:",
-        "        let seeded = self.sends.seed_spent(pending);\n        // eth_rpc first:",
-    );
-    let e = check_the_reserver_is_seeded(&mutant).unwrap_err();
-    assert!(e.contains("seeded after the state is installed"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 7. The ledger's invariant check has exactly one installation, and one way in.
-// ---------------------------------------------------------------------------------------
-
-/// The meta-finding. Five hand-placed `l.audit()` calls were deleted — one site, then all
-/// five — and the suite stayed green, because the tests drove the CHECKER and never its
-/// installation. The audit now runs in `Audited::drop`, so a door cannot omit it; this keeps
-/// it there, where "every mutating path ends in audit()" stops being a thing to remember.
-fn check_the_audit_is_installed_once(src: &str) -> Result<(), String> {
-    let full = code_only(src);
-    let code = non_test(&full);
-    let fns = functions(code);
-    let calls = sites(code, ".audit()");
-    let who: Vec<String> = calls.iter().map(|&a| enclosing_fn(&fns, a)).collect();
-    if who != ["drop"] {
-        return Err(format!(
-            "send.rs installs the invariant check in {who:?}. It belongs in `Audited::drop` \
-             alone: hand-placed calls are what a mutation pass deleted without a single \
-             failure."
-        ));
-    }
-    let at = code.find("impl Drop for Audited").ok_or("Audited must audit as it is released")?;
-    if !(at < calls[0] && calls[0] < block_end(code, at)) {
-        return Err(format!("send.rs:{} audits outside Audited::drop", line_of(src, calls[0])));
-    }
-    Ok(())
-}
-
-/// And the other half: a guard that audits is worth nothing if a door can go round it.
-/// `SendLedger.inner` is private to `mod gate`, so a bypass is a compile error rather than a
-/// review question — this pins the two uses that live inside `gate` itself.
-fn check_the_ledger_has_one_way_in(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    let mut who: Vec<String> =
-        sites(&code, "self.inner").into_iter().map(|a| enclosing_fn(&fns, a)).collect();
-    who.sort();
-    if who != ["lock", "unreserve_behind_the_ledgers_back"] {
-        return Err(format!(
-            "the ledger's mutex is reached from {who:?}. Only `lock`, whose guard audits, \
-             and the test-only corruption door may name it; anything else is a door that \
-             skips the check."
-        ));
-    }
-    Ok(())
-}
-
-/// R-2. `SendJob::spent` has two halves and only one of them used to burn the number. One
-/// writer of a job's nonce means the two cannot disagree.
-fn check_the_burn_is_single_sourced(src: &str) -> Result<(), String> {
-    let full = code_only(src);
-    let code = non_test(&full);
-    let fns = functions(code);
-    let mut who: Vec<String> =
-        sites(code, ".mark_spent(").into_iter().map(|a| enclosing_fn(&fns, a)).collect();
-    who.sort();
-    if who != ["seed_spent", "sync_nonce"] {
-        return Err(format!(
-            "a nonce is burnt from {who:?}. `sync_nonce` is the one place a job's number is \
-             written — `SendJob::spent` decides the burn and the release together — and \
-             `seed_spent` carries what a previous process signed at."
-        ));
-    }
-    Ok(())
-}
-
-#[test]
-fn the_ledgers_invariant_check_cannot_be_omitted() {
-    check_the_audit_is_installed_once(SEND).unwrap();
-    check_the_ledger_has_one_way_in(SEND).unwrap();
-    check_the_burn_is_single_sourced(SEND).unwrap();
-}
-
-#[test]
-fn deleting_the_audit_from_the_guard_is_caught() {
-    let mutant = mutate(
-        SEND,
-        "        fn drop(&mut self) {\n            self.0.audit();\n        }",
-        "        fn drop(&mut self) {}",
-    );
-    let e = check_the_audit_is_installed_once(&mutant).unwrap_err();
-    assert!(e.contains("installs the invariant check in []"), "{e}");
-}
-
-#[test]
-fn a_second_unaudited_way_into_the_ledger_is_caught() {
-    let mutant = mutate(
-        SEND,
-        "    /// A borrow of the ledger that audits when it is released.",
-        "    impl SendLedger {\n        pub(super) fn unaudited(&self) -> MutexGuard<'_, Ledger> \
-         {\n            self.inner.lock().unwrap()\n        }\n    }\n\n    /// A borrow of the \
-         ledger that audits when it is released.",
-    );
-    let e = check_the_ledger_has_one_way_in(&mutant).unwrap_err();
-    assert!(e.contains("\"unaudited\""), "{e}");
-}
-
-#[test]
-fn burning_a_nonce_outside_the_one_writer_is_caught() {
-    let mutant = mutate(
-        SEND,
-        "        sync_nonce(&mut l, request_id);\n        BroadcastClaim::Claimed",
-        "        l.nonces.mark_spent(job_chain, &job_from, job_nonce);\n        BroadcastClaim::Claimed",
-    );
-    let e = check_the_burn_is_single_sourced(&mutant).unwrap_err();
-    assert!(e.contains("\"claim_broadcast\""), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 8. The record goes down before the transaction leaves.
-// ---------------------------------------------------------------------------------------
-
-/// The order in which named markers appear in a region. A count says a marker is present;
-/// this says where — and every rule below is about which side of the broadcast a write is on.
-fn order<'a>(region: &str, markers: &[&'a str]) -> Vec<&'a str> {
-    let mut out: Vec<(usize, &str)> = Vec::new();
-    // Distinct: the wanted order repeats markers, and scanning one twice reports its sites
-    // twice — a sequence that never matches anything and a check that always fails.
-    for m in markers.iter().copied().collect::<BTreeSet<_>>() {
-        out.extend(sites(region, m).into_iter().map(|a| (a, m)));
-    }
-    out.sort();
-    out.into_iter().map(|(_, m)| m).collect()
-}
-
-const BROADCAST_ORDER: &[&str] = &[
-    "st.history.record_intent(",
-    "SendStatus::Failed",
-    "self.broadcast(",
-    "st.history.leave_unknown(",
-    "SendStatus::Failed",
-    "st.history.leave_unknown(",
-    "SendStatus::Failed",
-    "st.history.resolve_broadcast(",
-    "SendStatus::Broadcast",
-];
-
-/// F-1 and F-2. The durable record used to be written AFTER the broadcast returned, and on
-/// the failure path not at all: a crash inside the RPC, or an early return, left a nonce that
-/// had left with nothing on disk, and the next process handed that number to another send.
-///
-/// Two halves. `broadcast` takes `Recorded`, which only `History::record_intent` produces, so
-/// sending before writing is a compile error rather than a review question — and the send
-/// path is pinned in order, because a proof obtained after the bytes leave would satisfy the
-/// type and none of the intent.
-fn check_the_record_precedes_the_broadcast(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    let who: Vec<String> =
-        sites(&code, ".send_raw_transaction(").into_iter().map(|a| enclosing_fn(&fns, a)).collect();
-    if who != ["broadcast"] {
-        return Err(format!(
-            "glue.rs sends a raw transaction from {who:?}. The one call that moves money \
-             belongs in `broadcast` alone, whose `Recorded` argument is what makes \
-             broadcasting before the record is written unexpressible."
-        ));
-    }
-    let f = fns.iter().find(|f| f.name == "broadcast").ok_or("fn broadcast")?;
-    if !no_ws(&code[f.sig.0..f.sig.1]).contains("&history::Recorded") {
-        return Err("`broadcast` no longer takes the `Recorded` proof, so writing the record \
-                    first is back to being a rule every new path has to remember"
-            .into());
-    }
-    let (_, tail) = claim_tail(&code);
-    let seen = order(&tail, BROADCAST_ORDER);
-    if seen != BROADCAST_ORDER {
-        return Err(format!(
-            "the send path runs {seen:?}. It must run {BROADCAST_ORDER:?}: record the intent, \
-             refuse the send if it did not land, broadcast, and leave the row unknown on \
-             every arm that did not get a hash."
-        ));
-    }
-    Ok(())
-}
-
-#[test]
-fn the_intent_is_on_disk_before_the_transaction_leaves() {
-    check_the_record_precedes_the_broadcast(GLUE).unwrap();
-}
-
-#[test]
-fn broadcasting_without_writing_the_record_first_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "let recorded = match st.history.record_intent(request_id, Self::intent_row(&job)) {\n            Ok(r) => r,\n            Err(reason) => return self.settle_owned(&st, &ticket, SendStatus::Failed { reason }),\n        };",
-        "let recorded = Self::proof();",
-    );
-    let e = check_the_record_precedes_the_broadcast(&mutant).unwrap_err();
-    assert!(e.contains("the send path runs"), "{e}");
-}
-
-/// The subtler one: the record is still written, just not first. This is the shape the
-/// finding describes — evidence after the risk — and a `contains` for `record_intent`
-/// anywhere in the function would have called it green.
-#[test]
-fn recording_the_intent_after_the_broadcast_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "let recorded = match st.history.record_intent(request_id, Self::intent_row(&job)) {\n            Ok(r) => r,\n            Err(reason) => return self.settle_owned(&st, &ticket, SendStatus::Failed { reason }),\n        };",
-        "let recorded = Self::proof();",
-    );
-    let mutant = mutate(
-        &mutant,
-        "let took_hash = st.history.resolve_broadcast(",
-        "let _ = st.history.record_intent(request_id, Self::intent_row(&job));\n        \
-         let took_hash = st.history.resolve_broadcast(",
-    );
-    let e = check_the_record_precedes_the_broadcast(&mutant).unwrap_err();
-    assert!(e.contains("the send path runs"), "{e}");
-    assert!(
-        mutant.contains("record_intent"),
-        "the mutant still records — that a `contains` would pass it is the whole finding"
-    );
-}
-
-#[test]
-fn a_broadcast_that_does_not_demand_the_proof_is_caught() {
-    let mutant = mutate(GLUE, "_recorded: &history::Recorded,", "_recorded: &str,");
-    let e = check_the_record_precedes_the_broadcast(&mutant).unwrap_err();
-    assert!(e.contains("no longer takes the `Recorded` proof"), "{e}");
-}
-
-/// F-2's own arm. A broadcast that errors must leave the row `unknown` on disk before it
-/// settles the job: without this the send is recorded nowhere and the next process, seeing
-/// no row, hands the number straight out.
-#[test]
-fn a_failure_arm_that_does_not_leave_the_row_unknown_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "            Err(reason) => {\n                if st.history.leave_unknown(&recorded, &reason) {\n                    emit_history_changed(&job.from);\n                }\n",
-        "            Err(reason) => {\n",
-    );
-    let e = check_the_record_precedes_the_broadcast(&mutant).unwrap_err();
-    assert!(e.contains("the send path runs"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 9. A gated path a BUTTON drives is bounded across its gate.
-// ---------------------------------------------------------------------------------------
-
-/// F-1/F-4. `refresh_one` and `tx_details` are each one click, and each ran the UNBOUNDED
-/// gate — 20s at the protocol default — before taking the budget meant to cover the method.
-/// So `DETAILS_BUDGET` bounded the two legs and not the call a user waits on, and the view's
-/// own deadline expired first and blamed a backend that had answered nothing yet.
-const ON_A_BUTTON: &[(&str, &str)] =
-    &[("refresh_one", "REFRESH_BUDGET"), ("tx_details", "DETAILS_BUDGET")];
-
-/// The last argument of the call starting at `at`.
-fn last_arg(body: &str, at: usize) -> String {
-    let open = at + body[at..].find('(').expect("a call to close");
-    let args = &body[open + 1..call_end(body, at) - 1];
-    let (mut depth, mut cut) = (0i32, 0usize);
-    for (k, c) in args.char_indices() {
-        match c {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
-            ',' if depth == 0 => cut = k + 1,
-            _ => {}
-        }
-    }
-    args[cut..].trim().to_string()
-}
-
-fn check_button_paths_are_bounded(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    for (name, budget) in ON_A_BUTTON {
-        for body in bodies_of(&fns, &code, name) {
-            let gate = body.find("verified_gate").ok_or(format!("`{name}` no longer gates"))?;
-            let taken = body
-                .find(&format!("Budget::new({budget})"))
-                .ok_or(format!("`{name}` no longer takes a {budget}"))?;
-            if taken > gate {
-                return Err(format!(
-                    "`{name}` takes its {budget} AFTER the gate, so the gate is outside the \
-                     allowance and the method is bounded by nothing a user can feel."
-                ));
-            }
-            if body[gate..].starts_with("verified_gate(") {
-                return Err(format!(
-                    "`{name}` uses the unbounded gate. On a button that is up to 20s of \
-                     frozen wallet — use `verified_gate_within` charged to the budget above."
-                ));
-            }
-            for at in sites(body, "_with_timeout(") {
-                let arg = last_arg(body, at);
-                if arg.ends_with("_BUDGET") {
-                    return Err(format!(
-                        "`{name}` bounds a call with {arg} rather than a grant off its \
-                         budget, so the method is bounded by its call COUNT again."
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn a_path_a_button_drives_is_bounded_across_its_gate() {
-    check_button_paths_are_bounded(GLUE).unwrap();
-}
-
-#[test]
-fn the_unbounded_gate_on_a_button_path_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "self.verified_gate_within(rec.chain_id, &b) {\n            return Ok(blocked(&v));",
-        "self.verified_gate(rec.chain_id) {\n            return Ok(blocked(&v));",
-    );
-    let e = check_button_paths_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("uses the unbounded gate"), "{e}");
-}
-
-/// The subtler one, and the shape the finding describes: the gate is bounded, but the
-/// allowance is taken out after it — so it charges the gate nothing and covers only the legs.
-#[test]
-fn a_budget_taken_after_the_gate_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "        let b = Budget::new(DETAILS_BUDGET);\n        // The hash goes onto",
-        "        // The hash goes onto",
-    );
-    let mutant = mutate(
-        &mutant,
-        "        let Some(number) = rec.block_number else {",
-        "        let b = Budget::new(DETAILS_BUDGET);\n        let Some(number) = rec.block_number else {",
-    );
-    let e = check_button_paths_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("AFTER the gate"), "{e}");
-}
-
-#[test]
-fn a_call_bounded_by_a_constant_rather_than_the_budget_is_caught() {
-    // Twelve spaces: the same call in `sweep` is nested one level deeper, and it is bounded
-    // by the sweep's own allowance rather than by this one.
-    let mutant = mutate(
-        GLUE,
-        "\n            .get_transaction_receipt_with_timeout(rec.chain_id as i64, &rec.hash, t)",
-        "\n            .get_transaction_receipt_with_timeout(rec.chain_id as i64, &rec.hash, RPC_BUDGET)",
-    );
-    let e = check_button_paths_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("rather than a grant off its"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 10. The enabled token set is written only from a token_list snapshot.
+// 4. The enabled token set is written only from a token_list snapshot.
 // ---------------------------------------------------------------------------------------
 
 /// `decimals` scales every amount this wallet renders AND every amount it signs, so an
 /// enabled token's record has exactly one honest source: the list the user picked it from.
-/// A hand-built `Token` here would compile, run green, and mis-scale a balance by a power of
-/// ten with nothing to catch it — so the rule is that this file builds none, and the one
-/// write to the enabled set happens after the read that produced its record.
 fn check_enabled_set_is_snapshotted(src: &str) -> Result<(), String> {
     let full = code_only(src);
     let code = non_test(&full);
@@ -1089,7 +484,6 @@ fn the_enabled_set_is_only_ever_written_from_a_token_list_snapshot() {
 
 #[test]
 fn enabling_a_token_the_list_never_described_is_caught() {
-    // The mutant that matters: token_list said no, and the glue makes the record up anyway.
     let mutant = mutate(
         GLUE,
         "match self.snapshot(chain_id, &addr, &b) {\n                Ok(t) => st.settings.enable_token(chain_id as u64, t),\n                Err(e) => return err(e),\n            }",
@@ -1112,14 +506,13 @@ fn a_second_door_into_the_enabled_set_is_caught() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 11. A send names ONE contract.
+// 5. A send names ONE contract.
 // ---------------------------------------------------------------------------------------
 
 /// A token's identity is its `(chainId, address)`, and the shipped list holds two mainnet
 /// contracts both calling themselves `LIT`. `tokens::find` answers `None` for that ambiguity
 /// and a `None` is easy to ignore, so the send path takes the address when it has one, relays
-/// `tokens::resolve`'s refusal when it does not, and reports which contract it settled on —
-/// a confirmation carrying only the symbol cannot reveal that the wrong asset is moving.
+/// `tokens::resolve`'s refusal when it does not, and reports which contract it settled on.
 fn check_a_send_names_one_contract(src: &str) -> Result<(), String> {
     let full = code_only(src);
     let code = non_test(&full);
@@ -1141,19 +534,19 @@ fn check_a_send_names_one_contract(src: &str) -> Result<(), String> {
             ));
         }
         let owner = enclosing_fn(&fns, found[0]);
-        if owner != "quote" {
-            return Err(format!("`{call}` is called from `{owner}`, not `quote`"));
+        if owner != "resolve" {
+            return Err(format!("`{call}` is called from `{owner}`, not `resolve`"));
         }
     }
     // The reply is read from the RAW source: `code_only` blanks string literals, and the key
     // being looked for is one.
     let body = fns
         .iter()
-        .find(|f| f.name == "prepare_send")
+        .find(|f| f.name == "quote_reply")
         .map(|f| &src[f.body.0..f.body.1])
-        .ok_or("no fn prepare_send")?;
+        .ok_or("no fn quote_reply")?;
     if !body.contains("\"tokenAddress\"") {
-        return Err("`prepare_send` reports no `tokenAddress`, so nothing downstream can say \
+        return Err("`quote_reply` reports no `tokenAddress`, so nothing downstream can say \
                     WHICH contract the send will call"
             .into());
     }
@@ -1167,7 +560,6 @@ fn the_send_path_resolves_a_token_to_one_contract() {
 
 #[test]
 fn resolving_a_send_by_first_match_is_caught() {
-    // The regression itself: a symbol two contracts share, resolved to whichever came first.
     let mutant = mutate(
         GLUE,
         "Some(tokens::resolve(chain_id, k, settings.enabled_tokens(chain_id))?)",
@@ -1179,41 +571,28 @@ fn resolving_a_send_by_first_match_is_caught() {
 
 #[test]
 fn a_reply_that_names_only_the_symbol_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "\"tokenAddress\": q.token.as_ref().and_then(|t| t.address.clone()),",
-        "",
-    );
+    let mutant = mutate(GLUE, "\"tokenAddress\": r.token_address(),", "");
     let e = check_a_send_names_one_contract(&mutant).unwrap_err();
     assert!(e.contains("WHICH contract"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------
-// 12. Every gated path is bounded across its gate.
+// 6. Every gated path is bounded across its gate.
 // ---------------------------------------------------------------------------------------
 
-/// Section 9 bounded the two paths a BUTTON drives and left the other four gate sites on the
-/// unbounded probe, which the protocol ABI answers with its 20s default. `get_balances` was
-/// the worst: `READ_BUDGET`, then up to 20s of gate, then an untimed Multicall3 — some
-/// forty-four seconds of frozen wallet, and every gated read pays that probe now the cache is
-/// latched cold. So the rule is about every gated door, not two of them.
+/// The unbounded probe is what the protocol ABI answers with its 20s default; every gate
+/// site takes its allowance first and spends the gate out of it.
 const GATED: &[(&str, &str)] = &[
     ("get_balances", "BALANCES_BUDGET"),
     ("prepare_send", "SEND_BUDGET"),
     ("send", "SEND_BUDGET"),
-    ("advance_send", "SEND_BUDGET"),
     ("suggest_fees", "FEES_BUDGET"),
     ("verified_proxy_state", "VERDICT_BUDGET"),
-    ("refresh_one", "REFRESH_BUDGET"),
-    ("tx_details", "DETAILS_BUDGET"),
 ];
 
 fn check_gated_paths_are_bounded(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let fns = functions(&code);
-    // The unbounded twins are deleted rather than merely unused, so a call to one is a
-    // compile error in the nix build. This is what says so under `cargo test`, which never
-    // compiles this file at all.
     for call in ["self.verified_gate(", "self.verified_verdict("] {
         if let Some(at) = sites(&code, call).first() {
             return Err(format!(
@@ -1248,7 +627,6 @@ fn every_gated_path_takes_its_allowance_before_the_gate() {
     check_gated_paths_are_bounded(GLUE).unwrap();
 }
 
-/// The finding itself: a gate site left on the unbounded probe.
 #[test]
 fn a_gate_site_left_on_the_unbounded_probe_is_caught() {
     let mutant = mutate(
@@ -1260,8 +638,6 @@ fn a_gate_site_left_on_the_unbounded_probe_is_caught() {
     assert!(e.contains("calls the unbounded"), "{e}");
 }
 
-/// And the subtler shape: the gate is bounded, but by an allowance opened after it — so it
-/// charges the gate nothing and covers only what follows.
 #[test]
 fn an_allowance_opened_after_the_gate_is_caught() {
     let mutant = mutate(
@@ -1278,9 +654,7 @@ fn an_allowance_opened_after_the_gate_is_caught() {
     assert!(e.contains("AFTER the gate"), "{e}");
 }
 
-/// The read BEHIND the gate. One call, so a per-call cap and the aggregate are the same
-/// number — but "one call" was also the argument for leaving `get_balances`'s Multicall3 at
-/// the protocol default, on top of a gate that could already have spent twenty seconds.
+/// The read BEHIND the gate is bounded too.
 #[test]
 fn the_read_behind_the_gate_is_bounded_too() {
     let mutant = mutate(
@@ -1293,109 +667,70 @@ fn the_read_behind_the_gate_is_bounded_too() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 13. Nothing broadcasts through a gate that has closed.
+// 7. Money leaves only through the sender.
 // ---------------------------------------------------------------------------------------
 
-/// The window. `send` passes the gate and the job then sits `awaitingApproval` while a human
-/// decides — seconds to minutes. If the proxy goes unusable in there, or the mode flips to
-/// `required`, the poll that finally broadcasts used to re-check nothing: the transaction
-/// left through a route the gate would refuse, carrying a nonce and a fee read taken while it
-/// was still open.
-///
-/// Two halves, and the second is the one that must not be got wrong. The gate sits between
-/// the signature and `claim_broadcast` — as late as a check can be and still be in front of
-/// the money. And its refusal touches NOTHING: no claim, no record, no settle, so the job
-/// stays `awaitingApproval` with its nonce reserved and the next poll resumes it. A refusal
-/// here is not a failed send; the transaction never left.
-fn check_the_broadcast_is_gated(src: &str) -> Result<(), String> {
+/// This wallet decides WHAT to send and hands it to `tx_sender_module`, which alone reserves
+/// the nonce, asks the keystore and broadcasts. A second path to any of those is a second
+/// nonce authority on the device — exactly the collision the sender exists to prevent.
+fn check_money_leaves_through_the_sender(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let fns = functions(&code);
-    let body = bodies_of(&fns, &code, "advance_send")[0];
-    let gate = body.find("verified_gate_within").ok_or(
-        "`advance_send` reaches `broadcast` with no verified gate. The gate `send` passed can \
-         close while a human is approving, and this is the poll that moves the money.",
-    )?;
-    let claim = body.find("claim_broadcast").ok_or("`advance_send` no longer claims the broadcast")?;
-    if gate > claim {
-        return Err("`advance_send` gates AFTER the broadcast is claimed, so the claim — and \
-                    the burnt nonce with it — is taken on a route the gate would refuse."
-            .into());
-    }
-    let arm = &body[gate..block_end(body, gate)];
-    for (touch, why) in [
-        ("claim_broadcast", "claims the broadcast"),
-        ("record_intent", "writes the write-ahead record"),
-        ("settle", "settles the job"),
-    ] {
-        if arm.contains(touch) {
+    for forbidden in ["send_raw_transaction", "request_approval", "fetch_result", "get_transaction_count"] {
+        if let Some(at) = code.find(forbidden) {
             return Err(format!(
-                "the refusal arm {why}. A closed gate is not a failed send — the transaction \
-                 never left — so the job keeps its nonce and stays resumable."
+                "glue.rs:{} calls `{forbidden}`. Broadcasting, asking the keystore for a \
+                 signature and reading the nonce are tx_sender_module's; a wallet that does \
+                 any of them itself is a second nonce authority.",
+                line_of(src, at)
             ));
         }
     }
-    if arm.contains("blocked(") {
-        return Err("the refusal answers `ok: false`, which a poller reads as a failed send: \
-                    it drops the request id and orphans a job still holding its nonce. \
-                    `held_by_the_gate` is the shape that keeps the poll coming back."
+    let sends = sites(&code, ".tx_sender_module.send_with_timeout(");
+    if sends.len() != 1 || enclosing_fn(&fns, sends[0]) != "send" {
+        return Err(format!(
+            "the delegated send must have exactly one site, in `send`; found {} in {:?}",
+            sends.len(),
+            sends.iter().map(|a| enclosing_fn(&fns, *a)).collect::<Vec<_>>()
+        ));
+    }
+    // The request carries the claim the human reads and the meta this wallet reads back.
+    let body = bodies_of(&fns, &code, "send")[0];
+    if !body.contains("send::purpose(") {
+        return Err("`send` hands the sender no `purpose`, so the signer shows the human an \
+                    unnamed transaction"
             .into());
     }
-    if !arm.contains("job_reply") {
-        return Err("the refusal does not answer with the job as it stands, so a poller cannot \
-                    tell a held send from a lost one"
-            .into());
+    let call = bodies_of(&fns, &code, "call")[0];
+    if !call.contains("erc20_transfer_calldata(") {
+        return Err("`call` no longer encodes the ERC-20 transfer this wallet is sending".into());
     }
     Ok(())
 }
 
 #[test]
-fn the_broadcast_is_gated_and_a_refusal_leaves_the_send_resumable() {
-    check_the_broadcast_is_gated(GLUE).unwrap();
+fn money_leaves_only_through_tx_sender_module() {
+    check_money_leaves_through_the_sender(GLUE).unwrap();
 }
 
-/// The defect as it stood: `send` gates, `send_status` does not, and the poll behind it
-/// broadcasts.
 #[test]
-fn an_ungated_broadcast_is_caught() {
-    let mutant = mutate(GLUE, "self.verified_gate_within(job.chain_id, &b)", "Ok::<(), Value>(())");
-    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
-    assert!(e.contains("no verified gate"), "{e}");
-}
-
-/// The gate present but behind the claim: the nonce is burnt and the job is unsettleable by
-/// anyone but the ticket holder before anything asks whether the send may go out at all.
-#[test]
-fn a_gate_taken_after_the_claim_is_caught() {
-    const ARM: &str = "if let Err(v) = self.verified_gate_within(job.chain_id, &b) {\n            // Re-read: a cancel may have landed while the probe was out.\n            let now_job = st.sends.get(request_id).unwrap_or(job);\n            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));\n        }\n";
-    let mutant = mutate(GLUE, ARM, "");
-    let mutant = mutate(&mutant, "        // WRITE AHEAD.", &format!("        {ARM}\n        // WRITE AHEAD."));
-    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
-    assert!(e.contains("AFTER the broadcast is claimed"), "{e}");
-}
-
-/// The refusal that corrupts the ledger: a closed gate reported as a failed send. The job
-/// goes terminal for a transaction that never left, and every later poll then reports a send
-/// that failed rather than one waiting on a proxy to come back.
-#[test]
-fn a_refusal_that_fails_the_send_is_caught() {
+fn a_wallet_that_broadcasts_itself_is_caught() {
     let mutant = mutate(
         GLUE,
-        "            let now_job = st.sends.get(request_id).unwrap_or(job);\n            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));",
-        "            let reason = \"the verified proxy is not usable\".to_string();\n            return self.settle(&st, request_id, SendStatus::Failed { reason });",
+        "        relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))",
+        "        let _ = modules().eth_rpc_module.send_raw_transaction_with_timeout(1, &request_id, t);\n        relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))",
     );
-    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
-    assert!(e.contains("settles the job"), "{e}");
+    let e = check_money_leaves_through_the_sender(&mutant).unwrap_err();
+    assert!(e.contains("send_raw_transaction"), "{e}");
 }
 
-/// And the refusal that orphans it: `ok: false` stops the poll, so the job is left
-/// non-terminal, holding its nonce, with nothing left driving it.
 #[test]
-fn a_refusal_that_reads_as_a_failure_is_caught() {
+fn a_send_with_no_claim_line_is_caught() {
     let mutant = mutate(
         GLUE,
-        "            let now_job = st.sends.get(request_id).unwrap_or(job);\n            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));",
-        "            return Ok(blocked(&v));",
+        "        request[\"purpose\"] = json!(send::purpose(&amount, &r.symbol, &r.from.to_string(), &r.to.to_string()));\n",
+        "        let _ = amount;\n",
     );
-    let e = check_the_broadcast_is_gated(&mutant).unwrap_err();
-    assert!(e.contains("orphans a job"), "{e}");
+    let e = check_money_leaves_through_the_sender(&mutant).unwrap_err();
+    assert!(e.contains("no `purpose`"), "{e}");
 }

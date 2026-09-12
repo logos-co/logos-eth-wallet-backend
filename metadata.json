@@ -6,10 +6,16 @@
   "interface": "cdylib",
   "concurrency": "multi",
   "category": "wallet",
-  "description": "Ethereum-only wallet coordinator: one active network at a time, a fixed token table, balances, Send with full fee control, and local transaction history.",
+  "description": "Ethereum-only wallet coordinator: one active network at a time, a fixed token table plus enabled tokens, balances, Send with full fee control \u2014 every transaction leaving through tx_sender_module \u2014 and the local history it keeps.",
   "author": "Logos Core Team",
   "main": "eth_wallet_backend_plugin",
-  "dependencies": ["eth_rpc_module", "fee_module", "keystore_module", "token_list_module"],
+  "dependencies": [
+    "eth_rpc_module",
+    "fee_module",
+    "keystore_module",
+    "token_list_module",
+    "tx_sender_module"
+  ],
   "include": [],
   "capabilities": [],
   "codegen": {
@@ -21,7 +27,13 @@
   },
   "nix": {
     "external_libraries": [],
-    "packages": { "build": [], "runtime": [] },
-    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "cmake": {
+      "find_packages": [],
+      "extra_include_dirs": []
+    }
   }
 }

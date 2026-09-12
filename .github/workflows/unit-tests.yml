@@ -59,22 +59,23 @@ jobs:
         run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
 
       - name: The source-shape guards must actually be present
-        # Six files under rust-lib/tests/ assert things about the SHAPE of
+        # Four files under rust-lib/tests/ assert things about the SHAPE of
         # src/glue.rs rather than about a value it returns: that no outbound
-        # call is made under a lock, that the gate cache is opened by an arm and
-        # by nothing else, that every declared event is fired somewhere. A guard
+        # call is made under a lock, that money leaves only through
+        # tx_sender_module, that the gate cache is opened by an arm and by
+        # nothing else, that every declared event is fired somewhere. A guard
         # like that goes green the moment it stops being compiled, and green is
         # exactly what it looks like when it has been deleted -- so name one
         # test from each file rather than trusting the run above.
         run: |
           out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
-          for t in no_broadcast_is_ever_settled_by_request_id \
+          for t in money_leaves_only_through_tx_sender_module \
+                   the_send_path_resolves_a_token_to_one_contract \
                    only_an_arm_opens_the_cache \
-                   no_restart_hands_out_a_number_whose_transaction_may_have_left \
-                   a_send_the_gate_refused_is_still_a_live_send \
                    every_event_this_module_declares_is_emitted_somewhere \
-                   the_relay_arms_once_listens_off_thread_and_closes_its_own_window; do
+                   the_sender_relay_re_emits_every_event_it_subscribes_to \
+                   the_keystore_relay_arms_once_listens_off_thread_and_closes_its_own_window; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 332 ]
+          echo "tests: $n"; [ "$n" -ge 190 ]

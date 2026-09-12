@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::tokens::{Token, TokenSort};
-use crate::{history, networks, tokens};
+use crate::{networks, store, tokens};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,7 +185,7 @@ impl SettingsStore {
     /// a config we cannot read must not answer chain 1 — but naming a network is a way out.
     fn quarantine(&self) -> bool {
         let aside =
-            self.path.with_extension(format!("json.unreadable-{}", history::now_secs()));
+            self.path.with_extension(format!("json.unreadable-{}", store::now_secs()));
         std::fs::rename(&self.path, aside).is_ok()
     }
 
@@ -203,7 +203,7 @@ impl SettingsStore {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        match history::write_then_rename(&tmp, &self.path, &txt) {
+        match store::write_then_rename(&tmp, &self.path, &txt) {
             true => Ok(()),
             false => Err(SettingsError::Persist(format!(
                 "could not replace {}",
