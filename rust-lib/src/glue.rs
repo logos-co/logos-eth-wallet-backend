@@ -98,15 +98,16 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// native row and the verified WETH row — the two that cannot be turned off.
     ///
     /// `query` matches a symbol or name (case-insensitive substring) or an exact address; an
-    /// empty query matches everything. A `limit` of zero or less is no limit. `total` counts
-    /// the matches BEFORE the cut and `shown` after, so a view can say what it is hiding
-    /// rather than presenting a truncated list as the whole answer.
+    /// empty query matches everything. The answer comes in pages: `offset` skips that many
+    /// matches and `limit` caps the rest (zero or less is no limit). `total` counts every
+    /// match, `shown` the rows in this page, and `hasMore` says whether another page follows,
+    /// so a view loads the list as it scrolls instead of presenting a slice as the whole.
     ///
     /// The embedded Uniswap list is overwhelmingly mainnet, so on sepolia and hoodi `listed`
     /// is legitimately 0 and the reply carries the built-in rows alone. That is an ANSWER:
     /// `ok` stays true, and `listError` — present only when the `token_list` call itself
     /// failed — is what tells an empty catalogue from an unread one.
-    fn list_available_tokens(&self, chain_id: i64, query: String, limit: i64) -> String;
+    fn list_available_tokens(&self, chain_id: i64, query: String, offset: i64, limit: i64) -> String;
 
     /// Turn a token on or off for `chain_id`. `{ ok }` or `{ ok: false, error }`.
     ///
@@ -1263,7 +1264,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         .to_string()
     }
 
-    fn list_available_tokens(&self, chain_id: i64, query: String, limit: i64) -> String {
+    fn list_available_tokens(&self, chain_id: i64, query: String, offset: i64, limit: i64) -> String {
         if chain_id < 0 || !networks::is_supported(chain_id as u64) {
             return err(format!("chain {chain_id} is not one of this wallet's networks"));
         }
@@ -1278,11 +1279,13 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         // A non-positive limit is no limit: "show me everything" needs a spelling, and zero
         // meaning "nothing" would make an off-by-one in a caller look like an empty chain.
         let cut = usize::try_from(limit).ok().filter(|n| *n > 0);
+        let offset = usize::try_from(offset).unwrap_or(0);
         let (total, rows) =
-            tokens::available(chain_id, &listed, s.enabled_tokens(chain_id), &query, cut);
+            tokens::available(chain_id, &listed, s.enabled_tokens(chain_id), &query, offset, cut);
+        let has_more = offset.saturating_add(rows.len()) < total;
         let mut v = json!({ "ok": true, "chainId": chain_id, "tokenSort": s.token_sort.as_str(),
-                            "total": total, "shown": rows.len(), "listed": listed.len(),
-                            "tokens": rows });
+                            "total": total, "offset": offset, "shown": rows.len(),
+                            "hasMore": has_more, "listed": listed.len(), "tokens": rows });
         // Only when the call itself failed. Its ABSENCE is what makes `listed: 0` readable as
         // "this chain has none" — the ordinary answer on sepolia and hoodi.
         if let Some(e) = list_error {

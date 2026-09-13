@@ -281,11 +281,14 @@ yes/no.
 
 ### The picker, and testnets
 
-`list_available_tokens(chain_id, query, limit)` returns everything offered plus everything
-token_list holds for the chain, native first, then what is enabled, then the rest
-alphabetically. `total` counts the matches **before** the cut and `shown` after, so a view can
-say what it is hiding instead of presenting a truncated list as the whole answer. A `limit` of
-zero or less is no limit.
+`list_available_tokens(chain_id, query, offset, limit)` returns everything offered plus
+everything token_list holds for the chain, native first, then what is enabled, then the rest
+alphabetically — one page at a time. `offset` skips that many matches, `limit` caps the page
+(zero or less is no limit), `total` counts every match, `shown` the rows in this page and
+`hasMore` whether another follows, so a view loads the list as it scrolls rather than
+presenting a slice as the whole answer. Every page re-reads the catalogue from token_list;
+the order is stable while the lists are, and a `total` that moves between pages means they
+were refreshed underneath.
 
 The embedded Uniswap list is overwhelmingly mainnet, so on sepolia and hoodi `listed` is
 legitimately **0** and the reply carries the built-in rows alone. That is an answer, not a

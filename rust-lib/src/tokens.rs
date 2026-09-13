@@ -322,8 +322,9 @@ pub fn enrich(chain_id: u64, tokens: &[Token], meta: &HashMap<String, Value>) ->
 /// `token_list` holds for the chain, as `(matches BEFORE the cut, rows after it)`.
 ///
 /// `query` matches a symbol or name (case-insensitive substring) or an exact address; an
-/// empty query matches everything. `limit` of `None` is no cut at all. Order: the native row,
-/// then what is enabled, then the rest — alphabetically within each band.
+/// empty query matches everything. `offset` skips that many matches and `limit` of `None` is
+/// no cut at all, so a view loads the answer in pages without a hard end. Order: the native
+/// row, then what is enabled, then the rest — alphabetically within each band.
 ///
 /// A listed row missing `decimals`, `symbol` or a parseable address is dropped rather than
 /// filled in: an offer the user could act on must carry the scale its amounts are read at.
@@ -332,6 +333,7 @@ pub fn available(
     listed: &[Value],
     enabled: &[Token],
     query: &str,
+    offset: usize,
     limit: Option<usize>,
 ) -> (usize, Vec<Value>) {
     if networks::by_chain_id(chain_id).is_none() {
@@ -372,10 +374,11 @@ pub fn available(
         )
     });
     let total = hits.len();
+    let mut page: Vec<Value> = hits.into_iter().skip(offset).collect();
     if let Some(n) = limit {
-        hits.truncate(n);
+        page.truncate(n);
     }
-    (total, hits)
+    (total, page)
 }
 
 /// The `token_list` row for `address` on `chain_id`, read as a `Token` — the snapshot the
@@ -638,7 +641,7 @@ mod tests {
         // And an enabled row cannot conjure a network the wallet does not have.
         assert!(for_chain(999, &enabled).is_empty());
         assert!(find(999, USDC, &enabled).is_none());
-        assert_eq!(available(999, &[listed(999, "USDC", "USD Coin", 6, USDC)], &enabled, "", None).0, 0);
+        assert_eq!(available(999, &[listed(999, "USDC", "USD Coin", 6, USDC)], &enabled, "", 0, None).0, 0);
     }
 
     #[test]
@@ -950,7 +953,7 @@ mod tests {
             listed(1, "USDC", "USD Coin", 6, USDC),
             listed(1, "WETH", "Wrapped Ether", 18, WETH_MAINNET),
         ];
-        let (total, rows) = available(1, &list, &enabled, "", None);
+        let (total, rows) = available(1, &list, &enabled, "", 0, None);
         // Three listed and three offered, but WETH is both: the union is four rows, not six.
         assert_eq!(total, 4);
         assert_eq!(symbols(&rows), ["ETH", "USDC", "WETH", "DAI"]);
@@ -976,7 +979,7 @@ mod tests {
             listed(1, "DAI", "Dai Stablecoin", 18, DAI),
             listed(1, "USDC", "USD Coin", 6, USDC),
         ];
-        let q = |s: &str| symbols(&available(1, &list, &[], s, None).1);
+        let q = |s: &str| symbols(&available(1, &list, &[], s, 0, None).1);
         assert_eq!(q("dai"), ["DAI"], "symbol, case-insensitively");
         assert_eq!(q("stablecoin"), ["DAI"], "a name substring");
         assert_eq!(q(&DAI.to_lowercase()), ["DAI"], "an exact address, case-insensitively");
@@ -993,17 +996,38 @@ mod tests {
         let list: Vec<Value> = (0..12u64)
             .map(|i| listed(1, &format!("T{i:02}"), "Token", 18, &format!("0x{:040x}", i + 1)))
             .collect();
-        let (total, rows) = available(1, &list, &[], "", Some(5));
+        let (total, rows) = available(1, &list, &[], "", 0, Some(5));
         assert_eq!((total, rows.len()), (14, 5), "12 listed plus ETH and WETH");
         assert_eq!(symbols(&rows), ["ETH", "WETH", "T00", "T01", "T02"]);
         // No limit shows everything, and a limit past the end cuts nothing.
-        assert_eq!(available(1, &list, &[], "", None).1.len(), 14);
-        assert_eq!(available(1, &list, &[], "", Some(99)).1.len(), 14);
+        assert_eq!(available(1, &list, &[], "", 0, None).1.len(), 14);
+        assert_eq!(available(1, &list, &[], "", 0, Some(99)).1.len(), 14);
         // The count follows the query, not the catalogue.
-        assert_eq!(available(1, &list, &[], "T0", Some(2)), {
-            let (_, r) = available(1, &list, &[], "T0", Some(2));
+        assert_eq!(available(1, &list, &[], "T0", 0, Some(2)), {
+            let (_, r) = available(1, &list, &[], "T0", 0, Some(2));
             (10, r)
         });
+    }
+
+    #[test]
+    fn the_picker_pages_continue_where_the_last_one_ended() {
+        // A view that scrolls asks for the next slice; the slices must tile the answer with no
+        // row twice and none missing, and the count must stay the count of the whole.
+        let list: Vec<Value> = (0..12u64)
+            .map(|i| listed(1, &format!("T{i:02}"), "Token", 18, &format!("0x{:040x}", i + 1)))
+            .collect();
+        let (t1, p1) = available(1, &list, &[], "", 0, Some(5));
+        let (t2, p2) = available(1, &list, &[], "", 5, Some(5));
+        let (t3, p3) = available(1, &list, &[], "", 10, Some(5));
+        assert_eq!((t1, t2, t3), (14, 14, 14), "total is the whole answer on every page");
+        assert_eq!(symbols(&p2), ["T03", "T04", "T05", "T06", "T07"]);
+        assert_eq!(symbols(&p3), ["T08", "T09", "T10", "T11"], "the last page is short");
+        let all: Vec<String> = [p1, p2, p3].iter().flat_map(|p| symbols(p)).collect();
+        assert_eq!(all, symbols(&available(1, &list, &[], "", 0, None).1));
+        // Past the end is empty, not an error; an offset with no limit is the tail.
+        assert_eq!(available(1, &list, &[], "", 14, Some(5)), (14, Vec::new()));
+        assert_eq!(available(1, &list, &[], "", 99, None), (14, Vec::new()));
+        assert_eq!(available(1, &list, &[], "", 12, None).1.len(), 2);
     }
 
     #[test]
@@ -1012,12 +1036,12 @@ mod tests {
         // on sepolia and hoodi. It must read as "the list has none", not as a broken call.
         let mainnet_only = [listed(1, "DAI", "Dai Stablecoin", 18, DAI)];
         for id in [11_155_111u64, 560_048] {
-            let (total, rows) = available(id, &mainnet_only, &[], "", None);
+            let (total, rows) = available(id, &mainnet_only, &[], "", 0, None);
             assert_eq!((total, symbols(&rows)), (1, vec!["ETH".to_string()]));
             assert!(rows[0]["builtin"] == json!(true) && rows[0]["enabled"] == json!(true));
         }
         // And a query with no hits is an empty list, which is an answer.
-        assert_eq!(available(1, &[], &[], "nosuch", None), (0, Vec::new()));
+        assert_eq!(available(1, &[], &[], "nosuch", 0, None), (0, Vec::new()));
     }
 
     #[test]
@@ -1030,10 +1054,10 @@ mod tests {
             json!({ "chainId": 1, "address": USDC, "symbol": "", "decimals": 6 }),
             json!({ "chainId": 1, "symbol": "NOADDR", "decimals": 18 }),
         ];
-        assert_eq!(symbols(&available(1, &broken, &[], "", None).1), ["ETH", "WETH"]);
+        assert_eq!(symbols(&available(1, &broken, &[], "", 0, None).1), ["ETH", "WETH"]);
         // A row with no `name` is not missing anything — it falls back to its own symbol.
         let nameless = [json!({ "chainId": 1, "address": DAI, "symbol": "DAI", "decimals": 18 })];
-        let rows = available(1, &nameless, &[], "", None).1;
+        let rows = available(1, &nameless, &[], "", 0, None).1;
         let dai = rows.iter().find(|r| r["symbol"] == "DAI").unwrap();
         assert_eq!(dai["name"], json!("DAI"));
     }
@@ -1043,7 +1067,7 @@ mod tests {
         // The snapshot is why this is possible at all: the token stays usable, and the row
         // reports `enabled` rather than claiming a bucket vouches for it.
         let enabled = [tok("USDC", "USD Coin", 6, USDC)];
-        let rows = available(1, &[], &enabled, "", None).1;
+        let rows = available(1, &[], &enabled, "", 0, None).1;
         let usdc = rows.iter().find(|r| r["symbol"] == "USDC").unwrap();
         assert_eq!(usdc["source"], json!("enabled"));
         assert_eq!((usdc["enabled"].clone(), usdc["builtin"].clone()), (json!(true), json!(false)));
