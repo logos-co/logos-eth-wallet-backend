@@ -273,11 +273,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789407302,
+        "lastModified": 1789420400,
         "narHash": "sha256-wpV8YDt/I/D/tPuVs/B/7GkZEW1IyiNOpgSqsco1BGc=",
         "owner": "logos-co",
         "repo": "logos-evm-fee-module",
-        "rev": "d64a6367f62bd9e2e1a4b3d13f8ca6b08bd195c5",
+        "rev": "89db2172606b8db30067817548dbdf12ac0481fc",
         "type": "github"
       },
       "original": {
@@ -18573,11 +18573,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789407557,
-        "narHash": "sha256-fVgnoooDR+QyUHXLs6sjB1Y5EbP30zCbuwL+4ULVRQA=",
+        "lastModified": 1789428634,
+        "narHash": "sha256-CncAL7NxFT0Yy4GT3757ZfOqSlBObJJw1QbX+jtBX8U=",
         "owner": "logos-co",
         "repo": "logos-evm-tx-sender-module",
-        "rev": "4b1de22b9a51001e610cf201f110abeb2430a695",
+        "rev": "32039447708abfaece9668cf663f78e7fb6c41dd",
         "type": "github"
       },
       "original": {
