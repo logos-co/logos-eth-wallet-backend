@@ -47,12 +47,25 @@ const CALLEE_MARGIN: Duration = Duration::from_millis(300);
 pub const READ_BUDGET: Duration = Duration::from_secs(4);
 pub const STARTUP_BUDGET: Duration = Duration::from_secs(6);
 
-/// A send's own outbound work: the verified gate, the quote's fee, balance and nonce reads,
-/// and registering the approval. Larger than a read because a wrong quote is worse than a
-/// slow one — the figure a human is about to approve must not be shortened into an error.
-/// It grew by exactly one `PROBE_BUDGET` when the gate moved inside it, so the quote kept
-/// the allowance it already had.
+/// A send's own outbound work: the verified gate, a token balance read for an ERC-20 send,
+/// and the delegated `tx_sender_module` call that prices the fee, reads the nonce and
+/// registers the approval. Larger than a read because a wrong quote is worse than a slow one
+/// — the figure a human is about to approve must not be shortened into an error.
 pub const SEND_BUDGET: Duration = Duration::from_millis(13_500);
+
+/// The one delegated call of a send: `tx_sender_module.prepare` or `.send`, which itself runs
+/// a gate, a fee estimate, a balance and a nonce read, and the approval request. Its own
+/// allowance is handed down as `deadlineMs` so its error sentence comes home rather than a
+/// bare transport timeout.
+pub const SENDER_BUDGET: Duration = Duration::from_secs(9);
+
+/// One relayed `send_status`: the sender reads the approval, collects the signatures, gates,
+/// and broadcasts — the broadcast itself deliberately unbounded on its side. Under the
+/// protocol's 20s default so a slow node reports a reason rather than a bare timeout.
+pub const STATUS_BUDGET: Duration = Duration::from_secs(18);
+
+/// One relayed history read or receipt sweep: the sender's own sweep allowance is 10s.
+pub const HISTORY_BUDGET: Duration = Duration::from_secs(12);
 
 /// One `get_balances`: the lazy eth_rpc retry, the verified gate, and the single Multicall3
 /// read that answers every row. The gate is INSIDE it — an unbounded probe in front of a
@@ -68,18 +81,10 @@ pub const FEES_BUDGET: Duration = Duration::from_secs(5);
 /// outlast its own interval.
 pub const VERDICT_BUDGET: Duration = Duration::from_secs(2);
 
-/// One receipt sweep: up to `SWEEP_MAX` receipts plus a verdict per distinct chain. The
-/// worst offender before this existed — eleven calls at the 20s protocol default.
-pub const SWEEP_BUDGET: Duration = Duration::from_secs(10);
-
-/// One `get_tx_details`: the verified gate, the block header and, for a row that does not
-/// already store them, the transaction's own fields. A user is waiting on a button for all
-/// three, so the gate is INSIDE this — an aggregate that starts after the longest call in
-/// the method bounds nothing a user can feel.
-pub const DETAILS_BUDGET: Duration = Duration::from_secs(8);
-
-/// One `refresh_tx_status`: the verified gate and one receipt read, both on a button.
-pub const REFRESH_BUDGET: Duration = Duration::from_secs(5);
+/// One relayed `tx_details` (the sender's own allowance is 8s) and one relayed
+/// `refresh_tx_status` (5s), each on a button.
+pub const DETAILS_BUDGET: Duration = Duration::from_secs(9);
+pub const REFRESH_BUDGET: Duration = Duration::from_secs(6);
 
 /// Below this a grant buys nothing, and the protocol ABI refuses a sub-millisecond bound
 /// outright. The last sliver of an allowance goes on answering, not on one more call.
@@ -144,30 +149,29 @@ mod tests {
         assert!(walk(READ_BUDGET, &calls) <= READ_BUDGET);
     }
 
-    /// The worst case a sweep presents: a verdict per chain, then `SWEEP_MAX` receipts.
+    /// A send: the gate, a token balance read, then the one delegated call to the sender.
+    /// The delegated call gets the lion's share — it is where the fee, the nonce and the
+    /// approval happen — and it must fit AFTER the two reads in front of it.
     #[test]
-    fn a_sweep_is_bounded_by_its_total_and_not_by_the_history_length() {
-        let mut calls = vec![PROBE_BUDGET; crate::networks::ALL.len()];
-        calls.extend([RPC_BUDGET; crate::sweep::SWEEP_MAX]);
-        assert!(calls.iter().sum::<Duration>() > SWEEP_BUDGET, "the aggregate must bind");
-        assert!(walk(SWEEP_BUDGET, &calls) <= SWEEP_BUDGET);
+    fn a_send_is_bounded_across_its_reads_and_the_delegated_call() {
+        let calls = [PROBE_BUDGET, RPC_BUDGET, SENDER_BUDGET];
+        assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
+        assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "every call must fit");
+        assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
+        // What the sender is handed is what is left after the reads, less the margin that
+        // brings its reply home — and that is still a working allowance.
+        let handed = callee_deadline(SENDER_BUDGET).expect("worth bounding");
+        assert!(handed >= 8_000, "the sender needs room for four calls of its own: {handed}ms");
     }
 
-    /// A send: the gate, the fee estimate, the native balance, a token balance, the nonce,
-    /// then the approval request.
+    /// The relays sit under the protocol's 20s default, so a slow sender reports its own
+    /// reason rather than being cut off by the transport.
     #[test]
-    fn a_send_is_bounded_across_its_quote_and_its_approval_request() {
-        let mut calls = vec![PROBE_BUDGET];
-        calls.extend([RPC_BUDGET; 4]);
-        calls.push(INIT_BUDGET);
-        assert!(calls.iter().sum::<Duration>() > SEND_BUDGET, "the aggregate must bind");
-        assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
-        // And it must be long enough to make every call it needs, or the budget is the bug:
-        // a send that times out mid-quote is a Send button that never works.
-        assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
-        // The gate arrived inside the aggregate rather than in front of it, and took nothing
-        // from the quote: a probe's worth is exactly what the total grew by.
-        assert_eq!(SEND_BUDGET - PROBE_BUDGET, Duration::from_secs(12));
+    fn every_relay_answers_inside_the_transport_default() {
+        for total in [STATUS_BUDGET, HISTORY_BUDGET, DETAILS_BUDGET, REFRESH_BUDGET] {
+            assert!(total < Duration::from_secs(20), "{total:?}");
+            assert!(slice(total, Duration::ZERO, total).is_some());
+        }
     }
 
     /// The four gate sites that ran the UNBOUNDED probe. `get_balances` was the worst:

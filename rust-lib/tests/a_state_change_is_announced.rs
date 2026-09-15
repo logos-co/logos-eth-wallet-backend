@@ -1,19 +1,13 @@
 //! The rule this file holds: a method that changes persisted or observable state announces
-//! it, on the change alone and after the write; a pure reader announces nothing.
-//!
-//! `set_token_enabled` and `set_token_sort` were silent — the offered set could move under a
-//! view with nothing saying so — and `set_active_chain` announced every call, including one
-//! that re-affirmed the chain already stored. Both directions are checked here.
+//! it, on the change alone and after the write; a pure reader announces nothing; and what
+//! the sender announces reaches this module's subscribers unchanged.
 //!
 //! `glue.rs` is behind the `logos_module` feature and `--no-default-features` cannot compile
-//! it, so it is read as text, exactly as `glue_never_calls_under_a_lock.rs` does. The same two
-//! rules keep that honest: every check pins the SITE rather than the vocabulary, and every
+//! it, so it is read as text. Every check pins the SITE rather than the vocabulary, and every
 //! check ships with the mutant it is meant to kill.
 
 const GLUE: &str = include_str!("../src/glue.rs");
 
-/// The file with comments and string literals blanked out, byte offsets preserved. Brace
-/// counting must not be fooled by a `{` inside a `json!` string.
 fn code_only(src: &str) -> String {
     let mut out: Vec<u8> = src.as_bytes().to_vec();
     let b = src.as_bytes();
@@ -51,7 +45,6 @@ fn sites(hay: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-/// The end of the block opened after `from` — its matching close brace.
 fn block_end(code: &str, from: usize) -> usize {
     let open = from + code[from..].find('{').expect("a block to close");
     let mut depth = 0i32;
@@ -70,7 +63,6 @@ fn block_end(code: &str, from: usize) -> usize {
     code.len()
 }
 
-/// The end of the call expression starting at `from` — its matching close paren.
 fn call_end(code: &str, from: usize) -> usize {
     let open = from + code[from..].find('(').expect("a call to close");
     let mut depth = 0i32;
@@ -117,8 +109,7 @@ fn functions(code: &str) -> Vec<Func> {
     out
 }
 
-/// Every body under `name`. All of them, not the first: an impl and a trait default can
-/// share a name, and picking one is how a check reads the wrong one.
+/// Every body under `name`. All of them, not the first.
 fn bodies_of<'a>(fns: &[Func], code: &'a str, name: &str) -> Vec<&'a str> {
     let out: Vec<&str> =
         fns.iter().filter(|f| f.name == name).map(|f| &code[f.body.0..f.body.1]).collect();
@@ -126,7 +117,6 @@ fn bodies_of<'a>(fns: &[Func], code: &'a str, name: &str) -> Vec<&'a str> {
     out
 }
 
-/// A copy of the source with one regression applied, for the mutant tests.
 fn mutate(src: &str, from: &str, to: &str) -> String {
     assert_eq!(src.matches(from).count(), 1, "the mutation target moved: {from}");
     src.replacen(from, to, 1)
@@ -166,8 +156,8 @@ fn declared_events(code: &str) -> Vec<String> {
 /// The three methods that write `settings.json`. Each must announce, on the change alone.
 const SETTINGS_MUTATORS: &[&str] = &["set_active_chain", "set_token_enabled", "set_token_sort"];
 
-/// Methods that only read. `get_history` and `refresh_pending` are deliberately absent: both
-/// drive the sweep, which WRITES, and section 4 is where its announcement is pinned.
+/// Methods that only read, or relay a read. The sender announces what its sweep moves; a
+/// relay that announced on top would be a view driving its own subscription round forever.
 const READERS: &[&str] = &[
     "list_networks",
     "get_active_network",
@@ -175,7 +165,12 @@ const READERS: &[&str] = &[
     "list_tokens",
     "list_available_tokens",
     "get_balances",
+    "get_history",
+    "refresh_pending",
+    "refresh_tx_status",
     "get_tx_details",
+    "send_status",
+    "prepare_send",
     "suggest_fees",
     "get_account_wallets",
     "list_contacts",
@@ -185,8 +180,6 @@ const READERS: &[&str] = &[
 // 1. A declared event has an emitter.
 // ---------------------------------------------------------------------------------------
 
-/// The defect that motivated all of this, generalised: an event in the trait that nothing
-/// ever fires is a consumer subscribing to silence, and it costs a subscription to find out.
 fn check_every_declared_event_is_emitted(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let declared = declared_events(&code);
@@ -236,8 +229,6 @@ fn check_mutators_announce_a_change(src: &str) -> Result<(), String> {
                      learn of the change except by asking again."
                 ));
             }
-            // The write is what `changed` is computed from, so an announcement in front of it
-            // would be announcing what the caller asked for, not what reached disk.
             let write = body
                 .find("st.settings.")
                 .ok_or_else(|| format!("{name} no longer writes through st.settings"))?;
@@ -302,8 +293,6 @@ fn announcing_before_the_write_lands_is_caught() {
 // 3. A reader announces nothing.
 // ---------------------------------------------------------------------------------------
 
-/// The other direction, and the one that bites quietly: a read that announces itself is a
-/// view driving its own subscription round forever.
 fn check_readers_stay_silent(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let fns = functions(&code);
@@ -329,205 +318,64 @@ fn no_read_announces_itself() {
 fn a_read_that_announces_itself_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        let balances = tokens::balance_rows(chain_id, &list, &decoded, settings.token_sort);",
-        "        let balances = tokens::balance_rows(chain_id, &list, &decoded, settings.token_sort);\n        emit_balances_updated(&address);",
+        "        rows::decorate_history(&mut v, chain_id, settings.enabled_tokens(chain_id));\n        v.to_string()",
+        "        rows::decorate_history(&mut v, chain_id, settings.enabled_tokens(chain_id));\n        emit_balances_updated(&address);\n        v.to_string()",
     );
     let e = check_readers_stay_silent(&mutant).unwrap_err();
-    assert!(e.contains("get_balances"), "{e}");
+    assert!(e.contains("get_history"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------
-// 4. The sweep announces the balance it moved, wherever it was driven from.
+// 4. What the sender announces reaches this module's subscribers.
 // ---------------------------------------------------------------------------------------
 
-/// `refresh_pending` announced a confirmation and `get_history` did not, though both sweep.
-/// A row confirming under an open history view moved the balance with nothing saying so, so
-/// the announcement belongs in the writer — once, and in one place.
-fn check_the_sweep_announces_its_own_confirmations(src: &str) -> Result<(), String> {
+/// A view depends on this module alone, so the sender's three events must come out of here
+/// under this module's own names — and a settle, which can move a balance the view is
+/// showing, must also say so, with an empty address because the sender's event names none.
+fn check_the_sender_relay_re_emits_everything(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let fns = functions(&code);
-    for body in bodies_of(&fns, &code, "sweep") {
-        if !body.contains("emit_balances_updated(") {
-            return Err("the sweep confirms rows and does not announce the balances they \
-                        moved, so whichever caller forgets to is silent"
-                .into());
+    let body = bodies_of(&fns, &code, "watch_sender")[0];
+    for (decode, emit) in [
+        ("decode_send_status_changed", "emit_send_status_changed("),
+        ("decode_tx_status_changed", "emit_tx_status_changed("),
+        ("decode_history_changed", "emit_history_changed("),
+    ] {
+        let at = body.find(decode).ok_or_else(|| format!("watch_sender no longer decodes {decode}"))?;
+        let arm = &body[at..block_end(body, at)];
+        if !arm.contains(emit) {
+            return Err(format!("the sender's {decode} is decoded and not re-emitted as {emit}"));
         }
     }
-    for name in ["refresh_pending", "get_history"] {
-        for body in bodies_of(&fns, &code, name) {
-            if body.contains("emit_balances_updated(") {
-                return Err(format!(
-                    "{name} announces a balance move the sweep already announced. Two sites \
-                     is how one of them ends up being the only one."
-                ));
-            }
-        }
+    let at = body.find("decode_tx_status_changed").expect("checked above");
+    let arm = &body[at..block_end(body, at)];
+    if !arm.contains("emit_balances_updated(") {
+        return Err("a settled transaction can move a balance the view is showing, and the \
+                    relay of tx_status_changed does not say so"
+            .into());
     }
     Ok(())
 }
 
 #[test]
-fn a_confirmation_is_announced_once_by_the_sweep_that_found_it() {
-    check_the_sweep_announces_its_own_confirmations(GLUE).unwrap();
+fn the_sender_relay_re_emits_every_event_it_subscribes_to() {
+    check_the_sender_relay_re_emits_everything(GLUE).unwrap();
 }
 
 #[test]
-fn announcing_from_one_caller_of_the_sweep_instead_is_caught() {
+fn a_relay_that_drops_the_balance_announcement_is_caught() {
+    let mutant = mutate(GLUE, "                    emit_balances_updated(\"\");\n", "");
+    let e = check_the_sender_relay_re_emits_everything(&mutant).unwrap_err();
+    assert!(e.contains("does not say so"), "{e}");
+}
+
+#[test]
+fn a_relay_that_swallows_an_event_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        if out.confirmed {\n            emit_balances_updated(address);\n        }\n",
-        "",
+        "                    emit_history_changed(&e.address);\n",
+        "                    let _ = e.address;\n",
     );
-    let mutant = mutate(
-        &mutant,
-        "        let s = self.sweep(&st, &address, &Budget::new(SWEEP_BUDGET));\n        json!({ \"ok\": true, \"address\": address,",
-        "        let s = self.sweep(&st, &address, &Budget::new(SWEEP_BUDGET));\n        if s.confirmed {\n            emit_balances_updated(&address);\n        }\n        json!({ \"ok\": true, \"address\": address,",
-    );
-    let e = check_the_sweep_announces_its_own_confirmations(&mutant).unwrap_err();
-    assert!(e.contains("whichever caller forgets"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 5. A history row no hash can name still announces itself.
-// ---------------------------------------------------------------------------------------
-
-/// The intent row goes to disk BEFORE the broadcast and has no hash until the node answers,
-/// so `tx_status_changed` cannot name it. A history view would otherwise learn of a send only
-/// if it succeeded — and on the `leave_unknown` arm, never.
-fn check_the_intent_row_is_announced(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    for body in bodies_of(&fns, &code, "advance_send") {
-        let record = body.find("record_intent(").ok_or("advance_send no longer records")?;
-        let announced: Vec<usize> =
-            sites(body, "emit_history_changed(").into_iter().filter(|a| *a > record).collect();
-        // One for the intent, one per broadcast arm that leaves the row unknown.
-        if announced.len() < 3 {
-            return Err(format!(
-                "advance_send announces {} of the 3 history writes that no hash can name: \
-                 the intent, and the two arms that leave the row unknown.",
-                announced.len()
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn every_hashless_history_write_is_announced() {
-    check_the_intent_row_is_announced(GLUE).unwrap();
-}
-
-#[test]
-fn a_row_written_before_the_broadcast_and_never_announced_is_caught() {
-    let mutant = mutate(GLUE, "\n        emit_history_changed(&job.from);\n", "\n");
-    let e = check_the_intent_row_is_announced(&mutant).unwrap_err();
-    assert!(e.contains("announces 2 of the 3"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 6. A settle announces only the status it actually moved.
-// ---------------------------------------------------------------------------------------
-
-/// `settle_locked` answers with the live job on three paths, and only one of them wrote
-/// anything: an outsider settling a claimed broadcast, and a settle arriving after a
-/// terminal status, both get the job back unchanged. Announcing on `Some` alone made
-/// `send_status_changed` mean "someone tried", which is the one thing an event may not mean.
-fn check_a_settle_announces_only_a_move(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    for name in ["settle", "settle_owned"] {
-        for body in bodies_of(&fns, &code, name) {
-            let emits = sites(body, "emit_send_status_changed(");
-            if emits.is_empty() {
-                return Err(format!("{name} settles a send and announces nothing"));
-            }
-            for at in emits {
-                let head = enclosing_head(body, at);
-                if !head.contains("changed") {
-                    return Err(format!(
-                        "{name} announces from a block headed `{}` — the ledger answers with \
-                         the live job whether or not this call moved it, so a settle the \
-                         broadcast owner refused, or one that arrived after a terminal \
-                         status, is announced as a state change that never happened.",
-                        head.trim()
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn only_a_settle_that_moved_the_status_is_announced() {
-    check_a_settle_announces_only_a_move(GLUE).unwrap();
-}
-
-#[test]
-fn announcing_a_settle_that_lost_the_race_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "            .ok_or_else(|| format!(\"no send with id '{request_id}'\"))?;\n        if s.changed {\n            emit_send_status_changed(&s.job.request_id);\n        }\n",
-        "            .ok_or_else(|| format!(\"no send with id '{request_id}'\"))?;\n        emit_send_status_changed(&s.job.request_id);\n",
-    );
-    let e = check_a_settle_announces_only_a_move(&mutant).unwrap_err();
-    assert!(e.contains("never happened"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 7. A receipt is announced once it is STORED, not once it is decided.
-// ---------------------------------------------------------------------------------------
-
-/// `apply_receipt` decides the new status in memory and then writes it. Announcing on the
-/// in-memory verdict announces a settle that a refused write left on disk as `pending` — a
-/// subscriber re-reads the row it was told about and finds it unmoved, the sweep re-polls it
-/// forever, and the reply's `changed` count names a transaction nothing settled.
-fn check_a_receipt_is_announced_only_once_stored(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    for name in ["sweep", "refresh_one"] {
-        for body in bodies_of(&fns, &code, name) {
-            if !body.contains("apply_receipt(") {
-                return Err(format!("{name} no longer applies receipts — the check is blind"));
-            }
-            for at in sites(body, "emit_tx_status_changed(") {
-                let head = enclosing_head(body, at);
-                if !head.contains("apply_receipt") {
-                    return Err(format!(
-                        "{name} announces a receipt from a block headed `{}`, which is not \
-                         the apply that stored it.",
-                        head.trim()
-                    ));
-                }
-                // `Ok(true)` and `?` are the two shapes that can only be reached by a write
-                // that landed; a bare bool cannot distinguish one from a full disk.
-                if !(head.contains("Ok(true)") || head.contains('?')) {
-                    return Err(format!(
-                        "{name} announces a receipt from a block headed `{}` — that answers \
-                         whether the row moved in memory, not whether the new status reached \
-                         disk, so a write the disk refused is announced as a settle.",
-                        head.trim()
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn a_receipt_is_announced_only_once_it_is_on_disk() {
-    check_a_receipt_is_announced_only_once_stored(GLUE).unwrap();
-}
-
-#[test]
-fn announcing_a_receipt_whose_write_was_refused_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "if st.history.apply_receipt(&rec, &receipt, history::now_secs())? {",
-        "if st.history.apply_receipt(&rec, &receipt, history::now_secs()).unwrap_or_default() {",
-    );
-    let e = check_a_receipt_is_announced_only_once_stored(&mutant).unwrap_err();
-    assert!(e.contains("refused"), "{e}");
+    let e = check_the_sender_relay_re_emits_everything(&mutant).unwrap_err();
+    assert!(e.contains("decode_history_changed"), "{e}");
 }

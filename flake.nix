@@ -28,6 +28,13 @@
       url = "github:logos-co/logos-evm-token-list-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
+    # The one sender on the device. Every transaction this wallet makes leaves through it:
+    # it reserves the nonce, asks the keystore, broadcasts and records. Until the repo is
+    # published, build with `--override-input tx_sender_module path:../logos-evm-tx-sender-module`.
+    tx_sender_module = {
+      url = "github:logos-co/logos-evm-tx-sender-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

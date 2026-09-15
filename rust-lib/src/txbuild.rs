@@ -1,16 +1,14 @@
-//! Offline transaction construction + ABI encode/decode (the folded-in
-//! tx-builder).
+//! Offline ABI encode/decode.
 //!
-//! Builds unsigned native-ETH and ERC20-transfer transactions (as JSON the
-//! keystore will sign), ABI-encodes ERC20 reads (`balanceOf`/`decimals`/
-//! `symbol`), and encodes/decodes **Multicall3 `aggregate3`** so the coordinator
-//! can fetch every balance on a chain in one `eth_call`. No network, no keys.
-//! Pure Rust, unit-tested with `cargo test`.
+//! ABI-encodes the ERC20 `transfer` this wallet sends and the reads it makes
+//! (`balanceOf`/`decimals`/`symbol`), and encodes/decodes **Multicall3 `aggregate3`**
+//! so the coordinator can fetch every balance on a chain in one `eth_call`. The unsigned
+//! transaction itself is `tx_sender_module`'s to build. No network, no keys. Pure Rust,
+//! unit-tested with `cargo test`.
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use serde_json::{json, Value};
 
 sol! {
     #[allow(missing_docs)]
@@ -138,61 +136,6 @@ pub fn decode_aggregate3_returns(data: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
     )
 }
 
-// ── Unsigned transactions (keystore-signable JSON) ───────────────────────────
-
-/// Fee policy for an unsigned transaction.
-#[derive(Clone, Debug)]
-pub enum Fee {
-    Eip1559 { max_fee_per_gas: U256, max_priority_fee_per_gas: U256 },
-    Legacy { gas_price: U256 },
-}
-
-fn apply_fee(o: &mut serde_json::Map<String, Value>, fee: &Fee) {
-    match fee {
-        Fee::Eip1559 { max_fee_per_gas, max_priority_fee_per_gas } => {
-            o.insert("fee_mode".into(), json!("eip1559"));
-            o.insert("max_fee_per_gas".into(), json!(u256_hex(*max_fee_per_gas)));
-            o.insert("max_priority_fee_per_gas".into(), json!(u256_hex(*max_priority_fee_per_gas)));
-        }
-        Fee::Legacy { gas_price } => {
-            o.insert("fee_mode".into(), json!("legacy"));
-            o.insert("gas_price".into(), json!(u256_hex(*gas_price)));
-        }
-    }
-}
-
-/// Build an unsigned native-ETH transfer as the JSON the keystore signs.
-pub fn unsigned_native_tx(to: Address, value: U256, nonce: u64, gas_limit: u64, fee: &Fee) -> Value {
-    let mut o = serde_json::Map::new();
-    o.insert("to".into(), json!(to.to_string()));
-    o.insert("value".into(), json!(u256_hex(value)));
-    o.insert("nonce".into(), json!(u64_hex(nonce)));
-    o.insert("gas_limit".into(), json!(u64_hex(gas_limit)));
-    o.insert("data".into(), json!("0x"));
-    apply_fee(&mut o, fee);
-    Value::Object(o)
-}
-
-/// Build an unsigned ERC20 `transfer` (to = token, value = 0, data = calldata).
-pub fn unsigned_erc20_tx(
-    token: Address,
-    to: Address,
-    amount: U256,
-    nonce: u64,
-    gas_limit: u64,
-    fee: &Fee,
-) -> Value {
-    let data = erc20_transfer_calldata(to, amount);
-    let mut o = serde_json::Map::new();
-    o.insert("to".into(), json!(token.to_string()));
-    o.insert("value".into(), json!("0x0"));
-    o.insert("nonce".into(), json!(u64_hex(nonce)));
-    o.insert("gas_limit".into(), json!(u64_hex(gas_limit)));
-    o.insert("data".into(), json!(hex0x(&data)));
-    apply_fee(&mut o, fee);
-    Value::Object(o)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,63 +170,4 @@ mod tests {
     fn erc20_balance_of_selector() {
         let data = erc20_balance_of_calldata(ALICE);
         assert_eq!(&data[0..4], &[0x70, 0xa0, 0x82, 0x31]);
-    }
-
-    #[test]
-    fn multicall3_aggregate3_roundtrips() {
-        let calls = vec![
-            (multicall3_address(), multicall3_get_eth_balance_calldata(ALICE)),
-            (USDC, erc20_balance_of_calldata(ALICE)),
-        ];
-        let encoded = multicall3_aggregate3_calldata(&calls);
-        // aggregate3(Call3[]) selector 0x82ad56cb
-        assert_eq!(&encoded[0..4], &[0x82, 0xad, 0x56, 0xcb]);
-
-        // Build a synthetic return: native = 5 wei (success), token = failed.
-        let native = U256::from(5u64).to_be_bytes::<32>().to_vec();
-        let results = vec![
-            Result3 { success: true, returnData: Bytes::from(native) },
-            Result3 { success: false, returnData: Bytes::new() },
-        ];
-        let ret = IMulticall3::aggregate3Call::abi_encode_returns(&results);
-        let decoded = decode_aggregate3_returns(&ret).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decode_uint256(decoded[0].as_ref().unwrap()).unwrap(), U256::from(5u64));
-        assert!(decoded[1].is_none());
-    }
-
-    #[test]
-    fn unsigned_native_has_keystore_fields() {
-        let fee = Fee::Eip1559 { max_fee_per_gas: U256::from(2_000_000_000u64), max_priority_fee_per_gas: U256::from(1_000_000_000u64) };
-        let tx = unsigned_native_tx(ALICE, U256::from(1_000u64), 7, 21_000, &fee);
-        assert_eq!(tx["nonce"], "0x7");
-        assert_eq!(tx["value"], "0x3e8");
-        assert_eq!(tx["gas_limit"], "0x5208");
-        assert_eq!(tx["fee_mode"], "eip1559");
-        assert_eq!(tx["data"], "0x");
-    }
-
-    /// What the intent row records is the transaction's own `data`. A native send's is "0x",
-    /// which is a fact and not a missing value — it is what makes it a plain transfer.
-    #[test]
-    fn the_calldata_an_intent_row_records_is_the_transactions_own() {
-        let fee = Fee::Eip1559 {
-            max_fee_per_gas: U256::from(2_000_000_000u64),
-            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
-        };
-        assert_eq!(unsigned_native_tx(ALICE, U256::from(1_000u64), 7, 21_000, &fee)["data"], "0x");
-        let erc20 = unsigned_erc20_tx(USDC, ALICE, U256::from(42u64), 7, 60_000, &fee);
-        assert!(erc20["data"].as_str().unwrap().starts_with("0xa9059cbb"), "transfer selector");
-    }
-
-    #[test]
-    fn unsigned_erc20_targets_token_with_calldata() {
-        let fee = Fee::Legacy { gas_price: U256::from(1_000_000_000u64) };
-        let tx = unsigned_erc20_tx(USDC, ALICE, U256::from(42u64), 0, 60_000, &fee);
-        assert_eq!(tx["to"], USDC.to_string());
-        assert_eq!(tx["value"], "0x0");
-        assert_eq!(tx["fee_mode"], "legacy");
-        let data = tx["data"].as_str().unwrap();
-        assert!(data.starts_with("0xa9059cbb")); // transfer selector
-    }
-}
+    }}

@@ -196,6 +196,53 @@
         "type": "github"
       }
     },
+    "eth_rpc_module_3": {
+      "inputs": {
+        "logos-module-builder": [
+          "tx_sender_module",
+          "logos-module-builder"
+        ],
+        "modules_state": "modules_state_2",
+        "verified_proxy_module": "verified_proxy_module_2"
+      },
+      "locked": {
+        "lastModified": 1788919187,
+        "narHash": "sha256-THfe5T8VPTBmyBY85OwUQDrpnNZBvzRhrWLa4vHK55Q=",
+        "owner": "logos-co",
+        "repo": "logos-evm-eth-rpc-module",
+        "rev": "fbb8d7a784519df011815e7e2b6f9ba654d5736e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-evm-eth-rpc-module",
+        "type": "github"
+      }
+    },
+    "eth_rpc_module_4": {
+      "inputs": {
+        "logos-module-builder": [
+          "tx_sender_module",
+          "fee_module",
+          "logos-module-builder"
+        ],
+        "modules_state": "modules_state_3",
+        "verified_proxy_module": "verified_proxy_module_3"
+      },
+      "locked": {
+        "lastModified": 1788919187,
+        "narHash": "sha256-THfe5T8VPTBmyBY85OwUQDrpnNZBvzRhrWLa4vHK55Q=",
+        "owner": "logos-co",
+        "repo": "logos-evm-eth-rpc-module",
+        "rev": "fbb8d7a784519df011815e7e2b6f9ba654d5736e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-evm-eth-rpc-module",
+        "type": "github"
+      }
+    },
     "fee_module": {
       "inputs": {
         "eth_rpc_module": "eth_rpc_module_2",
@@ -217,9 +264,52 @@
         "type": "github"
       }
     },
+    "fee_module_2": {
+      "inputs": {
+        "eth_rpc_module": "eth_rpc_module_4",
+        "logos-module-builder": [
+          "tx_sender_module",
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789420400,
+        "narHash": "sha256-wpV8YDt/I/D/tPuVs/B/7GkZEW1IyiNOpgSqsco1BGc=",
+        "owner": "logos-co",
+        "repo": "logos-evm-fee-module",
+        "rev": "89db2172606b8db30067817548dbdf12ac0481fc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-evm-fee-module",
+        "type": "github"
+      }
+    },
     "keystore_module": {
       "inputs": {
         "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788461421,
+        "narHash": "sha256-0TNwHBZ57vLIjyN++HDV9w8letYprNNbhcTAT30hxKI=",
+        "owner": "logos-co",
+        "repo": "logos-evm-keystore-module",
+        "rev": "e8fff7df5aef2326e8854ac2fc421ba20df73ced",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-evm-keystore-module",
+        "type": "github"
+      }
+    },
+    "keystore_module_2": {
+      "inputs": {
+        "logos-module-builder": [
+          "tx_sender_module",
           "logos-module-builder"
         ]
       },
@@ -5688,6 +5778,44 @@
         "owner": "logos-co",
         "repo": "logos-nix",
         "rev": "6e0f4a7120fced10829b0b3a698ff619a11d4605",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-nix",
+        "type": "github"
+      }
+    },
+    "logos-nix_160": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_161",
+        "nixpkgs-windows": "nixpkgs-windows_146"
+      },
+      "locked": {
+        "lastModified": 1786729772,
+        "narHash": "sha256-7qE/hchFHmaCxoFCI4dtCqv2eHyL6VttgedTas41Lgs=",
+        "owner": "logos-co",
+        "repo": "logos-nix",
+        "rev": "f55bf91b8a723ee5c27c39c773b034255538d280",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-nix",
+        "type": "github"
+      }
+    },
+    "logos-nix_161": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_163",
+        "nixpkgs-windows": "nixpkgs-windows_147"
+      },
+      "locked": {
+        "lastModified": 1786729772,
+        "narHash": "sha256-7qE/hchFHmaCxoFCI4dtCqv2eHyL6VttgedTas41Lgs=",
+        "owner": "logos-co",
+        "repo": "logos-nix",
+        "rev": "f55bf91b8a723ee5c27c39c773b034255538d280",
         "type": "github"
       },
       "original": {
@@ -11455,6 +11583,51 @@
         "type": "github"
       }
     },
+    "modules_state_2": {
+      "inputs": {
+        "logos-module-builder": [
+          "tx_sender_module",
+          "eth_rpc_module",
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788383488,
+        "narHash": "sha256-s/XG+4RyX6djnqMvdegdjygPz/n9/o6Da0Zo7vBangk=",
+        "owner": "logos-co",
+        "repo": "logos-modules-state-module",
+        "rev": "dc13caa80164f2a941f788f4f96af193cd019879",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-modules-state-module",
+        "type": "github"
+      }
+    },
+    "modules_state_3": {
+      "inputs": {
+        "logos-module-builder": [
+          "tx_sender_module",
+          "fee_module",
+          "eth_rpc_module",
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788383488,
+        "narHash": "sha256-s/XG+4RyX6djnqMvdegdjygPz/n9/o6Da0Zo7vBangk=",
+        "owner": "logos-co",
+        "repo": "logos-modules-state-module",
+        "rev": "dc13caa80164f2a941f788f4f96af193cd019879",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-modules-state-module",
+        "type": "github"
+      }
+    },
     "nimbus-eth1": {
       "inputs": {
         "nimbusBuildSystem": "nimbusBuildSystem",
@@ -11478,9 +11651,108 @@
         "url": "https://github.com/status-im/nimbus-eth1"
       }
     },
+    "nimbus-eth1_2": {
+      "inputs": {
+        "nimbusBuildSystem": "nimbusBuildSystem_2",
+        "nixpkgs": "nixpkgs_162"
+      },
+      "locked": {
+        "lastModified": 1785300199,
+        "lfs": false,
+        "narHash": "sha256-y3msabM1TJzj7gWHHBPUKBhwSWAzgosQksNec243Bgs=",
+        "ref": "refs/tags/v0.4.0",
+        "rev": "2ed512525a955d4f6c5f977eae4ea761b770d58a",
+        "revCount": 5503,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-eth1"
+      },
+      "original": {
+        "ref": "refs/tags/v0.4.0",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-eth1"
+      }
+    },
+    "nimbus-eth1_3": {
+      "inputs": {
+        "nimbusBuildSystem": "nimbusBuildSystem_3",
+        "nixpkgs": "nixpkgs_164"
+      },
+      "locked": {
+        "lastModified": 1785300199,
+        "lfs": false,
+        "narHash": "sha256-y3msabM1TJzj7gWHHBPUKBhwSWAzgosQksNec243Bgs=",
+        "ref": "refs/tags/v0.4.0",
+        "rev": "2ed512525a955d4f6c5f977eae4ea761b770d58a",
+        "revCount": 5503,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-eth1"
+      },
+      "original": {
+        "ref": "refs/tags/v0.4.0",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-eth1"
+      }
+    },
     "nimbusBuildSystem": {
       "inputs": {
         "nixpkgs": [
+          "eth_rpc_module",
+          "verified_proxy_module",
+          "nimbus-eth1",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1780314388,
+        "narHash": "sha256-YA4zuAAIEPkIyCenc6Z58rS2J2Ih2IB1m1o//nBr7Kw=",
+        "ref": "refs/heads/master",
+        "rev": "74985931a6bf4c774655308eafde449696c6a32e",
+        "revCount": 253,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-build-system"
+      },
+      "original": {
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-build-system"
+      }
+    },
+    "nimbusBuildSystem_2": {
+      "inputs": {
+        "nixpkgs": [
+          "tx_sender_module",
+          "eth_rpc_module",
+          "verified_proxy_module",
+          "nimbus-eth1",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1780314388,
+        "narHash": "sha256-YA4zuAAIEPkIyCenc6Z58rS2J2Ih2IB1m1o//nBr7Kw=",
+        "ref": "refs/heads/master",
+        "rev": "74985931a6bf4c774655308eafde449696c6a32e",
+        "revCount": 253,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-build-system"
+      },
+      "original": {
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/status-im/nimbus-build-system"
+      }
+    },
+    "nimbusBuildSystem_3": {
+      "inputs": {
+        "nixpkgs": [
+          "tx_sender_module",
+          "fee_module",
           "eth_rpc_module",
           "verified_proxy_module",
           "nimbus-eth1",
@@ -13962,6 +14234,38 @@
       }
     },
     "nixpkgs-windows_145": {
+      "locked": {
+        "lastModified": 1782723713,
+        "narHash": "sha256-oPXCU/SSUokcGaJREHibG1CBX3+s/W7orDWQOZDsEeQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "b5aa0fbd538984f6e3d201be0005b4463d8b09f8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "b5aa0fbd538984f6e3d201be0005b4463d8b09f8",
+        "type": "github"
+      }
+    },
+    "nixpkgs-windows_146": {
+      "locked": {
+        "lastModified": 1782723713,
+        "narHash": "sha256-oPXCU/SSUokcGaJREHibG1CBX3+s/W7orDWQOZDsEeQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "b5aa0fbd538984f6e3d201be0005b4463d8b09f8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "b5aa0fbd538984f6e3d201be0005b4463d8b09f8",
+        "type": "github"
+      }
+    },
+    "nixpkgs-windows_147": {
       "locked": {
         "lastModified": 1782723713,
         "narHash": "sha256-oPXCU/SSUokcGaJREHibG1CBX3+s/W7orDWQOZDsEeQ=",
@@ -16553,6 +16857,70 @@
         "type": "github"
       }
     },
+    "nixpkgs_161": {
+      "locked": {
+        "lastModified": 1759036355,
+        "narHash": "sha256-0m27AKv6ka+q270dw48KflE0LwQYrO7Fm4/2//KCVWg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e9f00bd893984bc8ce46c895c3bf7cac95331127",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_162": {
+      "locked": {
+        "lastModified": 1768818593,
+        "narHash": "sha256-sMGoIJFAdXvGh4lZppBxJd4FYHQbNWtuZY4sn70OcrY=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2a777ace4b722f2714cc06d596f2476ee628c04a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2a777ace4b722f2714cc06d596f2476ee628c04a",
+        "type": "github"
+      }
+    },
+    "nixpkgs_163": {
+      "locked": {
+        "lastModified": 1759036355,
+        "narHash": "sha256-0m27AKv6ka+q270dw48KflE0LwQYrO7Fm4/2//KCVWg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e9f00bd893984bc8ce46c895c3bf7cac95331127",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_164": {
+      "locked": {
+        "lastModified": 1768818593,
+        "narHash": "sha256-sMGoIJFAdXvGh4lZppBxJd4FYHQbNWtuZY4sn70OcrY=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2a777ace4b722f2714cc06d596f2476ee628c04a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2a777ace4b722f2714cc06d596f2476ee628c04a",
+        "type": "github"
+      }
+    },
     "nixpkgs_17": {
       "locked": {
         "lastModified": 1759036355,
@@ -18071,7 +18439,8 @@
         "fee_module": "fee_module",
         "keystore_module": "keystore_module",
         "logos-module-builder": "logos-module-builder",
-        "token_list_module": "token_list_module"
+        "token_list_module": "token_list_module",
+        "tx_sender_module": "tx_sender_module"
       }
     },
     "rust-overlay": {
@@ -18194,6 +18563,29 @@
         "type": "github"
       }
     },
+    "tx_sender_module": {
+      "inputs": {
+        "eth_rpc_module": "eth_rpc_module_3",
+        "fee_module": "fee_module_2",
+        "keystore_module": "keystore_module_2",
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789428634,
+        "narHash": "sha256-CncAL7NxFT0Yy4GT3757ZfOqSlBObJJw1QbX+jtBX8U=",
+        "owner": "logos-co",
+        "repo": "logos-evm-tx-sender-module",
+        "rev": "32039447708abfaece9668cf663f78e7fb6c41dd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-evm-tx-sender-module",
+        "type": "github"
+      }
+    },
     "verified_proxy_module": {
       "inputs": {
         "logos-module-builder": [
@@ -18202,6 +18594,55 @@
         ],
         "logos-nix": "logos-nix",
         "nimbus-eth1": "nimbus-eth1"
+      },
+      "locked": {
+        "lastModified": 1788461543,
+        "narHash": "sha256-hqx4l+ooT9yf2h71nm/gbH1XTK8JZOOr4CjbunDbha0=",
+        "owner": "logos-co",
+        "repo": "logos-verified-proxy-module",
+        "rev": "53a619417603e311efdee464df729e0e1a6cc3bc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-verified-proxy-module",
+        "type": "github"
+      }
+    },
+    "verified_proxy_module_2": {
+      "inputs": {
+        "logos-module-builder": [
+          "tx_sender_module",
+          "eth_rpc_module",
+          "logos-module-builder"
+        ],
+        "logos-nix": "logos-nix_160",
+        "nimbus-eth1": "nimbus-eth1_2"
+      },
+      "locked": {
+        "lastModified": 1788461543,
+        "narHash": "sha256-hqx4l+ooT9yf2h71nm/gbH1XTK8JZOOr4CjbunDbha0=",
+        "owner": "logos-co",
+        "repo": "logos-verified-proxy-module",
+        "rev": "53a619417603e311efdee464df729e0e1a6cc3bc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-verified-proxy-module",
+        "type": "github"
+      }
+    },
+    "verified_proxy_module_3": {
+      "inputs": {
+        "logos-module-builder": [
+          "tx_sender_module",
+          "fee_module",
+          "eth_rpc_module",
+          "logos-module-builder"
+        ],
+        "logos-nix": "logos-nix_161",
+        "nimbus-eth1": "nimbus-eth1_3"
       },
       "locked": {
         "lastModified": 1788461543,

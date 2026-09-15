@@ -9,6 +9,12 @@
 //! stall the rest. The multi contract makes the generated trait take `&self` + `Send + Sync`,
 //! so all state lives behind an `RwLock` — chosen at the first commit because a `&mut self`
 //! module cannot be retrofitted onto multi later.
+//!
+//! Every transaction this wallet makes LEAVES through `tx_sender_module`, the one sender on
+//! the device. This module decides WHAT to send — which token, how much, to whom, and what
+//! the human is told — and the sender decides the nonce, the fee ceiling, the approval and
+//! the broadcast, and keeps the record. What this module reads back it decorates with the
+//! one thing the sender does not have: the token table.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,21 +25,24 @@ use alloy::primitives::U256;
 use serde_json::{json, Value};
 
 use crate::budget::{
-    Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, INIT_BUDGET,
-    PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, STARTUP_BUDGET,
-    SWEEP_BUDGET, VERDICT_BUDGET, callee_deadline};
+    callee_deadline, Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET,
+    HISTORY_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET,
+    SENDER_BUDGET, SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET, VERDICT_BUDGET,
+};
 use crate::contacts::ContactsStore;
 use crate::depinit::{self, Next};
 use crate::gate::{self, Gate};
-use crate::details;
-use crate::history::{self, History, TxRecord};
-use crate::send::{self, BroadcastClaim, SendJob, SendLedger, SendStatus};
+use crate::rows;
+use crate::send;
 use crate::settings::{Settings, SettingsStore};
-use crate::sweep::{history_reply, SweepOutcome, GAS_PRICE_DECIMALS, SWEEP_MAX};
-use crate::txbuild::parse_u256_any;
-use crate::verified::{self, unwrap_answer, unwrap_rpc, Answer};
 use crate::tokens::{Token, TokenSort};
+use crate::txbuild::parse_u256_any;
+use crate::verified::{self, unwrap_answer, Answer};
 use crate::{networks, tokens, txbuild, units};
+
+/// This module's own name, as the runtime attests it to the sender and the sender records
+/// it on every row. What `get_history` and the network-switch refusal filter on.
+const OWN_NAME: &str = "eth_wallet_backend";
 
 pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// The three selectable networks. `{ ok, activeChainId, networks: [{ chainId, key,
@@ -52,6 +61,11 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
 
     /// Switch the active network. Refuses any chain outside {1, 11155111, 560048} —
     /// this wallet is Ethereum only. `{ ok, activeChainId }`.
+    ///
+    /// Refused while a send THIS wallet made is awaiting a human: the request names the
+    /// network it was built for, and moving the wallet under it would have the user approve
+    /// for a chain the wallet no longer shows. Another app's pending send does not hold the
+    /// wallet — the sender sends it on its own chain either way.
     ///
     /// Emits `active_chain_changed` when the chain MOVES. Re-selecting the network already
     /// active is a successful no-op and announces nothing.
@@ -84,15 +98,16 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// native row and the verified WETH row — the two that cannot be turned off.
     ///
     /// `query` matches a symbol or name (case-insensitive substring) or an exact address; an
-    /// empty query matches everything. A `limit` of zero or less is no limit. `total` counts
-    /// the matches BEFORE the cut and `shown` after, so a view can say what it is hiding
-    /// rather than presenting a truncated list as the whole answer.
+    /// empty query matches everything. The answer comes in pages: `offset` skips that many
+    /// matches and `limit` caps the rest (zero or less is no limit). `total` counts every
+    /// match, `shown` the rows in this page, and `hasMore` says whether another page follows,
+    /// so a view loads the list as it scrolls instead of presenting a slice as the whole.
     ///
     /// The embedded Uniswap list is overwhelmingly mainnet, so on sepolia and hoodi `listed`
     /// is legitimately 0 and the reply carries the built-in rows alone. That is an ANSWER:
     /// `ok` stays true, and `listError` — present only when the `token_list` call itself
     /// failed — is what tells an empty catalogue from an unread one.
-    fn list_available_tokens(&self, chain_id: i64, query: String, limit: i64) -> String;
+    fn list_available_tokens(&self, chain_id: i64, query: String, offset: i64, limit: i64) -> String;
 
     /// Turn a token on or off for `chain_id`. `{ ok }` or `{ ok: false, error }`.
     ///
@@ -135,21 +150,10 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     ///
     /// Separate from `get_account_labels` because they are different things and a view must
     /// tell them apart: an account's own name identifies THAT account, a wallet's name is
-    /// shared by every account under it. Folding the second into the first would put one
-    /// name on several rows of a picker with nothing to separate them — which is what
-    /// `index` is for.
-    ///
-    /// `index` is the DERIVATION index, straight off `m/44'/60'/0'/0/<index>`, and it is
-    /// stable for the life of the account. A positional counter would not be: it renumbers
-    /// when an account is added or removed, so a name built from one silently comes to mean
-    /// a different account. `get_account_labels` already refuses to invent one for that
-    /// reason, and this must not undo it.
-    ///
-    /// Absent for an account whose wallet has no name, and `index` is absent for one that
-    /// was imported rather than derived — both are ordinary, and an empty map is the normal
-    /// state rather than an error. Keys are whatever `get_provenance` answers — EIP-55 —
-    /// while `get_account_labels` keys are `vault_name` form, so a view reading both still
-    /// has to normalise.
+    /// shared by every account under it. `index` is the DERIVATION index, straight off
+    /// `m/44'/60'/0'/0/<index>`, and it is stable for the life of the account. Absent for an
+    /// account whose wallet has no name, and `index` is absent for one that was imported
+    /// rather than derived — both are ordinary, and an empty map is the normal state.
     fn get_account_wallets(&self) -> String;
 
     /// The address book: `{ ok, contacts: [{ address, name }] }`, named rows first and then
@@ -157,18 +161,12 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// and the order does not move when an unrelated contact is added.
     ///
     /// These are COUNTERPARTIES and live here rather than in the keystore, which names
-    /// accounts it holds keys for. A contact carries no key material and is not a secret, so
-    /// putting it behind a surface whose whole point is guarding one would buy nothing and
-    /// cost every reader a dependency on it.
+    /// accounts it holds keys for. A contact carries no key material and is not a secret.
     fn list_contacts(&self) -> String;
 
     /// Add a contact, or rename one already there — an UPSERT, because a user who saves an
-    /// address they already have meant to name it, and refusing would send them to find a
-    /// row they cannot see from the form they are standing in.
-    ///
-    /// The address is stored EIP-55 and matched case-insensitively, so the same address typed
-    /// in two casings is one contact. `{ ok, contact: { address, name } }`. An empty name is
-    /// allowed: an address worth remembering is worth remembering before its owner has one.
+    /// address they already have meant to name it. The address is stored EIP-55 and matched
+    /// case-insensitively. `{ ok, contact: { address, name } }`. An empty name is allowed.
     fn save_contact(&self, address: String, name: String) -> String;
 
     /// Forget a contact. Removing one that is not there SUCCEEDS — the caller's goal is that
@@ -183,8 +181,7 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// view renders an em-dash and never a zero. A caller must not scale `raw` itself — a JS
     /// number loses digits above 2^53.
     ///
-    /// EVERY offered token gets a row, including one the account holds none of: a token the
-    /// user turned on and then cannot find reads as the wallet having lost it. The array
+    /// EVERY offered token gets a row, including one the account holds none of. The array
     /// arrives ALREADY SORTED by the persisted `tokenSort` — comparing 18-decimal amounts is
     /// exact `U256` work and belongs where it is testable, not in QML.
     ///
@@ -193,14 +190,16 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// balances on `route`, never on the network's mode.
     fn get_balances(&self, address: String) -> String;
 
-    /// Locally recorded transactions for `address`, newest first, scoped to the active
-    /// network. Only transactions this wallet broadcast — there is no indexer.
+    /// Transactions `tx_sender_module` broadcast for `address` on the active network, newest
+    /// first — this wallet's own sends and any other app's calls from the same account. Only
+    /// transactions the sender broadcast: there is no indexer.
     ///
-    /// `{ ok, chainId, address, stillDue, stillDueAnyChain, blockedChains, transactions }`.
-    /// Each row carries its stored fields, `stalled` (pending, past the give-up horizon and
-    /// no longer polled) and `verificationBlocked` (frozen because its chain's proxy is
-    /// blocking). `stillDue` covers the rows in THIS reply — stop your poll timer on it;
-    /// `stillDueAnyChain` covers every chain. `blockedChains` explains a frozen row.
+    /// `{ ok, chainId, address, stillDue, stillDueAnyChain, unstored, unresolved,
+    /// blockedChains, strandedNonces, transactions }`. A row this wallet sent as an ERC-20
+    /// transfer reads back as one: `kind: "erc20"`, `to` the recipient, `value` the token
+    /// amount at the token's decimals, `txTo` the contract. Another app's call keeps
+    /// `kind: "call"` with its `label`, `origin` and `purpose`. Each row carries `stalled`,
+    /// `unresolved` and `verificationBlocked`; `stillDue` covers the rows in THIS reply.
     fn get_history(&self, address: String) -> String;
 
     /// Fee tiers for the active network, from `fee_module`. `{ ok, chainId, baseFeePerGas,
@@ -208,59 +207,39 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// suggestion from the legacy `gasPrice` fallback.
     fn suggest_fees(&self) -> String;
 
-    /// Quote a send without doing anything: resolves the fee through `fee_module`, reads the
-    /// nonce, and refuses up front if the balance cannot cover value plus the fee ceiling.
+    /// Quote a send without doing anything: resolves the token, checks an ERC-20 balance
+    /// here, and has `tx_sender_module` price the fee, check the ether and read the nonce.
     ///
-    /// `request_json`: `{ from, to, amount | amountUnits, token?, tier?, maxFeePerGas?,
-    /// maxPriorityFeePerGas?, gasLimit?, nonce? }`. `amount` is base units, `amountUnits` is
-    /// what the user typed in TOKEN units ("0.1" ETH, not 10^17 wei); exactly one of the two,
-    /// because they mean different things and only one can be what the caller meant. `token`
-    /// is a symbol or contract address, absent for a native send. Any explicit fee field is
-    /// used verbatim — the user overrules the suggestion, never the other way round.
+    /// `request_json`: `{ from, to, amount | amountUnits, token?, tokenAddress?, tier?,
+    /// maxFeePerGas?, maxPriorityFeePerGas?, gasLimit?, nonce? }`. `amount` is base units,
+    /// `amountUnits` is what the user typed in TOKEN units ("0.1" ETH, not 10^17 wei);
+    /// exactly one of the two. `tokenAddress` names the contract exactly and wins over
+    /// `token`, a symbol that is refused when two offered contracts share it. Any explicit
+    /// fee field is used verbatim — the user overrules the suggestion, never the other way.
     ///
     /// Returns `{ ok, chainId, from, to, amount, amountDisplay, amountExact, amountSymbol,
-    /// amountDecimals, nativeSymbol, token?, nonce, gasLimit, maxFeePerGas,
+    /// amountDecimals, nativeSymbol, token?, tokenAddress, nonce, gasLimit, maxFeePerGas,
     /// maxPriorityFeePerGas, maxCostWei(+Display/Exact), feeCeilingWei(+Display/Exact),
     /// feeSource, route, feeRoute }`. `feeCeilingWei` is `maxFeePerGas × gasLimit` — a
-    /// ceiling, never a price, so a view must say "at most". `route` labels the
-    /// balance and nonce reads; `feeRoute` is always `unknown`, because `fee_module` emits no
-    /// label and its figures are never proof-backed. No approval is requested and no nonce
-    /// is reserved, so it is safe to call on every keystroke.
+    /// ceiling, never a price, so a view must say "at most". No approval is requested and no
+    /// nonce is reserved, so it is safe to call on every keystroke.
     fn prepare_send(&self, request_json: String) -> String;
 
     /// Ask a human to approve a send. Takes the same `request_json` as `prepare_send`.
     ///
     /// Returns `{ ok, pending: true, requestId, handle }` and **never a transaction hash** —
-    /// nothing has been signed or broadcast at this point. The human approves in `evm_signer_ui`;
-    /// drive the rest with `send_status`.
-    ///
-    /// `handle` is the KEYSTORE's name for the approval record, not ours. A caller that has
-    /// to point another surface at this specific request needs the keystore's word for it,
-    /// and reconstructing one from `requestId` would make our id format that caller's
-    /// business. Every reply that names a request carries it, so a caller that restarted
-    /// mid-send can recover it from `send_status` rather than losing the send.
+    /// nothing has been signed or broadcast at this point. `tx_sender_module` reserved the
+    /// nonce and registered the approval; the human approves in `evm_signer_ui`; drive the
+    /// rest with `send_status`. `handle` is the KEYSTORE's name for the approval record, for
+    /// pointing a signer at this specific request.
     fn send(&self, request_json: String) -> String;
 
-    /// Advance a pending send and report where it got to. Poll this.
-    ///
-    /// When the human has approved, this collects the signature, broadcasts it exactly once
-    /// and records it in history. `{ ok, requestId, handle, status, hash?, route?, reason? }`
-    /// where `handle` is the keystore's name for the approval record — carried on every reply
-    /// so a caller that restarted mid-send can point a signer at this request again instead
-    /// of stranding it — and `status` is
-    /// `awaitingApproval` | `broadcasting` | `stuck` | `broadcast` | `rejected` |
-    /// `cancelled` | `failed`. The first three are not settled states: `broadcasting` means
-    /// the signed transaction is with a node, and `stuck` that it has not answered — neither
-    /// may be retried or cancelled, and only `stuck` carries a `reason` without failing.
-    /// `route` accompanies a broadcast and is never `verified`: nothing proves a send was
-    /// accepted.
-    ///
-    /// The broadcast is gated on the verified proxy in its own right, because the gate `send`
-    /// passed can close while a human is approving. A reply carrying `blocked: true` — with
-    /// `reason` and the whole `verifiedProxy` verdict beside it — is a send being HELD, not a
-    /// failed one: `ok` is still true, the status is still `awaitingApproval`, the nonce is
-    /// still reserved, and the next poll sends it once the proxy is usable. Keep polling, or
-    /// `cancel_send`.
+    /// Advance a pending send and report where it got to. Poll this — the sender broadcasts
+    /// on this call, exactly once, and records the row before the transaction leaves.
+    /// `{ ok, requestId, handle, status, hash?, hashes, route?, reason?, origin, purpose,
+    /// legs }` where `status` is `awaitingApproval` | `broadcasting` | `stuck` | `broadcast`
+    /// | `rejected` | `cancelled` | `failed`. A reply carrying `blocked: true` is a send being
+    /// HELD by the verified-proxy gate, not a failed one: keep polling, or `cancel_send`.
     fn send_status(&self, request_id: String) -> String;
 
     /// Withdraw a send that has not been approved yet, releasing its reserved nonce.
@@ -268,61 +247,47 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
 
     /// Re-read one recorded transaction's receipt on ITS OWN chain and update the stored
     /// status. `{ ok, hash, chainId, status, route }` — `pending` | `confirmed` | `failed`.
-    /// `route` is never `verified`: a receipt is forwarded on trust, not proved.
     fn refresh_tx_status(&self, address: String, hash_hex: String) -> String;
 
     /// The transaction- and block-level fields a RECEIPT does not carry, for one recorded
-    /// transaction on ITS OWN chain. At most two RPCs, and the second is skipped outright when
-    /// the row already stores what it would answer — so a send recorded by this build costs
-    /// one call, and the method gets cheaper as the data model improves.
-    ///
-    /// `{ ok, hash, chainId, route, fetchedAt, gasPriceUnit, block?: { number, timestamp },
-    /// transaction?: { gasLimit?, maxPriorityFeePerGas(+Display/Exact)? }, blockError?,
-    /// transactionError? }`. The two legs are independent: `ok` is true when EITHER landed, and
-    /// the failed one's own words come back beside the fields it could not fill.
-    ///
-    /// `route` is never `verified` — neither method is proof-backed, so nothing fetched here
-    /// may wear a verified badge. Every reply names the `hash` it is about, refusals included,
-    /// so a view can never render one transaction's detail under another's.
+    /// transaction on ITS OWN chain. `{ ok, hash, chainId, route, fetchedAt, gasPriceUnit,
+    /// block?, transaction?, blockError?, transactionError? }`; `ok` is true when EITHER leg
+    /// landed. Every reply names the `hash` it is about, refusals included.
     fn get_tx_details(&self, address: String, hash_hex: String) -> String;
 
     /// Poll receipts for this address's still-pending transactions, on each row's OWN chain,
     /// and update their stored status. `{ ok, address, polled, changed, blocked,
-    /// blockedChains, stillDue }`. `blocked` counts the rows skipped by their chain's proxy
-    /// verdict and `blockedChains` says which rows, on which chain, and why — a row on a
-    /// non-active chain is explained nowhere else. `stillDue` is false once no row can move
-    /// again, which is when a caller's poll timer should stop.
+    /// blockedChains, stillDue }`. `stillDue` is false once no row can move again, which is
+    /// when a caller's poll timer should stop.
     fn refresh_pending(&self, address: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
 
 pub trait EthWalletBackendModuleEvents {
+    /// A balance may have moved: a transaction this wallet is tracking settled. The address
+    /// is EMPTY when the sender's event named only a hash — re-read what is on screen.
     fn balances_updated(&self, address: String);
     fn active_chain_changed(&self, chain_id: i64);
+    /// Relayed from `tx_sender_module`: a recorded transaction took a hash or settled.
     fn tx_status_changed(&self, hash_hex: String);
-    /// A pending send changed state — approved, rejected, broadcast or failed.
+    /// Relayed from `tx_sender_module`: a pending send changed state.
     fn send_status_changed(&self, request_id: String);
     /// The keystore's accounts moved — the set itself, or the names they are shown under.
     /// Relayed from `keystore_module::accounts_changed`; `count` is carried verbatim and is
     /// ADVISORY, not a change detector: a rename does not move it. Re-read both
     /// `list_accounts` and `get_account_labels` on it.
     fn accounts_changed(&self, count: i64);
-    /// The set of tokens OFFERED on `chain_id` moved. Not `balances_updated`: no amount
-    /// moved and there is no address to name, while every address on that chain now has a row
-    /// more or a row fewer. Chain-scoped, so a wallet on another network can ignore it.
+    /// The set of tokens OFFERED on `chain_id` moved. Chain-scoped, so a wallet on another
+    /// network can ignore it.
     fn tokens_changed(&self, chain_id: i64);
-    /// The balance-row order moved. Device-wide and chainless, unlike `tokens_changed`:
-    /// nothing was offered or withdrawn, and the same rows arrive re-ordered on every network.
+    /// The balance-row order moved. Device-wide and chainless.
     fn token_sort_changed(&self, order: String);
-    /// A recorded row for `address` appeared or changed with no hash for `tx_status_changed`
-    /// to name — a send is written to history BEFORE it is broadcast, and on the arm where the
-    /// node returns no hash it never gets one.
+    /// Relayed from `tx_sender_module`: a recorded row for `address` appeared or changed with
+    /// no hash for `tx_status_changed` to name.
     fn history_changed(&self, address: String);
     /// What `eth_rpc_module` reports for one chain moved — its endpoint, its transport, or its
-    /// verified-proxy mode. Relayed from `eth_rpc_module`, which owns that record: this wallet
-    /// serves it through `list_networks`, and a view one hop out cannot subscribe to eth_rpc
-    /// without taking a token for its whole surface. Re-read `list_networks`.
+    /// verified-proxy mode. Relayed from `eth_rpc_module`, which owns that record.
     fn networks_changed(&self, chain_id: i64);
 }
 
@@ -335,13 +300,11 @@ struct EthWalletBackendImpl {
     /// unexpressible: the state a method works on outlives the lock by construction.
     state: RwLock<Option<Arc<State>>>,
     deps: DepInit,
-    /// Built once with the module and never replaced. `on_context_ready` can be called
-    /// again — a re-init installs a fresh `State` — and a second ledger would drop every
-    /// reservation at once, including those protecting transactions already on chain.
-    sends: Arc<SendLedger>,
     /// Whether the keystore relay is armed. `on_context_ready` can run again, and a second
     /// listener thread would sit on a channel nothing closes for the life of the process.
     watching_keystore: AtomicBool,
+    /// The same, for the three sender relays.
+    watching_sender: AtomicBool,
     feeds: Feeds,
     /// Which chains may be gated without asking eth_rpc at all. Shared with the listener
     /// thread that keeps it honest; see [`crate::gate`] for why only `off` is ever held.
@@ -452,9 +415,6 @@ struct DepInit {
 struct State {
     settings: SettingsStore,
     contacts: ContactsStore,
-    history: History,
-    /// Shared with the module, not owned here: see `EthWalletBackendImpl::sends`.
-    sends: Arc<SendLedger>,
 }
 
 /// Accounts the keystore holds, or -1 when it could not be asked — the keystore's own
@@ -496,6 +456,31 @@ fn expect_ok(raw: &str) -> Result<Value, String> {
     }
 }
 
+/// A reply from `tx_sender_module`, parsed, with its refusal surfaced as this module's own.
+/// A transport error names the sender, so an operator can tell a sender that is down from a
+/// sender that said no.
+fn sender_reply(raw: Result<String, impl std::fmt::Debug>) -> Result<Value, String> {
+    let raw = raw.map_err(|e| format!("tx_sender_module: {e:?}"))?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(v
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("tx_sender_module refused the call")
+            .to_string());
+    }
+    Ok(v)
+}
+
+/// A reply relayed to the view VERBATIM — the sender's refusals included, because they are
+/// already in the `{ ok: false, error, verifiedProxy? }` shape the view renders.
+fn relay(raw: Result<String, impl std::fmt::Debug>) -> String {
+    match raw {
+        Ok(reply) => reply,
+        Err(e) => err(format!("tx_sender_module: {e:?}")),
+    }
+}
+
 /// A send as the caller asked for it, before any chain lookup.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -531,37 +516,67 @@ struct SendRequest {
     nonce: Option<u64>,
 }
 
-/// A priced send: what `prepare_send` reports and what `send` acts on.
-struct Quote {
+/// A resolved send: what the transaction IS, before the sender prices it.
+struct Resolved {
     chain_id: u64,
     from: alloy::primitives::Address,
     to: alloy::primitives::Address,
     amount: U256,
-    token: Option<crate::tokens::Token>,
-    /// What `amount` is denominated in. Carried so every rendering — the reply, the signer
-    /// intent, the history row — reads the same units without re-deriving them.
+    token: Option<Token>,
+    /// What `amount` is denominated in. Carried so every rendering — the reply, the claim,
+    /// the history meta — reads the same units without re-deriving them.
     decimals: u8,
     symbol: String,
     native_symbol: String,
-    nonce: u64,
-    gas_limit: u64,
-    max_fee: U256,
-    max_priority: U256,
-    fee_source: String,
-    /// The weakest route behind the balance and nonce reads. Says nothing about the fee.
-    route: String,
+    /// The route label of this module's own token-balance read, when it made one.
+    token_route: Option<String>,
+}
+
+impl Resolved {
+    fn native(&self) -> bool {
+        self.token.as_ref().map(|t| t.native).unwrap_or(true)
+    }
+
+    fn token_address(&self) -> Option<String> {
+        self.token.as_ref().and_then(|t| t.address.clone())
+    }
+
+    /// The one call this send is: the transfer, as `tx_sender_module` takes it. `meta` is
+    /// what this wallet wants back on the history row — the transfer's own facts, so the row
+    /// can be read as a transfer rather than as a call to a token contract.
+    fn call(&self) -> Result<Value, String> {
+        let meta = match &self.token {
+            Some(t) if !t.native => json!({
+                "kind": "erc20", "token": t.address, "tokenSymbol": t.symbol,
+                "tokenDecimals": t.decimals, "recipient": self.to.to_string(),
+                "amount": self.amount.to_string(),
+            }),
+            _ => json!({ "kind": "native", "recipient": self.to.to_string(),
+                         "amount": self.amount.to_string() }),
+        };
+        Ok(match &self.token {
+            Some(t) if !t.native => {
+                let addr = t.address.as_deref().unwrap_or_default()
+                    .parse::<alloy::primitives::Address>()
+                    .map_err(|e| format!("token has an unparseable address: {e}"))?;
+                json!({ "to": addr.to_string(), "value": "0x0",
+                        "data": format!("0x{}", hex::encode(txbuild::erc20_transfer_calldata(self.to, self.amount))),
+                        "label": format!("Send {}", t.symbol), "meta": meta })
+            }
+            _ => json!({ "to": self.to.to_string(), "value": format!("0x{:x}", self.amount),
+                         "data": "0x", "label": format!("Send {}", self.native_symbol),
+                         "meta": meta }),
+        })
+    }
 }
 
 fn parse_u64_any(s: &str) -> Option<u64> {
     parse_u256_any(s).and_then(|v| u64::try_from(v).ok())
 }
 
-
-
 impl EthWalletBackendImpl {
-    /// The state, with the guard already dropped — the only lock this file takes. It used to
-    /// run a closure under the guard, and six entry points made an IPC call in there. An
-    /// owned handle is not a convention to remember: the guard is gone before this returns.
+    /// The state, with the guard already dropped — the only lock this file takes. An owned
+    /// handle is not a convention to remember: the guard is gone before this returns.
     fn state(&self) -> Result<Arc<State>, String> {
         let guard = self.state.read().map_err(|_| "state lock poisoned".to_string())?;
         guard.clone().ok_or_else(|| NO_CONTEXT.to_string())
@@ -569,10 +584,6 @@ impl EthWalletBackendImpl {
 
     /// The whole settings file. A file read; no lock and no call. An unreadable settings file
     /// is an error, never chain 1: every caller here gates, prices or labels on this answer.
-    ///
-    /// Read whole because the callers that want the active network usually want that
-    /// network's enabled tokens too, and two reads are two snapshots that can straddle a
-    /// change — which is how the balance list ends up naming a token the send path refuses.
     fn settings(&self) -> Result<Settings, String> {
         self.state()?.settings.try_load().map_err(|e| e.to_string())
     }
@@ -647,6 +658,61 @@ impl EthWalletBackendImpl {
                     .map(|e| e.count)
                     .unwrap_or(-1);
                 emit_accounts_changed(count);
+            }
+        });
+    }
+
+    /// Relay the sender's three events as this module's own. A view depends on this module
+    /// alone, and the facts these carry — a send settled, a row took a hash, a row was
+    /// written ahead of its broadcast — now happen one hop further out. Armed once, like the
+    /// keystore relay: three threads on channels nothing closes.
+    ///
+    /// `tx_status_changed` names a hash and no account, and this wallet cannot say from a
+    /// hash whether a balance moved — so it also announces `balances_updated` with an EMPTY
+    /// address, which a view reads as "re-read what you are showing". Every path the sender
+    /// announces on is a settle or a broadcast, and both can move a balance.
+    fn watch_sender(&self) {
+        if self.watching_sender.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Three clients, each subscribing as it is built: a subscription outlives the call
+        // that armed it, and a client dropped before its subscription is armed takes the
+        // subscription with it.
+        let mut a = modules().tx_sender_module;
+        let Ok(sends) = a.on_send_status_changed() else {
+            self.watching_sender.store(false, Ordering::SeqCst);
+            return;
+        };
+        let mut b = modules().tx_sender_module;
+        let Ok(txs) = b.on_tx_status_changed() else {
+            self.watching_sender.store(false, Ordering::SeqCst);
+            return;
+        };
+        let mut c = modules().tx_sender_module;
+        let Ok(rows) = c.on_history_changed() else {
+            self.watching_sender.store(false, Ordering::SeqCst);
+            return;
+        };
+        std::thread::spawn(move || {
+            for ev in sends {
+                if let Some(e) = tx_sender_module::TxSenderModuleClient::decode_send_status_changed(&ev) {
+                    emit_send_status_changed(&e.request_id);
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            for ev in txs {
+                if let Some(e) = tx_sender_module::TxSenderModuleClient::decode_tx_status_changed(&ev) {
+                    emit_tx_status_changed(&e.hash_hex);
+                    emit_balances_updated("");
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            for ev in rows {
+                if let Some(e) = tx_sender_module::TxSenderModuleClient::decode_history_changed(&ev) {
+                    emit_history_changed(&e.address);
+                }
             }
         });
     }
@@ -889,492 +955,10 @@ impl EthWalletBackendImpl {
         })
     }
 
-    /// Poll due receipts for `address`, each on ITS OWN chain, and update the stored rows.
-    /// An `Err` is never a status — the row stays pending and the stamped poll time is the
-    /// backoff. The verdict is read once per distinct chain, not once per record.
-    /// Rows are collected through History's lock, receipts fetched holding nothing, results
-    /// applied back through that lock — which re-reads the file, so the apply is a
-    /// compare-and-set rather than a blind write from this snapshot. Bounded as a whole:
-    /// eleven round trips at worst, and `get_history` is a read a view polls.
-    fn sweep(&self, st: &State, address: &str, b: &Budget) -> SweepOutcome {
-        let now = history::now_secs();
-        let mut out = SweepOutcome::default();
-        let mut failures: HashMap<u64, u32> = HashMap::new();
-        let mut blocking: HashMap<u64, Option<Value>> = HashMap::new();
-
-        for rec in st.history.pending_due(address, now, SWEEP_MAX) {
-            // Two consecutive errors on a chain drop it for the rest of this sweep.
-            if failures.get(&rec.chain_id).copied().unwrap_or(0) >= 2 {
-                continue;
-            }
-            // Bounded, unlike the paths that refuse outright: a row this skips is DISCLOSED in
-            // `blockedChains` and retried on the next poll, so an expired probe costs one
-            // degraded cycle rather than a wallet that shows nothing.
-            let gated = blocking.entry(rec.chain_id).or_insert_with(|| {
-                let v = self.verified_verdict_within(rec.chain_id, b);
-                verified::is_blocking(&v).then_some(v)
-            });
-            if let Some(verdict) = gated {
-                out.blocked
-                    .entry(rec.chain_id)
-                    .or_insert_with(|| (Vec::new(), verdict.clone()))
-                    .0
-                    .push(rec.hash.clone());
-                continue;
-            }
-            let Some(t) = b.take(RPC_BUDGET) else { break };
-            let receipt = modules()
-                .eth_rpc_module
-                .get_transaction_receipt_with_timeout(rec.chain_id as i64, &rec.hash, t)
-                .map_err(|e| format!("{e:?}"))
-                .and_then(|raw| unwrap_rpc(&raw));
-            out.polled += 1;
-            match receipt {
-                Ok(r) => {
-                    failures.insert(rec.chain_id, 0);
-                    // Counted and announced only where the new status reached DISK. A
-                    // subscriber re-reads from there, so a settle claimed over a refused
-                    // write is a row the view renders as pending for ever.
-                    match st.history.apply_receipt(&rec, &r, now) {
-                        Ok(true) => {
-                            out.changed += 1;
-                            out.confirmed |= history::classify_receipt(&r) == "confirmed";
-                            emit_tx_status_changed(&rec.hash);
-                        }
-                        Ok(false) => {}
-                        Err(_) => out.unstored += 1,
-                    }
-                }
-                Err(_) => {
-                    *failures.entry(rec.chain_id).or_insert(0) += 1;
-                    // The backoff stamp alone. A disk that refuses it refuses the status
-                    // too, and the row is simply due again on the next sweep.
-                    let _ = st.history.apply_receipt(&rec, &Value::Null, now);
-                }
-            }
-        }
-        out.still_due = st.history.has_live(address, now);
-        // Announced HERE, not in `refresh_pending`: `get_history` sweeps too, and a row that
-        // confirmed under it moved the balance with nothing saying so. `confirmed` is set
-        // only where `apply_receipt` actually moved a row, so this fires on a transition.
-        if out.confirmed {
-            emit_balances_updated(address);
-        }
-        out
-    }
-
-
-    /// Price, commit, then ask for approval — the commit under the ledger's lock rather than
-    /// around the call. Two concurrent sends both reach `open` and take consecutive nonces;
-    /// what the old shape got wrong was the other direction, where five `?`s could return
-    /// without releasing the nonce and the job did not exist until after the approval.
-    fn request_send(
-        &self,
-        st: &State,
-        req: &SendRequest,
-        chain_id: u64,
-        b: &Budget,
-    ) -> Result<(String, String), String> {
-        let mut q = self.quote(req, chain_id, b)?;
-
-        // `latest` does not count a broadcast-but-unmined transaction and the verified path
-        // refuses `pending`, so this reservation is all that stops a clash. The guard owns it
-        // from here: every path out short of `commit` hands it back.
-        let guard = st.sends.open(chain_id, &q.from.to_string(), q.nonce, req.nonce, || {
-            st.settings.try_load().map(|s| s.active_chain_id).map_err(|e| e.to_string())
-        })?;
-        q.nonce = guard.claim().nonce;
-
-        let tx = self.unsigned_tx(&q)?;
-        let tx_input = tx.get("data").and_then(Value::as_str).map(str::to_string);
-        // What a human reads at the moment of approval: exact to the last digit and in the
-        // token's own units. Nobody can check a figure denominated in wei.
-        let amount = units::format_exact(&q.amount.to_string(), q.decimals)
-            .unwrap_or_else(|| q.amount.to_string());
-        let intent = json!({
-            "address": q.from.to_string(),
-            "purpose": crate::send::purpose(&amount, &q.symbol, &q.from.to_string(),
-                                            &q.to.to_string()),
-            "legs": [{ "kind": "tx", "chain_id": chain_id, "tx": tx }],
-        });
-
-        // Bounded: this registers the request, it does not wait for the human. A late deadline
-        // costs a stray prompt whose signature is never fetched — no money moves.
-        let t = b.take(INIT_BUDGET).ok_or("no time left to request approval")?;
-        let raw = modules()
-            .keystore_module
-            .request_approval_with_timeout(&intent.to_string(), t)
-            .map_err(|e| format!("{e:?}"))?;
-        let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        if v.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(v
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("the keystore refused the approval request")
-                .to_string());
-        }
-        let handle = v.get("handle").and_then(Value::as_str).unwrap_or_default().to_string();
-        let receipt = v.get("receipt").and_then(Value::as_str).unwrap_or_default().to_string();
-
-        let job = SendJob {
-            request_id: format!("snd_{handle}"),
-            handle,
-            receipt,
-            chain_id,
-            from: q.from.to_string(),
-            to: q.to.to_string(),
-            value: q.amount.to_string(),
-            kind: if q.token.as_ref().map(|t| t.native).unwrap_or(true) {
-                "native".into()
-            } else {
-                "erc20".into()
-            },
-            token: q.token.as_ref().and_then(|t| t.address.clone()),
-            nonce: q.nonce,
-            gas_limit: q.gas_limit,
-            max_fee: q.max_fee.to_string(),
-            max_priority: q.max_priority.to_string(),
-            token_symbol: q.token.as_ref().map(|t| t.symbol.clone()),
-            token_decimals: q.token.as_ref().map(|t| t.decimals),
-            tx_input,
-            status: SendStatus::AwaitingApproval,
-            broadcast: None,
-            // Set from the claim by `commit`; a caller does not get to name it.
-            replaces: None,
-        };
-        let request_id = job.request_id.clone();
-        let handle = job.handle.clone();
-        guard.commit(job);
-        Ok((request_id, handle))
-    }
-
-    /// Advance one pending send. Five outbound calls, none under a lock, and they need no
-    /// consistent view of each other: the claim belongs immediately before the one call that
-    /// moves money. Taken before `fetch_result` instead, as it used to be, one transient
-    /// failure left the job claimed and reporting `awaitingApproval` for ever.
-    ///
-    /// The claim hands back a ticket, and from then on nothing else may settle this job. A
-    /// concurrent dispatch that read the job before the claim bounces off it rather than
-    /// failing a transaction already on its way to a node.
-    fn advance_send(&self, request_id: &str) -> Result<Value, String> {
-        let st = self.state()?;
-        let b = Budget::new(SEND_BUDGET);
-        let now = history::now_secs();
-        let job =
-            st.sends.get(request_id).ok_or_else(|| format!("no send with id '{request_id}'"))?;
-        if job.status.is_terminal() {
-            return Ok(Self::job_reply(&job, now));
-        }
-        // Another dispatch owns the broadcast. Going on would ask the keystore about a request
-        // it has already answered and read the absence of a signature as a failure — settling
-        // a transaction that is on its way, and handing its nonce to the next send.
-        if job.broadcast_started() {
-            return Ok(Self::job_reply(&job, now));
-        }
-
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the approval")?;
-        let raw = modules()
-            .keystore_module
-            .approval_status_with_timeout(&job.handle, &job.receipt, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        if v.get("ok").and_then(Value::as_bool) != Some(true) {
-            let reason = v
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("the keystore lost this request")
-                .to_string();
-            return self.settle(&st, request_id, SendStatus::Failed { reason });
-        }
-        match v.get("state").and_then(Value::as_str).unwrap_or("") {
-            // Re-read: a cancel may have landed while the keystore was answering.
-            "offered" | "rendered" => {
-                return Ok(Self::job_reply(&st.sends.get(request_id).unwrap_or(job), now))
-            }
-            "settled" => {}
-            other => return Err(format!("unknown approval state '{other}'")),
-        }
-        match v.get("reason").and_then(Value::as_str).unwrap_or("approved") {
-            "approved" => {}
-            "rejected" => return self.settle(&st, request_id, SendStatus::Rejected),
-            r => {
-                return self.settle(&st, request_id, SendStatus::Failed { reason: r.to_string() })
-            }
-        }
-
-        // Approved. Fetching the signature is a read and is safe to repeat, so it happens
-        // BEFORE the claim: a failure here leaves the send exactly as it was, and the next
-        // poll tries again.
-        let t = b.take(RPC_BUDGET).ok_or("no time left to collect the signature")?;
-        let fetched = modules()
-            .keystore_module
-            .fetch_result_with_timeout(&job.handle, &job.receipt, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let fv: Value = serde_json::from_str(&fetched).map_err(|e| e.to_string())?;
-        // `signed`, not `results` — the documented key, and the one the keystore emits.
-        let raw_tx = fv
-            .get("signed")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let Some(raw_tx) = raw_tx else {
-            let reason = "the approval carried no signature".to_string();
-            return self.settle(&st, request_id, SendStatus::Failed { reason });
-        };
-
-        // The gate again, as late as a check can be and still be in front of the money: the
-        // one `send` passed can close while a human sits in the signer. A refusal touches
-        // nothing — no claim, no record, no settle — so the job keeps its nonce and the next
-        // poll sends it once the proxy is usable. A closed gate is not a failed send.
-        if let Err(v) = self.verified_gate_within(job.chain_id, &b) {
-            // Re-read: a cancel may have landed while the probe was out.
-            let now_job = st.sends.get(request_id).unwrap_or(job);
-            return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));
-        }
-
-        // Claim, record, then broadcast. The ticket is the only key to this job from here on,
-        // and it is the whole answer to a broadcast that never returns: the job cannot be
-        // settled behind our back, and after STUCK_AFTER_SECS it reports `stuck` rather than
-        // wedging. The claim burns the nonce IN MEMORY, which no restart can read.
-        let ticket = match st.sends.claim_broadcast(request_id, now) {
-            BroadcastClaim::Claimed(t) => t,
-            // Another poll is inside the broadcast right now; it will settle the job.
-            BroadcastClaim::InFlight(j) | BroadcastClaim::Settled(j) => {
-                return Ok(Self::job_reply(&j, now))
-            }
-            BroadcastClaim::Unknown => {
-                return Err(format!("no send with id '{request_id}'"))
-            }
-        };
-
-        // WRITE AHEAD. The record used to go down after the broadcast returned, and on a
-        // failed broadcast not at all, so a crash inside the RPC lost a number that had
-        // already left. The intent goes first; the outcome only completes it, and a row that
-        // cannot be written means no send — `broadcast` takes the proof.
-        let recorded = match st.history.record_intent(request_id, Self::intent_row(&job)) {
-            Ok(r) => r,
-            Err(reason) => return self.settle_owned(&st, &ticket, SendStatus::Failed { reason }),
-        };
-        // A row exists from here on and has no hash yet, so `tx_status_changed` cannot name
-        // it. A history view learns of it now rather than only if the broadcast answers.
-        emit_history_changed(&job.from);
-
-        let (hash, route) = match self.broadcast(&recorded, job.chain_id, &raw_tx) {
-            Ok(a) => match a.value.as_str().map(str::to_string).filter(|h| !h.is_empty()) {
-                Some(h) => (h, verified::weakest_route(&[a.route.as_deref()])),
-                None => {
-                    // The transaction may well be on-chain; we simply cannot follow it. The
-                    // nonce stays held for exactly that reason — see `settle_locked` — and
-                    // the row stays `unknown` on disk, so the next process holds it too.
-                    let reason =
-                        "the node accepted the transaction but returned no hash".to_string();
-                    if st.history.leave_unknown(&recorded, &reason) {
-                        emit_history_changed(&job.from);
-                    }
-                    return self.settle_owned(&st, &ticket, SendStatus::Failed { reason });
-                }
-            },
-            Err(reason) => {
-                if st.history.leave_unknown(&recorded, &reason) {
-                    emit_history_changed(&job.from);
-                }
-                return self.settle_owned(&st, &ticket, SendStatus::Failed { reason });
-            }
-        };
-
-        // The intent becomes an ordinary pollable row. Nothing new is recorded here: the
-        // evidence has been on disk since before the transaction left.
-        let took_hash = st.history.resolve_broadcast(&recorded, &hash, history::now_secs());
-        let _ = modules().keystore_module.ack_result_with_timeout(
-            &job.handle,
-            &job.receipt,
-            RPC_BUDGET,
-        );
-        // Only if the row actually took it: otherwise this names a hash history does not hold.
-        if took_hash {
-            emit_tx_status_changed(&hash);
-        }
-        self.settle_owned(&st, &ticket, SendStatus::Broadcast { hash, route })
-    }
-
-    /// The one call that moves money, and the only site allowed to make it. It takes
-    /// `Recorded`, which only `History::record_intent` produces, so broadcasting before the
-    /// record is written is not something this file can express — the ordering is a type,
-    /// not a rule each new path has to remember.
-    ///
-    /// Deliberately UNBOUNDED, alone among the four: a deadline here does not stop the
-    /// transaction, it only stops us learning its hash.
-    fn broadcast(
-        &self,
-        _recorded: &history::Recorded,
-        chain_id: u64,
-        raw_tx: &str,
-    ) -> Result<Answer, String> {
-        modules()
-            .eth_rpc_module
-            .send_raw_transaction(chain_id as i64, raw_tx)
-            .map_err(|e| format!("{e:?}"))
-            .and_then(|r| unwrap_answer(&r))
-    }
-
-    /// The durable record of one send, as it goes down BEFORE the broadcast. Every field but
-    /// the hash is known from the quote the user approved; the hash is what the broadcast is
-    /// for, and `record_intent` supplies the status.
-    fn intent_row(j: &SendJob) -> TxRecord {
-        TxRecord {
-            chain_id: j.chain_id,
-            from: j.from.clone(),
-            to: j.to.clone(),
-            value: j.value.clone(),
-            kind: j.kind.clone(),
-            token: j.token.clone(),
-            timestamp: history::now_secs(),
-            nonce: Some(j.nonce),
-            gas_limit: Some(j.gas_limit),
-            max_fee_per_gas: Some(j.max_fee.clone()),
-            max_priority_fee_per_gas: Some(j.max_priority.clone()),
-            fee_ceiling_wei: history::fee_ceiling_wei(&j.max_fee, j.gas_limit),
-            token_symbol: j.token_symbol.clone(),
-            token_decimals: j.token_decimals,
-            tx_input: j.tx_input.clone(),
-            // The receipt has not landed yet; the poll fills the rest.
-            ..Default::default()
-        }
-    }
-
-    /// Re-read one row's receipt on its own chain and settle it. Bounded AS A WHOLE, gate
-    /// included: this is a button, and an unbounded probe in front of the receipt read is up
-    /// to twenty seconds of frozen wallet. A probe the budget cuts short still refuses — the
-    /// verdict it returns carries its own reason, so a timeout is not reported as a freeze.
-    fn refresh_one(&self, address: &str, hash_hex: &str) -> Result<Value, String> {
-        let st = self.state()?;
-        // The record's own chain, not the active one: switching networks must not send every
-        // refresh to the wrong node and re-affirm `pending` forever.
-        let rec = st
-            .history
-            .find(address, hash_hex)
-            .ok_or_else(|| format!("no recorded transaction with hash {hash_hex}"))?;
-        let b = Budget::new(REFRESH_BUDGET);
-        if let Err(v) = self.verified_gate_within(rec.chain_id, &b) {
-            return Ok(blocked(&v));
-        }
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the receipt")?;
-        let raw = modules()
-            .eth_rpc_module
-            .get_transaction_receipt_with_timeout(rec.chain_id as i64, &rec.hash, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let Answer { value: receipt, route } = unwrap_answer(&raw)?;
-        let status = history::classify_receipt(&receipt);
-        // Exactly one of two concurrent refreshes of the same row sees `true` here — the
-        // apply compares against what is on disk — so the event is announced once.
-        if st.history.apply_receipt(&rec, &receipt, history::now_secs())? {
-            emit_tx_status_changed(&rec.hash);
-            if status == "confirmed" {
-                emit_balances_updated(&rec.from);
-            }
-        }
-        Ok(json!({ "ok": true, "hash": rec.hash, "chainId": rec.chain_id, "status": status,
-                   "route": verified::weakest_route(&[route.as_deref()]) }))
-    }
-
-    /// The mined-at time. `eth_getBlockByNumber` has no typed helper on `eth_rpc`, so it goes
-    /// through `raw_rpc`; `false` asks for the header rather than every transaction in it.
-    fn block_header(
-        &self,
-        chain_id: u64,
-        number: u64,
-        b: &Budget,
-    ) -> Result<(Value, Option<String>), String> {
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the block")?;
-        let params = format!("[\"0x{number:x}\", false]");
-        let raw = modules()
-            .eth_rpc_module
-            .raw_rpc_with_timeout(chain_id as i64, "eth_getBlockByNumber", &params, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let Answer { value, route } = unwrap_answer(&raw)?;
-        let ts = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_u64_any)
-            .ok_or("the node returned no timestamp for this block")?;
-        Ok((json!({ "number": number, "timestamp": ts }), route))
-    }
-
-    /// `gas` (the LIMIT the transaction carried), `maxPriorityFeePerGas` and `input`, none of
-    /// which a receipt reports. An absent field stays absent: a legacy transaction has no
-    /// priority fee, and a zero here would be a figure the chain never carried.
-    fn tx_fields(
-        &self,
-        chain_id: u64,
-        hash: &str,
-        b: &Budget,
-    ) -> Result<(Value, Option<String>), String> {
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the transaction")?;
-        let raw = modules()
-            .eth_rpc_module
-            .get_transaction_by_hash_with_timeout(chain_id as i64, hash, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let Answer { value, route } = unwrap_answer(&raw)?;
-        if value.is_null() {
-            return Err("the node does not have this transaction".to_string());
-        }
-        let mut out = json!({});
-        if let Some(g) = value.get("gas").and_then(Value::as_str).and_then(parse_u64_any) {
-            out["gasLimit"] = json!(g);
-        }
-        if let Some(p) =
-            value.get("maxPriorityFeePerGas").and_then(Value::as_str).and_then(parse_u256_any)
-        {
-            let tip = p.to_string();
-            out["maxPriorityFeePerGas"] = json!(tip);
-            units::decorate(&mut out, "maxPriorityFeePerGas", &tip, Some(GAS_PRICE_DECIMALS));
-        }
-        if let Some(d) = value.get("input").and_then(Value::as_str) {
-            out["input"] = json!(d);
-        }
-        Ok((out, route))
-    }
-
-    /// Fetch what a receipt never carried, for ONE row, on its own chain. Bounded AS A WHOLE,
-    /// gate included, for the reason `refresh_one` gives: the budget taken after the gate
-    /// bounded the two legs and not the call a user actually waits on.
-    ///
-    /// The two legs are independent, so one failing is reported BESIDE the fields it could not
-    /// fill rather than failing the other — a timed-out block read must not withhold a priority
-    /// fee that landed.
-    fn tx_details(&self, address: &str, hash_hex: &str) -> Result<Value, String> {
-        let st = self.state()?;
-        let rec = st
-            .history
-            .find(address, hash_hex)
-            .ok_or_else(|| format!("no recorded transaction with hash {hash_hex}"))?;
-        let b = Budget::new(DETAILS_BUDGET);
-        // The hash goes onto the refusal too: the view renders this beside one transaction's
-        // own rows, so every reply has to say which transaction it is about.
-        if let Err(v) = self.verified_gate_within(rec.chain_id, &b) {
-            let mut r = blocked(&v);
-            r["hash"] = json!(rec.hash);
-            r["chainId"] = json!(rec.chain_id);
-            return Ok(r);
-        }
-        let Some(number) = rec.block_number else {
-            return Err("this transaction has no block yet, so there is nothing to read".into());
-        };
-
-        // The second leg is SKIPPED, not failed, when the row already stores every answer it
-        // would bring: that is what makes this one call for a send recorded by this build.
-        let needed = details::transaction_leg_needed(&rec);
-        // The block first: it is the gap a user comparing with an explorer notices, so it gets
-        // the allowance ahead of a leg that may not even be made.
-        let block = self.block_header(rec.chain_id, number, &b);
-        let tx = needed.then(|| self.tx_fields(rec.chain_id, &rec.hash, &b));
-        Ok(details::details_reply(&rec.hash, rec.chain_id, history::now_secs(), block, tx))
-    }
-
-    /// Price a send: fee from `fee_module`, nonce from the chain, affordability from the
-    /// balance. Pure of side effects — reserves nothing and requests no approval.
-    fn quote(&self, req: &SendRequest, chain_id: u64, b: &Budget) -> Result<Quote, String> {
+    /// Resolve a send: the token, the amount in its units, and — for an ERC-20 — whether the
+    /// account holds it. Pure of side effects. What the sender cannot know is decided here;
+    /// what it can (the fee, the ether, the nonce) is left to it.
+    fn resolve(&self, req: &SendRequest, chain_id: u64, b: &Budget) -> Result<Resolved, String> {
         let from = req.from.trim().parse::<alloy::primitives::Address>()
             .map_err(|e| format!("invalid `from` address: {e}"))?;
         let to = req.to.trim().parse::<alloy::primitives::Address>()
@@ -1397,7 +981,6 @@ impl EthWalletBackendImpl {
             }
             (None, None) => None,
         };
-        let native = token.as_ref().map(|t| t.native).unwrap_or(true);
         let native_symbol =
             networks::by_chain_id(chain_id).map(|n| n.native_symbol).unwrap_or("ETH").to_string();
         let decimals = token.as_ref().map(|t| t.decimals).unwrap_or(18);
@@ -1410,66 +993,9 @@ impl EthWalletBackendImpl {
             &symbol,
         )?;
 
-        // The transaction the fee estimate must price is the real one, so an ERC-20 send is
-        // estimated against its calldata rather than a bare transfer's 21 000.
-        let tx_shape = match &token {
-            Some(t) if !t.native => {
-                let addr = t.address.as_deref().unwrap_or_default()
-                    .parse::<alloy::primitives::Address>()
-                    .map_err(|e| format!("token has an unparseable address: {e}"))?;
-                json!({ "from": from.to_string(), "to": addr.to_string(),
-                        "data": format!("0x{}", hex::encode(txbuild::erc20_transfer_calldata(to, amount))) })
-            }
-            _ => json!({ "from": from.to_string(), "to": to.to_string(),
-                         "value": format!("0x{amount:x}") }),
-        };
-
-        let mut fee_req = json!({ "tx": tx_shape });
-        if let Some(t) = &req.tier { fee_req["tier"] = json!(t); }
-        if let Some(v) = &req.max_fee_per_gas { fee_req["maxFeePerGas"] = json!(v); }
-        if let Some(v) = &req.max_priority_fee_per_gas { fee_req["maxPriorityFeePerGas"] = json!(v); }
-        if let Some(v) = &req.gas_limit { fee_req["gasLimit"] = json!(v); }
-
-        let t = b.take(RPC_BUDGET).ok_or("no time left to price the fee")?;
-        let raw = modules()
-            .fee_module
-            .estimate_with_timeout(chain_id as i64, &fee_req.to_string(), t)
-            .map_err(|e| format!("{e:?}"))?;
-        let fee: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        if fee.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(fee.get("error").and_then(Value::as_str)
-                .unwrap_or("fee estimation failed").to_string());
-        }
-        // fee_module emits amounts as decimal strings but `gasLimit` as a JSON number, so
-        // every numeric field is read through both forms rather than assuming one.
-        let pick = |k: &str| -> Result<U256, String> {
-            fee.get(k)
-                .and_then(|v| match v {
-                    Value::String(t) => parse_u256_any(t),
-                    Value::Number(n) => n.as_u64().map(U256::from),
-                    _ => None,
-                })
-                .ok_or_else(|| format!("fee_module returned no usable `{k}`"))
-        };
-        let max_fee = pick("maxFeePerGas")?;
-        let max_priority = pick("maxPriorityFeePerGas")?;
-        if max_priority > max_fee {
-            return Err("maxPriorityFeePerGas cannot exceed maxFeePerGas".into());
-        }
-        let gas_limit = u64::try_from(pick("gasLimit").map_err(|_| {
-            "fee_module returned no usable `gasLimit` — refusing rather than guessing one"
-        })?)
-        .map_err(|_| "fee_module returned an implausible `gasLimit`")?;
-        let fee_source =
-            fee.get("source").and_then(Value::as_str).unwrap_or("unknown").to_string();
-
-        let (balance, balance_route) = self.native_balance(chain_id, &from.to_string(), b)?;
-        send::affordable(balance, amount, gas_limit, max_fee, native, &native_symbol)?;
-
-        // `affordable` only ever charges the fee against ether, so an ERC-20 send is checked
-        // against the token itself here. Unreachable while the Send screen was hardcoded to
-        // native; the moment a token can be chosen, its absence means an over-large transfer
-        // is approved, broadcast, and reverts on chain having burned the gas.
+        // The sender charges the fee against ether. An ERC-20 send is checked against the
+        // token itself here: without it an over-large transfer is approved, broadcast,
+        // reverts on chain and burns the gas.
         let mut token_route = None;
         if let Some(t) = token.as_ref().filter(|t| !t.native) {
             let addr = t.address.as_deref().unwrap_or_default()
@@ -1480,36 +1006,7 @@ impl EthWalletBackendImpl {
             send::token_affordable(held, amount, &t.symbol, t.decimals)?;
         }
 
-        // A caller-supplied nonce came from nothing we can vouch for, so it unlabels the quote.
-        let (nonce, nonce_route) = match req.nonce {
-            Some(n) => (n, None),
-            None => self.chain_nonce(chain_id, &from.to_string(), b)?,
-        };
-        let route = verified::weakest_route(&[
-            balance_route.as_deref(),
-            token_route.as_deref(),
-            nonce_route.as_deref(),
-        ]);
-
-        Ok(Quote { chain_id, from, to, amount, token, decimals, symbol, native_symbol, nonce,
-                   gas_limit, max_fee, max_priority, fee_source, route })
-    }
-
-    fn native_balance(
-        &self,
-        chain_id: u64,
-        address: &str,
-        b: &Budget,
-    ) -> Result<(U256, Option<String>), String> {
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the balance")?;
-        let raw = modules()
-            .eth_rpc_module
-            .get_balance_with_timeout(chain_id as i64, address, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let a = unwrap_answer(&raw)?;
-        let v = a.value.as_str().and_then(parse_u256_any)
-            .ok_or_else(|| "could not read the native balance".to_string())?;
-        Ok((v, a.route))
+        Ok(Resolved { chain_id, from, to, amount, token, decimals, symbol, native_symbol, token_route })
     }
 
     fn token_balance(
@@ -1537,93 +1034,89 @@ impl EthWalletBackendImpl {
         Ok((v, a.route))
     }
 
-    fn chain_nonce(
-        &self,
-        chain_id: u64,
-        address: &str,
-        b: &Budget,
-    ) -> Result<(u64, Option<String>), String> {
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the nonce")?;
-        let raw = modules()
-            .eth_rpc_module
-            .get_transaction_count_with_timeout(chain_id as i64, address, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let a = unwrap_answer(&raw)?;
-        let v = a.value.as_str().and_then(parse_u64_any)
-            .ok_or_else(|| "could not read the account nonce".to_string())?;
-        Ok((v, a.route))
+    /// The request `tx_sender_module` takes for a resolved send: one call, the fee controls
+    /// as the caller gave them, and the sender's own allowance cut to what is left here.
+    fn sender_request(r: &Resolved, req: &SendRequest, t: std::time::Duration) -> Result<Value, String> {
+        let mut v = json!({
+            "chainId": r.chain_id,
+            "from": r.from.to_string(),
+            "calls": [r.call()?],
+        });
+        if let Some(x) = &req.tier { v["tier"] = json!(x); }
+        if let Some(x) = &req.max_fee_per_gas { v["maxFeePerGas"] = json!(x); }
+        if let Some(x) = &req.max_priority_fee_per_gas { v["maxPriorityFeePerGas"] = json!(x); }
+        if let Some(x) = &req.gas_limit { v["calls"][0]["gasLimit"] = json!(x); }
+        if let Some(n) = req.nonce { v["nonce"] = json!(n); }
+        if let Some(d) = callee_deadline(t) { v["deadlineMs"] = json!(d); }
+        Ok(v)
     }
 
-    /// The unsigned transaction for a quote, in the shape `keystore_module` deserializes.
-    fn unsigned_tx(&self, q: &Quote) -> Result<Value, String> {
-        let fee = txbuild::Fee::Eip1559 {
-            max_fee_per_gas: q.max_fee,
-            max_priority_fee_per_gas: q.max_priority,
-        };
-        Ok(match &q.token {
-            Some(t) if !t.native => {
-                let addr = t.address.as_deref().unwrap_or_default()
-                    .parse::<alloy::primitives::Address>()
-                    .map_err(|e| format!("token has an unparseable address: {e}"))?;
-                txbuild::unsigned_erc20_tx(addr, q.to, q.amount, q.nonce, q.gas_limit, &fee)
-            }
-            _ => txbuild::unsigned_native_tx(q.to, q.amount, q.nonce, q.gas_limit, &fee),
-        })
+    /// Have the sender price the resolved send. Its reply carries the nonce, the gas limit,
+    /// the fee and the ether check; this module's reply wraps them around the token.
+    fn sender_prepare(&self, r: &Resolved, req: &SendRequest, b: &Budget) -> Result<Value, String> {
+        let t = b.take(SENDER_BUDGET).ok_or("no time left to price the send")?;
+        let request = Self::sender_request(r, req, t)?;
+        sender_reply(modules().tx_sender_module.prepare_with_timeout(&request.to_string(), t))
     }
 
-    /// `status` is what the send is DOING, not only what it has settled into: a claimed
-    /// broadcast reads `broadcasting`, and one that has not answered reads `stuck`.
-    fn job_reply(j: &SendJob, now: u64) -> Value {
-        let status = j.reported_status(now);
-        let mut v = json!({ "ok": true, "requestId": j.request_id, "handle": j.handle,
-                            "status": status });
-        match &j.status {
-            SendStatus::Broadcast { hash, route } => {
-                v["hash"] = json!(hash);
-                v["route"] = json!(route);
+    /// The `prepare_send` reply: the resolved transfer, plus what the sender priced it at.
+    fn quote_reply(r: &Resolved, priced: &Value) -> Value {
+        let mut v = json!({
+            "ok": true, "chainId": r.chain_id,
+            "from": r.from.to_string(), "to": r.to.to_string(),
+            "amount": r.amount.to_string(),
+            "amountSymbol": r.symbol,
+            "amountDecimals": r.decimals,
+            "nativeSymbol": r.native_symbol,
+            "token": r.token.as_ref().map(|t| t.symbol.clone()),
+            // WHICH contract the send will call, resolved. A symbol cannot say it: two tokens
+            // can share one, so a confirmation step showing only the symbol cannot reveal
+            // that the wrong asset is about to move. Null for a native send.
+            "tokenAddress": r.token_address(),
+            "nonce": priced.get("nonce").cloned().unwrap_or(Value::Null),
+            "gasLimit": priced.get("gasLimit").cloned().unwrap_or(Value::Null),
+            "maxFeePerGas": priced.get("maxFeePerGas").cloned().unwrap_or(Value::Null),
+            "maxPriorityFeePerGas": priced.get("maxPriorityFeePerGas").cloned().unwrap_or(Value::Null),
+            "feeSource": priced.get("feeSource").cloned().unwrap_or(json!("unknown")),
+            // `route` covers the sender's balance and nonce reads and this module's token
+            // read; the weakest of them. The fee is fee_module's, which emits no label, so it
+            // is never proof-backed whatever `route` says.
+            "route": verified::weakest_route(&[
+                priced.get("route").and_then(Value::as_str),
+                r.token_route.as_deref(),
+            ]),
+            "feeRoute": verified::UNKNOWN_ROUTE,
+        });
+        // The ceiling and the worst case, as the sender computed them, in the sender's own
+        // decoration: `maxFeePerGas × gasLimit` is a ceiling, never a price.
+        for key in ["maxCostWei", "feeCeilingWei"] {
+            for suffix in ["", "Display", "Exact"] {
+                let k = format!("{key}{suffix}");
+                if let Some(x) = priced.get(&k) {
+                    v[k] = x.clone();
+                }
             }
-            SendStatus::Failed { reason } => v["reason"] = json!(reason),
-            _ => {}
         }
-        if status == "stuck" {
-            v["reason"] = json!(
-                "the broadcast has not answered; this send may already be on chain and must \
-                 not be sent again"
-            );
-        }
+        units::decorate(&mut v, "amount", &r.amount.to_string(), Some(r.decimals));
         v
     }
 
-    /// Settle a job and announce it. The ledger applies the status to the LIVE job and gives
-    /// back whatever it now holds, so a status another dispatch settled first is reported
-    /// rather than overwritten from this caller's stale copy — and announced only when THIS
-    /// call is what moved it, because the reply is a truthful answer to a settle that lost.
-    fn settle(&self, st: &State, request_id: &str, status: SendStatus) -> Result<Value, String> {
-        let s = st
-            .sends
-            .settle(request_id, status)
-            .ok_or_else(|| format!("no send with id '{request_id}'"))?;
-        if s.changed {
-            emit_send_status_changed(&s.job.request_id);
-        }
-        Ok(Self::job_reply(&s.job, history::now_secs()))
-    }
-
-    /// The broadcast owner's door — the only settle that lands once a broadcast is claimed.
-    fn settle_owned(
-        &self,
-        st: &State,
-        t: &send::BroadcastTicket,
-        status: SendStatus,
-    ) -> Result<Value, String> {
-        let s = st
-            .sends
-            .settle_owned(t, status)
-            .ok_or_else(|| "the send vanished while it was being broadcast".to_string())?;
-        if s.changed {
-            emit_send_status_changed(&s.job.request_id);
-        }
-        Ok(Self::job_reply(&s.job, history::now_secs()))
+    /// The sends THIS wallet made that a human has not answered yet, or an empty list when
+    /// the sender cannot be asked — a sender that is down holds nothing.
+    fn own_sends_in_flight(&self, b: &Budget) -> Vec<Value> {
+        let Some(t) = b.take(RPC_BUDGET) else { return Vec::new() };
+        let Ok(v) = sender_reply(modules().tx_sender_module.live_sends_with_timeout(t)) else {
+            return Vec::new();
+        };
+        v.get("sends")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter(|s| s.get("origin").and_then(Value::as_str) == Some(OWN_NAME))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The endpoint eth_rpc holds for `chain_id`, empty when it has none or when `b` had no
@@ -1665,18 +1158,9 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         let dir = PathBuf::from(&ctx.instance_persistence_path);
         let settings = SettingsStore::with_path(dir.join("settings.json"));
         let contacts = ContactsStore::with_path(dir.join("contacts.json"));
-        let history = History::new(dir);
-
-        // R-1. The ledger is in-memory and `latest` does not count a broadcast that has not
-        // mined, so a restart would hand the next send a number an unsettled transaction is
-        // already using. Burn them before any send can reach `state()`.
-        let seeded = self.sends.seed_spent(history.unsettled_nonces());
-        if seeded > 0 {
-            eprintln!("eth_wallet_backend: {seeded} unsettled nonces carried over from disk");
-        }
 
         if let Ok(mut g) = self.state.write() {
-            *g = Some(Arc::new(State { settings, contacts, history, sends: self.sends.clone() }));
+            *g = Some(Arc::new(State { settings, contacts }));
         }
         // eth_rpc first: every balance, fee and send goes through it while token_list only
         // decorates. Neither may fail startup, and neither writes over an existing config.
@@ -1688,6 +1172,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         // After the state above exists: the relay's first act is a `list_accounts`, and a
         // consumer must never be told to re-read before this module can answer.
         self.watch_keystore();
+        self.watch_sender();
         // Arm before the first gated read rather than on it: the gate cache may only trust an
         // answer read after its feed existed, so arming late costs a live read per chain.
         self.watch_gate();
@@ -1730,14 +1215,22 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         if chain_id < 0 {
             return err(format!("chain {chain_id} is not a valid chain id"));
         }
-        // The refusal and the write are one critical section inside the ledger. A send
-        // opening its claim between the two would straddle the switch: approved for a
-        // network the wallet had already left, and invisible to the check that forbids it.
-        match self.state().and_then(|st| {
-            st.sends.switch(history::now_secs(), || {
-                st.settings.set_active_chain(chain_id as u64).map_err(|e| e.to_string())
-            })
-        }) {
+        let st = match self.state() {
+            Ok(st) => st,
+            Err(e) => return err(e),
+        };
+        // A send this wallet made and a human has not answered names the network it was
+        // built for; moving the wallet under it would have them approve for a chain the
+        // wallet no longer shows. Only this wallet's own sends hold it — another app's is
+        // sent on its own chain either way.
+        let b = Budget::new(READ_BUDGET);
+        if let Some(live) = self.own_sends_in_flight(&b).first() {
+            let on = live.get("chainId").and_then(Value::as_u64).unwrap_or(0);
+            let name = networks::by_chain_id(on).map(|n| n.name.to_string()).unwrap_or_else(|| on.to_string());
+            let id = live.get("requestId").and_then(Value::as_str).unwrap_or_default();
+            return err(format!("cannot switch network while a send is awaiting approval on {name} ({id})"));
+        }
+        match st.settings.set_active_chain(chain_id as u64) {
             Ok(a) => {
                 if a.changed {
                     emit_active_chain_changed(chain_id);
@@ -1771,7 +1264,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         .to_string()
     }
 
-    fn list_available_tokens(&self, chain_id: i64, query: String, limit: i64) -> String {
+    fn list_available_tokens(&self, chain_id: i64, query: String, offset: i64, limit: i64) -> String {
         if chain_id < 0 || !networks::is_supported(chain_id as u64) {
             return err(format!("chain {chain_id} is not one of this wallet's networks"));
         }
@@ -1786,11 +1279,13 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         // A non-positive limit is no limit: "show me everything" needs a spelling, and zero
         // meaning "nothing" would make an off-by-one in a caller look like an empty chain.
         let cut = usize::try_from(limit).ok().filter(|n| *n > 0);
+        let offset = usize::try_from(offset).unwrap_or(0);
         let (total, rows) =
-            tokens::available(chain_id, &listed, s.enabled_tokens(chain_id), &query, cut);
+            tokens::available(chain_id, &listed, s.enabled_tokens(chain_id), &query, offset, cut);
+        let has_more = offset.saturating_add(rows.len()) < total;
         let mut v = json!({ "ok": true, "chainId": chain_id, "tokenSort": s.token_sort.as_str(),
-                            "total": total, "shown": rows.len(), "listed": listed.len(),
-                            "tokens": rows });
+                            "total": total, "offset": offset, "shown": rows.len(),
+                            "hasMore": has_more, "listed": listed.len(), "tokens": rows });
         // Only when the call itself failed. Its ABSENCE is what makes `listed: 0` readable as
         // "this chain has none" — the ordinary answer on sepolia and hoodi.
         if let Some(e) = list_error {
@@ -2032,59 +1527,32 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn get_history(&self, address: String) -> String {
-        let st = match self.state() {
-            Ok(st) => st,
-            Err(e) => return err(e),
-        };
-        // Rows are derived on read, so one that confirmed while this view was closed reads
-        // `confirmed` the moment anything asks. The sweep announces that itself, per row: a
-        // read must not, or the view's subscription drives it round again.
+        let b = Budget::new(HISTORY_BUDGET);
         let settings = match self.settings() {
             Ok(s) => s,
             Err(e) => return err(e),
         };
         let chain_id = settings.active_chain_id;
-        let swept = self.sweep(&st, &address, &Budget::new(SWEEP_BUDGET));
-        let rows = st.history.list(&address);
+        let Some(t) = b.take(HISTORY_BUDGET) else { return err("no time left to read the history") };
+        // The sender sweeps due receipts and announces what moved; this read announces
+        // nothing of its own.
+        let mut v = match sender_reply(
+            modules().tx_sender_module.history_with_timeout(&address, chain_id as i64, t),
+        ) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
         // The same offered set the balance list and the send path read, so a transfer in an
         // enabled token is decoded rather than shown as an unknown contract.
-        let mut v = history_reply(
-            &address,
-            chain_id,
-            &rows,
-            history::now_secs(),
-            &swept,
-            settings.enabled_tokens(chain_id),
-        );
-        // F-5. Numbers a duplicate request id stranded: nothing holds them, nothing will hand
-        // them back, and every later send queues behind them. Disclosed rather than released,
-        // because "nobody holds it" is not evidence a transaction did not leave.
-        let stranded: Vec<Value> = st
-            .sends
-            .stranded()
-            .iter()
-            .filter(|(c, a, _)| *c == chain_id && send::same_account(a, &address))
-            .map(|(_, _, n)| json!(n))
-            .collect();
-        v["strandedNonces"] = json!(stranded);
+        rows::decorate_history(&mut v, chain_id, settings.enabled_tokens(chain_id));
         v.to_string()
     }
 
     fn refresh_pending(&self, address: String) -> String {
-        // Gated per record inside the sweep, like `get_history` and `refresh_tx_status`:
-        // a row carries its own chain, so a blocking proxy on the ACTIVE one must not
-        // suppress a due row elsewhere. `blockedChains` says which rows that cost, and why.
-        let st = match self.state() {
-            Ok(st) => st,
-            Err(e) => return err(e),
-        };
-        let s = self.sweep(&st, &address, &Budget::new(SWEEP_BUDGET));
-        json!({ "ok": true, "address": address, "polled": s.polled,
-                "changed": s.changed, "blocked": s.blocked_count(),
-                "blockedChains": s.blocked_json(), "stillDue": s.still_due })
-        .to_string()
+        let b = Budget::new(HISTORY_BUDGET);
+        let Some(t) = b.take(HISTORY_BUDGET) else { return err("no time left to sweep the receipts") };
+        relay(modules().tx_sender_module.refresh_pending_with_timeout(&address, t))
     }
-
 
     fn prepare_send(&self, request_json: String) -> String {
         let b = Budget::new(SEND_BUDGET);
@@ -2099,49 +1567,12 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         if let Err(v) = self.verified_gate_within(chain_id, &b) {
             return blocked(&v).to_string();
         }
-        match self.quote(&req, chain_id, &b) {
-            Ok(q) => {
-                let native = q.token.as_ref().map(|t| t.native).unwrap_or(true);
-                let charged = if native { q.amount } else { U256::ZERO };
-                let max_cost =
-                    send::max_cost_wei(charged, q.gas_limit, q.max_fee).map(|v| v.to_string());
-                let ceiling = history::fee_ceiling_wei(&q.max_fee.to_string(), q.gas_limit);
-                let mut v = json!({
-                    "ok": true, "chainId": q.chain_id,
-                    "from": q.from.to_string(), "to": q.to.to_string(),
-                    "amount": q.amount.to_string(),
-                    "amountSymbol": q.symbol,
-                    "amountDecimals": q.decimals,
-                    "nativeSymbol": q.native_symbol,
-                    "token": q.token.as_ref().map(|t| t.symbol.clone()),
-                    // WHICH contract the send will call, resolved. A symbol cannot say it:
-                    // two tokens can share one, so a confirmation step showing only the
-                    // symbol cannot reveal that the wrong asset is about to move.
-                    // Null for a native send, which calls no contract.
-                    "tokenAddress": q.token.as_ref().and_then(|t| t.address.clone()),
-                    "nonce": q.nonce, "gasLimit": q.gas_limit,
-                    "maxFeePerGas": q.max_fee.to_string(),
-                    "maxPriorityFeePerGas": q.max_priority.to_string(),
-                    "maxCostWei": max_cost,
-                    // `maxFeePerGas × gasLimit`: a ceiling, never a price. A view that
-                    // presents it as "the fee" is how an overpayment goes unnoticed.
-                    "feeCeilingWei": ceiling,
-                    "feeSource": q.fee_source,
-                    // `route` covers the balance and nonce reads only. The fee is fee_module's,
-                    // which emits no label, so it is never proof-backed whatever `route` says.
-                    "route": q.route,
-                    "feeRoute": verified::UNKNOWN_ROUTE,
-                });
-                units::decorate(&mut v, "amount", &q.amount.to_string(), Some(q.decimals));
-                // Fees are ether whatever is being sent, so they render at 18 places.
-                if let Some(c) = &ceiling {
-                    units::decorate(&mut v, "feeCeilingWei", c, Some(18));
-                }
-                if let Some(m) = &max_cost {
-                    units::decorate(&mut v, "maxCostWei", m, Some(18));
-                }
-                v.to_string()
-            }
+        let r = match self.resolve(&req, chain_id, &b) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        match self.sender_prepare(&r, &req, &b) {
+            Ok(priced) => Self::quote_reply(&r, &priced).to_string(),
             Err(e) => err(e),
         }
     }
@@ -2165,59 +1596,51 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         if let Err(v) = self.verified_gate_within(chain_id, &b) {
             return blocked(&v).to_string();
         }
-        match self.request_send(&st, &req, chain_id, &b) {
-            // Deliberately no hash: nothing is signed or broadcast until a human approves.
-            Ok((id, handle)) => {
-                json!({ "ok": true, "pending": true, "requestId": id, "handle": handle })
-                    .to_string()
-            }
-            Err(e) => err(e),
-        }
+        let r = match self.resolve(&req, chain_id, &b) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        let Some(t) = b.take(SENDER_BUDGET) else { return err("no time left to request approval") };
+        let mut request = match Self::sender_request(&r, &req, t) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        // What a human reads at the moment of approval: exact to the last digit and in the
+        // token's own units. Nobody can check a figure denominated in wei.
+        let amount = units::format_exact(&r.amount.to_string(), r.decimals)
+            .unwrap_or_else(|| r.amount.to_string());
+        request["purpose"] = json!(send::purpose(&amount, &r.symbol, &r.from.to_string(), &r.to.to_string()));
+        // Deliberately no hash: nothing is signed or broadcast until a human approves. The
+        // sender's `{ ok, pending, requestId, handle }` is this module's own reply.
+        relay(modules().tx_sender_module.send_with_timeout(&request.to_string(), t))
     }
 
     fn send_status(&self, request_id: String) -> String {
-        match self.advance_send(&request_id) {
-            Ok(v) => v.to_string(),
-            Err(e) => err(e),
-        }
+        let b = Budget::new(STATUS_BUDGET);
+        let Some(t) = b.take(STATUS_BUDGET) else { return err("no time left to read the send") };
+        relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))
     }
 
     fn cancel_send(&self, request_id: String) -> String {
-        // Cancel locally FIRST, under the ledger's lock; telling the keystore is a courtesy
-        // whose reply was already discarded. The other order let two cancels release the same
-        // nonce twice, or one cancel a send another poll had begun broadcasting.
-        match self.state().and_then(|st| {
-            let job = st.sends.claim_cancel(&request_id)?;
-            let _ = modules().keystore_module.cancel_approval_with_timeout(
-                &job.handle,
-                &job.receipt,
-                RPC_BUDGET,
-            );
-            emit_send_status_changed(&job.request_id);
-            Ok(Self::job_reply(&job, history::now_secs()))
-        }) {
-            Ok(v) => v.to_string(),
-            Err(e) => err(e),
-        }
+        let b = Budget::new(READ_BUDGET);
+        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to cancel the send") };
+        relay(modules().tx_sender_module.cancel_send_with_timeout(&request_id, t))
     }
 
     fn refresh_tx_status(&self, address: String, hash_hex: String) -> String {
-        // Advisory: `hash`, `chain_id` and `from` are a row's identity and never change, so
-        // nothing needs re-checking after the call — and `apply_receipt` settles the row as
-        // it stands now, not as this copy remembers it.
-        match self.refresh_one(&address, &hash_hex) {
-            Ok(v) => v.to_string(),
-            Err(e) => err(e),
-        }
+        let b = Budget::new(REFRESH_BUDGET);
+        let Some(t) = b.take(REFRESH_BUDGET) else { return err("no time left to read the receipt") };
+        relay(modules().tx_sender_module.refresh_tx_status_with_timeout(&address, &hash_hex, t))
     }
 
     fn get_tx_details(&self, address: String, hash_hex: String) -> String {
-        match self.tx_details(&address, &hash_hex) {
-            Ok(v) => v.to_string(),
+        let b = Budget::new(DETAILS_BUDGET);
+        let Some(t) = b.take(DETAILS_BUDGET) else {
             // Not `err()`: this reply is rendered beside ONE transaction's rows, so even a
             // refusal has to name the hash it is about or it could land under another.
-            Err(e) => details::details_refusal(&hash_hex, &e).to_string(),
-        }
+            return json!({ "ok": false, "hash": hash_hex, "error": "no time left to read the transaction" }).to_string();
+        };
+        relay(modules().tx_sender_module.tx_details_with_timeout(&address, &hash_hex, t))
     }
 
     fn suggest_fees(&self) -> String {

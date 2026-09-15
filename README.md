@@ -1,7 +1,7 @@
 # eth_wallet_backend
 
-An Ethereum-only wallet coordinator: balances, Send with full fee control, and local
-transaction history.
+An Ethereum-only wallet coordinator: balances, Send with full fee control, and the local
+transaction history `tx_sender_module` keeps for it.
 
 Exactly one network is active at a time, chosen from **mainnet (1)**, **sepolia (11155111)**
 and **hoodi (560048)** — the same set the light-client verified proxy supports, so the
@@ -14,14 +14,24 @@ It never sees key material. Signatures are *requested* from `keystore_module` an
 by a human in `evm_signer_ui`; account creation, import and export belong to `evm_keystore_ui` and
 are refused to everyone else. This module can read which accounts exist, and nothing more.
 
+It never broadcasts, reserves a nonce, or asks the keystore for a signature itself. Every
+transaction it makes LEAVES through `tx_sender_module`, the one sender on the device: this
+module decides WHAT to send — which token, how much, to whom, and the one line the human is
+told — and hands it over as a one-call bundle. The sender prices the fee, reserves the nonce
+in the one ledger every app on the device shares, registers the approval, broadcasts, and
+keeps the record. `tests/glue_never_calls_under_a_lock.rs` refuses a second path to any of
+those: a wallet that reads a nonce itself is a second nonce authority, which is exactly the
+collision the sender exists to prevent.
+
 ## Dependencies
 
 | Module | For |
 |---|---|
 | `eth_rpc_module` | JSON-RPC; it also **owns** the per-chain endpoint and verified mode |
 | `fee_module` | EIP-1559 tiers — this module does not do fee maths |
-| `keystore_module` | reading the account list and account names; requesting signatures |
+| `keystore_module` | reading the account list and account names |
 | `token_list_module` | token metadata; the catalogue the picker shows and the snapshot an enabled token stores |
+| `tx_sender_module` | the send itself: nonce, approval request, broadcast, receipt tracking, and the history this module reads back |
 
 ## Events, and the one this module relays
 
@@ -35,9 +45,10 @@ never emitted is a consumer subscribing to silence, and is rejected.
 | `active_chain_changed(chainId)` | the active network moved | `set_active_chain` |
 | `tokens_changed(chainId)` | the set OFFERED on that chain moved | `set_token_enabled` |
 | `token_sort_changed(order)` | the balance-row order moved, device-wide | `set_token_sort` |
-| `balances_updated(address)` | the amounts moved for one address | a confirmation, found by the sweep or by `refresh_tx_status` |
-| `tx_status_changed(hash)` | one recorded transaction moved | the broadcast landing its hash, and the receipt poll |
-| `history_changed(address)` | a recorded row appeared or changed that no hash can name | the intent write, and a broadcast that returned no hash |
+| `balances_updated(address)` | a transaction settled, so an amount may have moved; the address is EMPTY, because the sender's event names a hash and no account — re-read what is on screen | the relay of the sender's `tx_status_changed` |
+| `tx_status_changed(hash)` | one recorded transaction moved | relayed from `tx_sender_module` |
+| `send_status_changed(requestId)` | a pending send changed state | relayed from `tx_sender_module` |
+| `history_changed(address)` | a recorded row appeared or changed that no hash can name | relayed from `tx_sender_module` |
 | `accounts_changed(count)` | relayed from `keystore_module` | see below |
 | `tokens_changed(chainId)` | also relayed from `token_list_module.tokens_updated` | see below |
 | `networks_changed(chainId)` | relayed from `eth_rpc_module` — one chain's endpoint, transport or verified-proxy mode moved | see below |
@@ -52,9 +63,8 @@ Three rules hold across all of them:
 * **After the write.** The announcement is in the success arm, so nothing is announced that
   did not reach disk.
 * **A read never announces itself**, for the same loop reason. `get_history` and
-  `refresh_pending` are the seeming exceptions and are not: both drive the receipt sweep, which
-  WRITES, and the sweep announces its own confirmations — once, from the writer, so a row
-  confirming under an open history view is not silent just because the caller was a read.
+  `refresh_pending` drive the sender's receipt sweep, and the sender announces what its sweep
+  moves; these relays add nothing on top, or a view subscribed to them would drive itself round.
 
 `tokens_changed` and `balances_updated` are deliberately separate. The set of tokens offered
 changing is a different fact from an amount moving: nothing was spent, there is no address to
@@ -172,8 +182,10 @@ Every one of these calls is bounded — 1.5 s to read a config, 5 s to write one
 20 s protocol default — and so is their **sum**. A per-call bound says nothing about a method
 that makes ten of them: `list_networks` reached ~29 s with every call individually capped, and
 ~120 s without. Each entry point now spends one shared allowance — 4 s for a consumer-facing
-read, 6 s for the load hook, 12 s for a send's quote and approval request, 10 s for a receipt
-sweep — and a call that no longer fits is not made. `list_networks`
+read, 6 s for the load hook, 13.5 s for a send — of which 9 s go to the one delegated
+`tx_sender_module` call, handed down as `deadlineMs` so its error sentence comes home rather
+than a bare transport timeout — 12 s for a relayed history read or sweep — and a call that no
+longer fits is not made. `list_networks`
 reads the active network first, so a short allowance costs `verifiedProxyMode: "unknown"` and
 an empty `rpcUrl` on the other two rather than a stall. What the load hook could not finish is
 retried on the first read.
@@ -186,38 +198,19 @@ back. A lock held across another module's call turns one slow dependency into a 
 every reader, and `concurrency: "multi"` means there are always other readers.
 
 What the lock never provided is mutual exclusion between requests — a shared read guard
-excludes nobody. That belongs to `History`, which does every read-modify-write under its own
-gate and matches on the hash, so an apply is a compare-and-set; and to `SendLedger`, which
-holds the jobs, the reserved nonces and the network switch under ONE lock, because "reserve
-this nonce and record the send" and "refuse a switch while a send could still move" are each
-one decision and cannot span two. A send reserves and claims under that lock, asks the
-keystore for approval holding nothing, and gives the nonce back on every path that does not
-reach a job — a `Drop` guard, so a new early return cannot forget. `send_status` claims the
-broadcast immediately before the broadcast RPC and nowhere earlier: a claim held across a
-call that does not move money wedges the send if that call fails.
+excludes nobody. The stores that need it take their own: `settings.json` and `contacts.json`
+each do every read-modify-write under one gate. The send pipeline that used to live here —
+the nonce ledger, the approval claim, the ticket that alone may settle a broadcast, the
+write-ahead record, the receipt sweep — moved verbatim into `tx_sender_module` and was
+generalised there to a bundle of calls under one approval; its guards moved with it. What
+stays here is the half the sender cannot know: which token a symbol names (`tokens::resolve`
+refuses a symbol two offered contracts share), how many base units "0.1" is, whether the
+account holds that much of an ERC-20, and the claim line the human reads. `send` hands the
+sender one call with `meta: { kind: "native" | "erc20", token, tokenSymbol, tokenDecimals,
+recipient, amount }` — the sender stores it verbatim and hands it back on the row, which is
+how `get_history` reads an ERC-20 send back as the transfer it was.
 
-The claim hands back a ticket, and past it nothing else may settle that job — the rule the
-cancel door always had, extended to every door. A concurrent dispatch would otherwise read a
-job mid-broadcast, find no signature because the first had already acked it, and call a
-transaction on its way to a node `failed`, handing its nonce to the next send. From the claim
-onward the nonce is never released either: once the raw transaction has left this process
-nothing here can prove it did not reach a chain.
-
-`send_raw_transaction` is deliberately unbounded, so a broadcast can simply never return. The
-deadline is on the CLAIM, not the call — a deadline on the call would not stop the transaction,
-only stop us learning its hash. After it the send reports `stuck` and stops refusing network
-switches; it never becomes terminal, never gives its nonce back and is never re-sent, and if
-the broadcast answers hours later its hash still lands.
-
-The durable record goes down BEFORE the bytes leave. It used to be written after the broadcast
-returned, and on a failed broadcast not at all — so a crash inside that unbounded call, or an
-early return, left a number that had already left with nothing on disk, and the next process
-handed it straight to another send. `record_intent` writes an `unknown` row carrying (chain,
-from, nonce) first and the outcome only completes it; `broadcast` takes the `Recorded` that
-write hands back, so broadcasting before recording is not something the glue can express. A
-row that reached no disk at all refuses the send rather than reporting itself written.
-
-Settings are written by rename for the same reason `History` is. `std::fs::write` truncates
+Settings are written by rename for the same reason the sender's history is. `std::fs::write` truncates
 before it writes, and a read landing in that window used to parse nothing and report
 **mainnet** — so the wallet could briefly gate, price and label against a network the user was
 not on. A config that cannot be read now says so instead of answering chain 1.
@@ -288,11 +281,14 @@ yes/no.
 
 ### The picker, and testnets
 
-`list_available_tokens(chain_id, query, limit)` returns everything offered plus everything
-token_list holds for the chain, native first, then what is enabled, then the rest
-alphabetically. `total` counts the matches **before** the cut and `shown` after, so a view can
-say what it is hiding instead of presenting a truncated list as the whole answer. A `limit` of
-zero or less is no limit.
+`list_available_tokens(chain_id, query, offset, limit)` returns everything offered plus
+everything token_list holds for the chain, native first, then what is enabled, then the rest
+alphabetically — one page at a time. `offset` skips that many matches, `limit` caps the page
+(zero or less is no limit), `total` counts every match, `shown` the rows in this page and
+`hasMore` whether another follows, so a view loads the list as it scrolls rather than
+presenting a slice as the whole answer. Every page re-reads the catalogue from token_list;
+the order is stable while the lists are, and a `total` that moves between pages means they
+were refreshed underneath.
 
 The embedded Uniswap list is overwhelmingly mainnet, so on sepolia and hoodi `listed` is
 legitimately **0** and the reply carries the built-in rows alone. That is an answer, not a
@@ -373,21 +369,14 @@ point, taken before the gate and spent by everything behind it, and no unbounded
 to reach for — a budget the probe outruns still refuses, because its verdict is `blocking`
 and a timeout is not permission.
 
-**The broadcast is gated in its own right.** `send` passing the gate proves nothing by the
-time the signature comes back: a human spends seconds or minutes in the signer, and the proxy
-can go unusable or the mode flip to `required` in that window. `send_status` checks again
-immediately before it claims the broadcast — as late as a check can be and still be in front
-of the money.
-
-A refusal there is **not** a failed send: the transaction never left. The job is left exactly
-as it stood — `awaitingApproval`, nothing claimed, nothing recorded, its nonce still reserved
-— and the reply carries `blocked: true`, a `reason` and the whole `verifiedProxy` verdict with
-`ok` still true and the status unchanged, which is what keeps a poller coming back. The next
-poll sends it once the proxy is usable; `cancel_send` is still open in the meantime, and is
-what stops a proxy that never returns from wedging the account. Marking it `failed` instead
-would hand its number to the next send while a transaction signed at that number is still
-waiting to leave — `tests/a_closed_gate_holds_a_send_it_does_not_lose_it.rs` drives the
-ledger through exactly that.
+**The broadcast is gated in its own right, on the sender's side.** `send` passing this
+module's gate proves nothing by the time the signature comes back: a human spends seconds or
+minutes in the signer, and the proxy can go unusable or the mode flip to `required` in that
+window. `tx_sender_module.send_status` checks again immediately before it claims the
+broadcast, and a refusal there is **not** a failed send: the job is left `awaitingApproval`
+with its nonce reserved, and the reply — relayed here unchanged — carries `blocked: true`, a
+`reason` and the whole `verifiedProxy` verdict with `ok` still true, which is what keeps a
+poller coming back. `cancel_send` is still open in the meantime.
 
 ## What was actually proved
 
@@ -403,14 +392,18 @@ because `fee_module` emits no label of its own.
 
 ## Transaction status
 
-A row is written `unknown` before its transaction leaves, becomes `pending` when the node
-answers with a hash, and is moved on from there by a receipt poll on **its own** chain.
-`get_history` sweeps before it answers, so a transaction that confirmed while the view was
-closed already reads `confirmed` the moment anything asks; `refresh_pending` is the same
-sweep on demand. Both gate per record, never on the active chain, so a blocking proxy on
-one network cannot suppress a due row on another. There is no background thread — the
-schedule in `history.rs` backs off (3 s → 15 s → 60 s → stop) and an unanswered poll still
-stamps its attempt.
+The rows are `tx_sender_module`'s: a row is written `unknown` before its transaction leaves,
+becomes `pending` when the node answers with a hash, and is moved on from there by a receipt
+poll on **its own** chain. `get_history` relays the sender's `history` for the active network,
+which sweeps before it answers, so a transaction that confirmed while the view was closed
+already reads `confirmed` the moment anything asks; `refresh_pending` is the same sweep on
+demand. Both gate per record, never on the active chain. There is no background thread — the
+sender's schedule backs off (3 s → 15 s → 60 s → stop) and an unanswered poll still stamps
+its attempt. The rows include every call made from the account by any app on the device —
+a swap app's `kind: "call"` rows arrive with their `label`, `origin` and `purpose` — and this
+module decorates them at read time with the one thing the sender does not have, the token
+table (`rows.rs`): an ERC-20 send of its own reads back as the transfer it was, and a
+`Transfer` log in an enabled token is named and scaled.
 
 Both replies carry `stillDue`: false once no row can move again. That is the signal a
 caller's poll timer stops on — without it, one transaction that was dropped or replaced
@@ -485,16 +478,11 @@ in and again on the way out, so a row written by an earlier build renders in one
 `maxFeePerGas`, `maxPriorityFeePerGas`, `feeCeilingWei`, `txInput` — the transaction's own
 calldata, `"0x"` for a plain transfer and the `transfer` call for an ERC-20 one — and the
 token's symbol and decimals.
-All optional, so a history file written by an earlier build still loads, and absent means "the
-node did not say" — the view renders an em-dash, never a zero. Every read-modify-write of the file runs
-under one lock and lands by rename, because `concurrency: "multi"` really does run these
-concurrently.
-
-One entry that does not parse costs that entry and nothing else: entries are read one at a
-time and an unreadable one is carried through every write untouched, where parsing the array
-all-or-nothing meant a single legacy row hid every transaction — and every nonce — in the file.
-A file that cannot be read at all still does not swallow the write: the row goes to a sidecar
-beside it, which the nonce sweep already reads and the next successful write folds back in.
+All optional, and absent means "the node did not say" — the view renders an em-dash, never a
+zero. The file itself, and its rules — one entry that does not parse costs that entry alone,
+a file that cannot be read does not swallow a write — are the sender's, under ITS instance
+directory. Rows this wallet recorded before the sender existed stay where they were and are
+not migrated.
 
 ## Headless operation (logosctl)
 
@@ -504,8 +492,8 @@ send on a local Anvil (chain id 11155111); the hermetic form, with a requester f
 of this module, is `doctests/evm-signer-cli-headless.test.yaml` in `logos-evm-signer-cli`.
 
 **Roles, once per daemon.** `configure` is TOTAL — a role the document does not name is held
-by nobody — so restate both roles, GUI surfaces included. Then import a key through the
-custodian:
+by nobody — so restate both roles, GUI surfaces included. Load `tx_sender_module` before this
+module, then import a key through the custodian:
 
 ```bash
 logosctl call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}'
@@ -533,7 +521,8 @@ logosctl call eth_rpc_module set_verified_proxy_mode 11155111 off        # or re
 **Send.** `send` takes ONE argument, the request as text — a quoted JSON document or a bare
 `@file`, never `json:`, which hands the dispatcher an object where the method takes a string.
 The reply is `{ok, pending, requestId, handle}` and never a hash. The prompt arrives on the
-signer's event plane, and the approval is typed there:
+signer's event plane naming `tx_sender_module` as the requester and this module, in the claim
+line, as the one that asked; the approval is typed there:
 
 ```bash
 logosctl call eth_wallet_backend send '{"from":"0xf39F…","to":"0x7099…","amountUnits":"1"}'
@@ -542,10 +531,10 @@ logosctl watch evm_signer_cli --event prompt
 logosctl call evm_signer_cli approve ksh_b524… e1c9d03f… @/run/user/501/pw
 ```
 
-**`send_status` IS the broadcast.** There is no background thread on this side either: the
-poll that finds the approval collects the signature, broadcasts it exactly once and records
-it. Nothing moves between polls, so poll it after the approval and keep polling until it
-settles:
+**`send_status` IS the broadcast.** There is no background thread on either side: the
+sender's poll that finds the approval collects the signature, broadcasts it exactly once and
+records it, and this module relays that poll. Nothing moves between polls, so poll it after
+the approval and keep polling until it settles:
 
 ```bash
 logosctl call eth_wallet_backend send_status snd_ksh_b524…
@@ -591,4 +580,10 @@ logosctl call eth_wallet_backend set_token_enabled 11155111 0x… true
 cargo test --no-default-features --manifest-path rust-lib/Cargo.toml   # pure cores + source-shape guards
 nix build .#default                                                    # the module
 nix build .#lidl                                                       # the derived contract
+```
+
+Until `logos-evm-tx-sender-module` is published, build against a local checkout:
+
+```bash
+nix build .#default --override-input tx_sender_module path:../logos-evm-tx-sender-module --no-write-lock-file
 ```
