@@ -16,78 +16,55 @@
 //! the broadcast, and keeps the record. What this module reads back it decorates with the
 //! one thing the sender does not have: the token table.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use alloy::primitives::U256;
 use serde_json::{json, Value};
 
 use crate::budget::{
     callee_deadline, Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET,
     HISTORY_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET,
-    SENDER_BUDGET, SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET, VERDICT_BUDGET,
+    ASSETS_BUDGET, SENDER_BUDGET, SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET,
 };
 use crate::contacts::ContactsStore;
 use crate::depinit::{self, Next};
-use crate::gate::{self, Gate};
-use crate::rows;
-use crate::send;
+use crate::history;
 use crate::settings::{Settings, SettingsStore};
-use crate::tokens::{Token, TokenSort};
-use crate::txbuild::parse_u256_any;
-use crate::verified::{self, unwrap_answer, Answer};
-use crate::{networks, tokens, txbuild, units};
-
-/// This module's own name, as the runtime attests it to the sender and the sender records
-/// it on every row. What `get_history` and the network-switch refusal filter on.
-const OWN_NAME: &str = "eth_wallet_backend";
+use crate::settings::TokenSort;
+use crate::verified;
 
 pub trait EthWalletBackendModule: Send + Sync + 'static {
-    /// The three selectable networks. `{ ok, activeChainId, networks: [{ chainId, key,
-    /// name, nativeSymbol, testnet, rpcUrl, verifiedProxyMode, verifiedProxy }] }`.
+    /// Enabled chains selected by the device scope, each carrying its current verdict.
+    /// `{ ok, scope, networks: [{ chainId, name, nativeSymbol, testnet, rpcUrl,
+    /// verifiedProxyMode, verifiedProxy }] }`.
     /// `rpcUrl`, `verifiedProxyMode` and `verifiedProxy` all come from `eth_rpc_module`, which
     /// owns them. All three are read-only here — a device-wide store shared with every wallet
     /// on the machine is configured in the `eth_rpc_ui` app, not from inside one wallet.
     ///
     /// Answers within a fixed budget however slow `eth_rpc` is. A network whose reads did
-    /// not fit reports `verifiedProxyMode: "unknown"` and an empty `rpcUrl`; the active one
-    /// is read first, so it is the last to degrade.
+    /// not fit reports `verifiedProxyMode: "unknown"` and an empty `rpcUrl`.
     fn list_networks(&self) -> String;
 
-    /// The active network alone, in the same shape as one `list_networks` entry.
-    fn get_active_network(&self) -> String;
+    /// Relay the chain registry's enable switch.
+    fn set_chain_enabled(&self, chain_id: i64, enabled: bool) -> String;
+    /// Relay the device-wide `mainnets` | `testnets` | `both` scope selector.
+    fn set_network_scope(&self, scope: String) -> String;
 
-    /// Switch the active network. Refuses any chain outside {1, 11155111, 560048} —
-    /// this wallet is Ethereum only. `{ ok, activeChainId }`.
-    ///
-    /// Refused while a send THIS wallet made is awaiting a human: the request names the
-    /// network it was built for, and moving the wallet under it would have the user approve
-    /// for a chain the wallet no longer shows. Another app's pending send does not hold the
-    /// wallet — the sender sends it on its own chain either way.
-    ///
-    /// Emits `active_chain_changed` when the chain MOVES. Re-selecting the network already
-    /// active is a successful no-op and announces nothing.
-    fn set_active_chain(&self, chain_id: i64) -> String;
-
-    /// `eth_rpc`'s verified-proxy verdict for the active network: `{ ok, chainId, mode,
-    /// state, usable, blocking, message, action, detail }`. Cheap: `off` costs no probe and
-    /// a repeat inside eth_rpc's 5s TTL costs none either.
+    /// `eth_rpc`'s verified-proxy verdict for every enabled in-scope chain:
+    /// `{ ok, chains: [{ chainId, verdict }] }`.
     fn verified_proxy_state(&self) -> String;
 
-    /// Tokens OFFERED on the active network, native first: the built-in rows plus whatever
+    /// Tokens OFFERED on `chain_id`, native first: the built-in rows plus whatever
     /// the user turned on. `{ ok, chainId, tokenSort, tokens: [{ symbol, name, decimals,
     /// address?, native, builtin, inTokenList, metadataSource, logoURI? }] }`.
     ///
-    /// `builtin` says whose assertion the address is — this wallet's fixed table, or a
-    /// snapshot the user took from `token_list`. `metadataSource` says who decorated the row:
+    /// `builtin` says the asset layer pins the address rather than accepting a user snapshot.
+    /// `metadataSource` says who decorated the row:
     /// `native` | `allowlist` (ours, undecorated) | `custom` | `downloaded` | `embedded`
-    /// (`token_list`'s own bucket labels, relayed rather than inferred) | `unknown` (a match
-    /// from a token_list too old to label its buckets) | `enabled` (a snapshot the list no
-    /// longer holds). Neither flag can be derived from the other: a built-in row and an
-    /// enabled one both read `embedded` when the same list decorates them.
-    fn list_tokens(&self) -> String;
+    /// (`token_list`'s own bucket labels, relayed rather than inferred) | `unknown` | `enabled`
+    /// (a persisted snapshot the list no longer holds).
+    fn list_tokens(&self, chain_id: i64) -> String;
 
     /// Every token that COULD be offered on `chain_id`: what the wallet offers now, plus
     /// everything `token_list_module` holds for that chain. The token picker's one read.
@@ -173,13 +150,15 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// the address is not in the book, and that is already true.
     fn forget_contact(&self, address: String) -> String;
 
-    /// Native and token balances for `address` on the active network, in one Multicall3
-    /// round-trip. `{ ok, chainId, address, tokenSort, balances: [{ symbol, address?, raw,
-    /// decimals, native, builtin, display, exact, amountExact }], route }`. `display` is
-    /// bounded; `amountExact` carries every digit, as a plain decimal string (`exact` is the
-    /// older name for the same digits). All three are absent when the sub-call failed, so a
-    /// view renders an em-dash and never a zero. A caller must not scale `raw` itself — a JS
-    /// number loses digits above 2^53.
+    /// Native and token balances for `address` on every enabled chain in the device scope.
+    /// The per-chain reads fan out concurrently, so another configured chain cannot multiply
+    /// the interaction deadline. `{ ok, address, tokenSort, chains: [{ ok, chainId,
+    /// balances: [{ symbol, address?, raw, decimals, native, builtin, display, exact,
+    /// amountExact }], route } | { ok: false, chainId, error }] }`. `display` is bounded;
+    /// `amountExact` carries every digit as a plain decimal string (`exact` is the older name
+    /// for the same digits). All three are absent when a sub-call failed, so a view renders an
+    /// em-dash and never a zero. A caller must not scale `raw` itself — a JS number loses
+    /// digits above 2^53.
     ///
     /// EVERY offered token gets a row, including one the account holds none of. The array
     /// arrives ALREADY SORTED by the persisted `tokenSort` — comparing 18-decimal amounts is
@@ -190,22 +169,22 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// balances on `route`, never on the network's mode.
     fn get_balances(&self, address: String) -> String;
 
-    /// Transactions `tx_sender_module` broadcast for `address` on the active network, newest
-    /// first — this wallet's own sends and any other app's calls from the same account. Only
-    /// transactions the sender broadcast: there is no indexer.
+    /// Transactions `tx_sender_module` broadcast for `address` on every chain in the current
+    /// device scope, newest first — this wallet's own sends and any other app's calls from the
+    /// same account. Only transactions the sender broadcast: there is no indexer.
     ///
-    /// `{ ok, chainId, address, stillDue, stillDueAnyChain, unstored, unresolved,
-    /// blockedChains, strandedNonces, transactions }`. A row this wallet sent as an ERC-20
+    /// `{ ok, address, stillDue, stillDueAnyChain, unstored, unresolved, blockedChains,
+    /// strandedNonces, transactions, decorationErrors? }`. A row this wallet sent as an ERC-20
     /// transfer reads back as one: `kind: "erc20"`, `to` the recipient, `value` the token
     /// amount at the token's decimals, `txTo` the contract. Another app's call keeps
     /// `kind: "call"` with its `label`, `origin` and `purpose`. Each row carries `stalled`,
     /// `unresolved` and `verificationBlocked`; `stillDue` covers the rows in THIS reply.
     fn get_history(&self, address: String) -> String;
 
-    /// Fee tiers for the active network, from `fee_module`. `{ ok, chainId, baseFeePerGas,
+    /// Fee tiers for `chain_id`, from `fee_module`. `{ ok, chainId, baseFeePerGas,
     /// source, tiers: { slow, normal, fast } }`; `source` distinguishes a real EIP-1559
     /// suggestion from the legacy `gasPrice` fallback.
-    fn suggest_fees(&self) -> String;
+    fn suggest_fees(&self, chain_id: i64) -> String;
 
     /// Quote a send without doing anything: resolves the token, checks an ERC-20 balance
     /// here, and has `tx_sender_module` price the fee, check the ether and read the nonce.
@@ -268,7 +247,6 @@ pub trait EthWalletBackendModuleEvents {
     /// A balance may have moved: a transaction this wallet is tracking settled. The address
     /// is EMPTY when the sender's event named only a hash — re-read what is on screen.
     fn balances_updated(&self, address: String);
-    fn active_chain_changed(&self, chain_id: i64);
     /// Relayed from `tx_sender_module`: a recorded transaction took a hash or settled.
     fn tx_status_changed(&self, hash_hex: String);
     /// Relayed from `tx_sender_module`: a pending send changed state.
@@ -306,9 +284,6 @@ struct EthWalletBackendImpl {
     /// The same, for the three sender relays.
     watching_sender: AtomicBool,
     feeds: Feeds,
-    /// Which chains may be gated without asking eth_rpc at all. Shared with the listener
-    /// thread that keeps it honest; see [`crate::gate`] for why only `off` is ever held.
-    gate: Arc<gate::ModeCache>,
 }
 
 /// The subscriptions this module keeps open on its dependencies. Each flag is held for as
@@ -316,8 +291,9 @@ struct EthWalletBackendImpl {
 /// quiet for the life of the process — unlike `watching_keystore`, which is armed once.
 #[derive(Default)]
 struct Feeds {
-    gate: Arc<AtomicBool>,
     chains: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+    scope: Arc<AtomicBool>,
     tokens: Arc<AtomicBool>,
 }
 
@@ -329,84 +305,11 @@ fn listen<S: Send + 'static>(flag: Arc<AtomicBool>, sub: S, body: impl FnOnce(S)
     });
 }
 
-/// How many new subscriptions a lost gate feed takes before giving up and leaving it to the
-/// next gated read, which arms one itself. Bounded so a provider that is gone for good is
-/// not spun on.
-const GATE_REARMS: u32 = 5;
-const GATE_REARM_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// One arming of the mode feed: the status watcher first, then the subscription.
-///
-/// The watcher goes on first because the C side replays the current state synchronously from
-/// inside the install, so no arm can fall into the gap ahead of it. `subscribed` is what
-/// stops that replay opening the cache before there is a mode subscription for an arm to be
-/// about — the status is per TARGET, so a client already armed for the chain-config feed
-/// reports `Armed` the instant it is asked. Re-installing after the subscription exists is a
-/// second replay and not a second gate: same closure, same flag, one edge.
-fn arm_gate(cache: &Arc<gate::ModeCache>) -> Option<logos_rust_sdk::EventSubscription> {
-    let subscribed = Arc::new(AtomicBool::new(false));
-    let watcher = |cache: Arc<gate::ModeCache>, subscribed: Arc<AtomicBool>| {
-        move |s: logos_rust_sdk::SubStatus, _generation: u64| match s {
-            // The one edge that opens this cache, and never before there is a feed to open it
-            // for. `Lost`, `Held`, `Abandoned` and anything a later protocol adds close it.
-            logos_rust_sdk::SubStatus::Armed if subscribed.load(Ordering::Acquire) => {
-                cache.feed_live()
-            }
-            _ => cache.feed_dead(),
-        }
-    };
-    let mut w = modules().eth_rpc_module;
-    w.on_subscription_status(watcher(cache.clone(), subscribed.clone())).ok()?;
-    // Bound at function scope, so `w` still holds the client when this second proxy asks the
-    // cache for it: the cache is weak, and letting the last handle go destroys the client and
-    // silently discards the watcher just installed.
-    let mut c = modules().eth_rpc_module;
-    let Ok(sub) = c.on_verified_proxy_mode_changed() else {
-        return None;
-    };
-    subscribed.store(true, Ordering::Release);
-    let _ = w.on_subscription_status(watcher(cache.clone(), subscribed));
-    Some(sub)
-}
-
-/// Keep the mode feed running for as long as one can be had.
-///
-/// A stream now ENDS: `Abandoned` is terminal, and it wakes its reader rather than parking it
-/// for ever, so everything below the loop is reachable. Terminal is terminal — the way back
-/// is not a re-arm of this subscription but a NEW one, which is unarmed at creation. Nothing
-/// here opens the cache: taking a subscription is not an arm, and every re-subscribe waits
-/// on the same single edge in [`arm_gate`] the first one did.
-fn gate_feed(cache: &Arc<gate::ModeCache>) {
-    for attempt in 0..=GATE_REARMS {
-        if attempt > 0 {
-            std::thread::sleep(GATE_REARM_PAUSE);
-        }
-        let Some(sub) = arm_gate(cache) else {
-            cache.feed_dead();
-            continue;
-        };
-        for ev in sub {
-            let Some(e) =
-                eth_rpc_module::EthRpcModuleClient::decode_verified_proxy_mode_changed(&ev)
-            else {
-                // An event we cannot read is a contract we no longer share, and it names no
-                // chain to invalidate. Drop the lot, and do not go back for more of it.
-                cache.feed_dead();
-                return;
-            };
-            cache.told(e.chain_id as u64, &e.mode);
-            emit_networks_changed(e.chain_id);
-        }
-        cache.feed_dead();
-    }
-}
-
 /// One flag per dependency, set once its config is settled and never disturbed again.
 /// A dependency can appear after us: `dependencies` orders the initial load, but a module
 /// that crashed and restarted comes back late, so startup is not the only chance to ask.
 #[derive(Default)]
 struct DepInit {
-    eth_rpc: AtomicBool,
     token_list: AtomicBool,
 }
 
@@ -429,32 +332,16 @@ fn keystore_account_count() -> i64 {
 }
 
 fn err(e: impl std::fmt::Display) -> String {
-    json!({ "ok": false, "error": e.to_string() }).to_string()
+    let message = e.to_string();
+    if let Ok(v) = serde_json::from_str::<Value>(&message) {
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            return v.to_string();
+        }
+    }
+    json!({ "ok": false, "error": message }).to_string()
 }
 
 const NO_CONTEXT: &str = "module context not ready";
-
-/// The reply every gated method returns when the proxy is blocking. `error` is the verdict's
-/// own sentence, so the view renders something actionable with no new wiring.
-fn blocked(verdict: &Value) -> Value {
-    json!({
-        "ok": false,
-        "error": verdict.get("message").and_then(Value::as_str)
-            .unwrap_or("the verified proxy is not usable"),
-        "verifiedProxy": verdict,
-    })
-}
-
-/// eth_rpc's config mutators answer `{ ok, ... }`. A `false` there is a real refusal —
-/// an empty endpoint, an unknown chain — and must not be reported as success.
-fn expect_ok(raw: &str) -> Result<Value, String> {
-    let v: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
-    if v.get("ok").and_then(Value::as_bool) == Some(true) {
-        Ok(v)
-    } else {
-        Err(v.get("error").and_then(Value::as_str).unwrap_or("eth_rpc refused the change").to_string())
-    }
-}
 
 /// A reply from `tx_sender_module`, parsed, with its refusal surfaced as this module's own.
 /// A transport error names the sender, so an operator can tell a sender that is down from a
@@ -463,11 +350,18 @@ fn sender_reply(raw: Result<String, impl std::fmt::Debug>) -> Result<Value, Stri
     let raw = raw.map_err(|e| format!("tx_sender_module: {e:?}"))?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(v
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("tx_sender_module refused the call")
-            .to_string());
+        return Err(v.to_string());
+    }
+    Ok(v)
+}
+
+/// A structured reply from the reusable asset provider. A provider refusal remains an
+/// object (not a flattened sentence), including `verified_blocked` and its verdict.
+fn assets_reply(raw: Result<String, impl std::fmt::Debug>) -> Result<Value, String> {
+    let raw = raw.map_err(|e| format!("evm_assets_module: {e:?}"))?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(v.to_string());
     }
     Ok(v)
 }
@@ -485,6 +379,7 @@ fn relay(raw: Result<String, impl std::fmt::Debug>) -> String {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendRequest {
+    chain_id: i64,
     from: String,
     to: String,
     /// Base units of the token being moved (wei for a native send). Kept exactly as it was
@@ -516,62 +411,13 @@ struct SendRequest {
     nonce: Option<u64>,
 }
 
-/// A resolved send: what the transaction IS, before the sender prices it.
-struct Resolved {
-    chain_id: u64,
-    from: alloy::primitives::Address,
-    to: alloy::primitives::Address,
-    amount: U256,
-    token: Option<Token>,
-    /// What `amount` is denominated in. Carried so every rendering — the reply, the claim,
-    /// the history meta — reads the same units without re-deriving them.
-    decimals: u8,
-    symbol: String,
-    native_symbol: String,
-    /// The route label of this module's own token-balance read, when it made one.
-    token_route: Option<String>,
-}
-
-impl Resolved {
-    fn native(&self) -> bool {
-        self.token.as_ref().map(|t| t.native).unwrap_or(true)
-    }
-
-    fn token_address(&self) -> Option<String> {
-        self.token.as_ref().and_then(|t| t.address.clone())
-    }
-
-    /// The one call this send is: the transfer, as `tx_sender_module` takes it. `meta` is
-    /// what this wallet wants back on the history row — the transfer's own facts, so the row
-    /// can be read as a transfer rather than as a call to a token contract.
-    fn call(&self) -> Result<Value, String> {
-        let meta = match &self.token {
-            Some(t) if !t.native => json!({
-                "kind": "erc20", "token": t.address, "tokenSymbol": t.symbol,
-                "tokenDecimals": t.decimals, "recipient": self.to.to_string(),
-                "amount": self.amount.to_string(),
-            }),
-            _ => json!({ "kind": "native", "recipient": self.to.to_string(),
-                         "amount": self.amount.to_string() }),
-        };
-        Ok(match &self.token {
-            Some(t) if !t.native => {
-                let addr = t.address.as_deref().unwrap_or_default()
-                    .parse::<alloy::primitives::Address>()
-                    .map_err(|e| format!("token has an unparseable address: {e}"))?;
-                json!({ "to": addr.to_string(), "value": "0x0",
-                        "data": format!("0x{}", hex::encode(txbuild::erc20_transfer_calldata(self.to, self.amount))),
-                        "label": format!("Send {}", t.symbol), "meta": meta })
-            }
-            _ => json!({ "to": self.to.to_string(), "value": format!("0x{:x}", self.amount),
-                         "data": "0x", "label": format!("Send {}", self.native_symbol),
-                         "meta": meta }),
-        })
-    }
-}
-
 fn parse_u64_any(s: &str) -> Option<u64> {
-    parse_u256_any(s).and_then(|v| u64::try_from(v).ok())
+    let raw = s.trim();
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse().ok()
+    }
 }
 
 impl EthWalletBackendImpl {
@@ -586,51 +432,6 @@ impl EthWalletBackendImpl {
     /// is an error, never chain 1: every caller here gates, prices or labels on this answer.
     fn settings(&self) -> Result<Settings, String> {
         self.state()?.settings.try_load().map_err(|e| e.to_string())
-    }
-
-    fn active_chain(&self) -> Result<u64, String> {
-        Ok(self.settings()?.active_chain_id)
-    }
-
-    /// Seed a network's transport where eth_rpc has none. `chains.json` is shared with other
-    /// wallets on this device: seeding is ours to do, overwriting is not.
-    fn seed_chain_config(&self, chain_id: u64, rpc_url: &str, b: &Budget) -> Result<(), String> {
-        if rpc_url.trim().is_empty() {
-            return Ok(());
-        }
-        let t = b.take(INIT_BUDGET).ok_or_else(|| "no time left to seed a chain".to_string())?;
-        let cfg = json!({ "endpoint": rpc_url, "timeoutSecs": 8 });
-        let raw = modules()
-            .eth_rpc_module
-            .ensure_chain_config_with_timeout(chain_id as i64, &cfg.to_string(), t)
-            .map_err(|e| format!("{e:?}"))?;
-        expect_ok(&raw).map(|_| ())
-    }
-
-    /// Give eth_rpc a transport for every network without ever overwriting one. Runs at
-    /// startup and, if it did not land, at most once per consumer-facing read after that.
-    /// Four calls, all charged to `b`: the retry must not outlast the read that triggered it.
-    fn ensure_eth_rpc(&self, b: &Budget) {
-        if self.deps.eth_rpc.load(Ordering::Relaxed) {
-            return;
-        }
-        // A url the user set while eth_rpc was down goes in first, so it claims an absent
-        // slot ahead of the built-in default. Both writes only ever fill an absent field.
-        // The settings are copied out first — none of these calls runs under the guard.
-        if let Ok(st) = self.state() {
-            for n in st.settings.try_load().map(|s| s.networks).unwrap_or_default() {
-                let _ = self.seed_chain_config(n.chain_id, &n.rpc_url, b);
-            }
-        }
-        // Keyed and idempotent per chain, so no gate: a store with one chain configured and
-        // another missing still needs seeding.
-        let Some(t) = b.take(INIT_BUDGET) else { return };
-        let Ok(raw) = modules().eth_rpc_module.init_defaults_with_timeout(t) else {
-            return;
-        };
-        if depinit::reply_ok(&raw) {
-            self.deps.eth_rpc.store(true, Ordering::Relaxed);
-        }
     }
 
     /// Relay the keystore's account changes to this module's own subscribers, so a view one
@@ -717,33 +518,6 @@ impl EthWalletBackendImpl {
         });
     }
 
-    /// Arm the gate feed. Everything the mode cache is allowed to remember rests on this
-    /// subscription: it is what turns "verification is off for this chain" from a reading
-    /// taken once into a fact someone is obliged to correct.
-    ///
-    /// Holding the subscription handle is NOT that fact. A subscription taken from
-    /// `on_context_ready` is deferred until eth_rpc listens, so the handle exists across a
-    /// window in which nobody would tell us the user switched verification ON. Only the
-    /// runtime's per-module status channel separates the two, so a runtime without one
-    /// latches the cache cold instead and every gated read pays its own probe.
-    fn watch_gate(&self) {
-        if self.feeds.gate.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let cache = self.gate.clone();
-        if !gate::status_channel(&logos_rust_sdk::protocol_version()) {
-            // No one here can say when a subscription arms or dies, and a handle that merely
-            // exists is not an arm. Latched for the process, which makes `feed_live` inert.
-            cache.no_status_channel();
-            eprintln!(
-                "eth_wallet_backend: logos-protocol {} carries no per-module subscription \
-                 status channel; the verified-proxy gate reads live on every check",
-                logos_rust_sdk::protocol_version()
-            );
-        }
-        listen(self.feeds.gate.clone(), cache, |cache| gate_feed(&cache));
-    }
-
     /// Arm the chain-config feed. Freshness only — `list_networks` serves eth_rpc's record,
     /// and this is how a view learns the other app moved an endpoint. The gate invalidation
     /// is belt and braces: a config change that did not move the mode cannot alter a verdict,
@@ -757,38 +531,66 @@ impl EthWalletBackendImpl {
             self.feeds.chains.store(false, Ordering::SeqCst);
             return;
         };
-        let cache = self.gate.clone();
         listen(self.feeds.chains.clone(), sub, move |sub| {
             for ev in sub {
                 if let Some(e) = eth_rpc_module::EthRpcModuleClient::decode_chain_config_changed(&ev)
                 {
-                    cache.invalidate(e.chain_id as u64);
                     emit_networks_changed(e.chain_id);
                 }
             }
         });
     }
 
-    /// Relay token_list's catalogue changes as this module's own `tokens_changed`. Same
-    /// argument as the keystore relay: the rows this wallet OFFERS on a chain are that
-    /// catalogue filtered by local settings, so a token another app imported moves them, and
-    /// the view can subscribe to us but not to token_list. `config_changed` is deliberately
-    /// not relayed — a proxy or interval edit moves no row, and the one field that does
-    /// (`useEmbeddedList`) already comes back as `tokens_updated` per chain that moved.
-    fn watch_token_list(&self) {
+    fn watch_scope(&self) {
+        if self.feeds.scope.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut c = modules().eth_rpc_module;
+        let Ok(sub) = c.on_network_scope_changed() else {
+            self.feeds.scope.store(false, Ordering::SeqCst);
+            return;
+        };
+        listen(self.feeds.scope.clone(), sub, |sub| {
+            for ev in sub {
+                if eth_rpc_module::EthRpcModuleClient::decode_network_scope_changed(&ev).is_some() {
+                    emit_networks_changed(-1);
+                }
+            }
+        });
+    }
+
+    fn watch_chain_enabled(&self) {
+        if self.feeds.enabled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut c = modules().eth_rpc_module;
+        let Ok(sub) = c.on_chain_enabled_changed() else {
+            self.feeds.enabled.store(false, Ordering::SeqCst);
+            return;
+        };
+        listen(self.feeds.enabled.clone(), sub, |sub| {
+            for ev in sub {
+                if let Some(e) = eth_rpc_module::EthRpcModuleClient::decode_chain_enabled_changed(&ev) {
+                    emit_networks_changed(e.chain_id);
+                }
+            }
+        });
+    }
+
+    /// Relay the assets module's composed offered-set event. It already joins token-list
+    /// membership with chain-native metadata, so the wallet observes one authoritative feed.
+    fn watch_assets(&self) {
         if self.feeds.tokens.swap(true, Ordering::SeqCst) {
             return;
         }
-        let mut t = modules().token_list_module;
-        let Ok(sub) = t.on_tokens_updated() else {
+        let mut assets = modules().evm_assets_module;
+        let Ok(sub) = assets.on_offered_changed() else {
             self.feeds.tokens.store(false, Ordering::SeqCst);
             return;
         };
         listen(self.feeds.tokens.clone(), sub, |sub| {
             for ev in sub {
-                if let Some(e) =
-                    token_list_module::TokenListModuleClient::decode_tokens_updated(&ev)
-                {
+                if let Some(e) = evm_assets_module::EvmAssetsModuleClient::decode_offered_changed(&ev) {
                     emit_tokens_changed(e.chain_id);
                 }
             }
@@ -830,12 +632,8 @@ impl EthWalletBackendImpl {
         let Some(t) = b.take(PROBE_BUDGET) else {
             return verified::unknown_verdict(chain_id, "this read's budget ran out");
         };
-        self.watch_gate();
-        let ticket = self.gate.ticket();
         let raw = modules().eth_rpc_module.verified_proxy_status_with_timeout(chain_id as i64, t);
-        let v = Self::verdict_of(chain_id, raw);
-        self.gate.learned(chain_id, v.get("mode").and_then(Value::as_str), ticket);
-        v
+        Self::verdict_of(chain_id, raw)
     }
 
     fn verdict_of(chain_id: u64, raw: Result<String, impl std::fmt::Debug>) -> Value {
@@ -849,198 +647,35 @@ impl EthWalletBackendImpl {
         }
     }
 
-    /// Whether `chain_id` may be read. `Err` carries the verdict to return to the caller:
-    /// with verification required and the proxy not usable, this wallet shows no chain data
-    /// at all — not stale numbers, not zeros, not a clear-net read.
-    ///
-    /// [`Gate::Open`] skips the hop entirely, and only ever for a chain whose mode eth_rpc
-    /// has told us is `off` — where its own `blocking` is `mode_required && !usable`, so the
-    /// answer cannot depend on the proxy health this would have probed. Every other chain,
-    /// and every chain we are not certain about, is read live and refuses on its own.
-    ///
-    /// Charged to the SAME budget as the calls behind it, so the gate is time the method's
-    /// own allowance can see rather than twenty seconds in front of it.
-    fn verified_gate_within(&self, chain_id: u64, b: &Budget) -> Result<(), Value> {
-        if self.gate.gate(chain_id) == Gate::Open {
-            return Ok(());
+    /// Ask the reusable asset module to resolve units, check one ERC-20 balance when needed,
+    /// and build the single unsigned call. It receives only its slice of the send budget.
+    fn build_transfer(&self, chain_id: u64, request_json: &str, b: &Budget) -> Result<Value, String> {
+        let t = b.take(ASSETS_BUDGET).ok_or("no time left to build the transfer")?;
+        let mut request: Value = serde_json::from_str(request_json)
+            .map_err(|e| format!("invalid send request: {e}"))?;
+        let object = request.as_object_mut().ok_or("send request must be a JSON object")?;
+        if let Some(deadline) = callee_deadline(t) {
+            object.insert("deadlineMs".into(), json!(deadline));
         }
-        Self::gate_of(self.verified_verdict_within(chain_id, b))
+        assets_reply(modules().evm_assets_module.build_transfer_with_timeout(
+            chain_id as i64, &request.to_string(), t,
+        ))
     }
 
-    fn gate_of(v: Value) -> Result<(), Value> {
-        if verified::is_blocking(&v) {
-            Err(v)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// `token_list` entries for the rows `chain_id` OFFERS, keyed by lowercased address.
-    /// Asked by address — a mainnet `get_tokens` is ~86 KB to decorate two rows — and bounded:
-    /// enrichment is decoration and must never fail, or stall, the token list.
-    fn list_meta(
-        &self,
-        chain_id: i64,
-        list: &[tokens::Token],
-        b: &Budget,
-    ) -> HashMap<String, Value> {
-        let mut out = HashMap::new();
-        let Some(query) = tokens::meta_query(list) else { return out };
-        let Some(t) = b.take(PROBE_BUDGET) else { return out };
-        let Ok(raw) =
-            modules().token_list_module.get_tokens_by_address_with_timeout(chain_id, &query, t)
-        else {
-            return out;
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&raw) else { return out };
-        for t in v.get("tokens").and_then(Value::as_array).into_iter().flatten() {
-            if let Some(a) = t.get("address").and_then(Value::as_str) {
-                out.insert(a.to_lowercase(), t.clone());
-            }
-        }
-        out
-    }
-
-    /// Everything `token_list` holds for `chain_id`, and — separately — why it could not be
-    /// asked. Two values rather than one empty vector: on sepolia and hoodi an empty catalogue
-    /// is the ORDINARY answer, and a caller that cannot tell it from a failed call shows
-    /// "this network has no tokens" for what is really an outage.
-    fn chain_catalogue(&self, chain_id: i64, b: &Budget) -> (Vec<Value>, Option<String>) {
-        self.watch_token_list();
-        let Some(t) = b.take(CATALOGUE_BUDGET) else {
-            return (Vec::new(), Some("this read ran out of time before token_list was asked".into()));
-        };
-        let raw = match modules().token_list_module.get_tokens_with_timeout(chain_id, t) {
-            Ok(r) => r,
-            Err(e) => return (Vec::new(), Some(format!("{e:?}"))),
-        };
-        let v: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => return (Vec::new(), Some(format!("unreadable token_list reply: {e}"))),
-        };
-        match v.get("tokens").and_then(Value::as_array) {
-            Some(a) => (a.clone(), None),
-            None => (
-                Vec::new(),
-                Some(
-                    v.get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("token_list returned no token list")
-                        .to_string(),
-                ),
-            ),
-        }
-    }
-
-    /// The record `token_list` holds for one address on one chain — the snapshot the enabled
-    /// set stores — or why there is none.
-    ///
-    /// This is THE gate on the enabled set. An address the list cannot describe is not
-    /// enabled, because `decimals` would have to be invented and a wrong one mis-scales every
-    /// amount by a power of ten — on the screen and in what the user signs.
-    fn snapshot(&self, chain_id: i64, address: &str, b: &Budget) -> Result<Token, String> {
-        let query = serde_json::to_string(&[address]).map_err(|e| e.to_string())?;
-        let t = b.take(PROBE_BUDGET).ok_or("this read ran out of time before token_list was asked")?;
-        let raw = modules()
-            .token_list_module
-            .get_tokens_by_address_with_timeout(chain_id, &query, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        let rows = v.get("tokens").and_then(Value::as_array).cloned().unwrap_or_default();
-        tokens::snapshot_of(chain_id as u64, address, &rows).ok_or_else(|| {
-            format!(
-                "token_list does not hold {address} on chain {chain_id}, so this wallet cannot \
-                 say what its amounts mean — a token it cannot describe is one it must not offer"
-            )
-        })
-    }
-
-    /// Resolve a send: the token, the amount in its units, and — for an ERC-20 — whether the
-    /// account holds it. Pure of side effects. What the sender cannot know is decided here;
-    /// what it can (the fee, the ether, the nonce) is left to it.
-    fn resolve(&self, req: &SendRequest, chain_id: u64, b: &Budget) -> Result<Resolved, String> {
-        let from = req.from.trim().parse::<alloy::primitives::Address>()
-            .map_err(|e| format!("invalid `from` address: {e}"))?;
-        let to = req.to.trim().parse::<alloy::primitives::Address>()
-            .map_err(|e| format!("invalid `to` address: {e}"))?;
-        // The token first: `amountUnits` cannot be scaled until its decimals are known. The
-        // offered set is the SAME one the balance list reads, enabled tokens included, so a
-        // token the wallet shows a balance for can always be sent.
-        let settings = self.settings()?;
-        // Address first, and a symbol only while it names ONE contract: `tokens::resolve`
-        // refuses an ambiguous one instead of taking the first row, which is how a send
-        // reached the wrong asset for a user holding both tokens that call themselves LIT.
-        let addr = req.token_address.as_deref().map(str::trim).filter(|a| !a.is_empty());
-        let token = match (addr, &req.token) {
-            (Some(a), _) => Some(
-                tokens::by_address(chain_id, a, settings.enabled_tokens(chain_id))
-                    .ok_or_else(|| format!("no token at {a} is offered on chain {chain_id}"))?,
-            ),
-            (None, Some(k)) => {
-                Some(tokens::resolve(chain_id, k, settings.enabled_tokens(chain_id))?)
-            }
-            (None, None) => None,
-        };
-        let native_symbol =
-            networks::by_chain_id(chain_id).map(|n| n.native_symbol).unwrap_or("ETH").to_string();
-        let decimals = token.as_ref().map(|t| t.decimals).unwrap_or(18);
-        let symbol =
-            token.as_ref().map(|t| t.symbol.clone()).unwrap_or_else(|| native_symbol.clone());
-        let amount = units::resolve_amount(
-            req.amount.as_deref(),
-            req.amount_units.as_deref(),
-            decimals,
-            &symbol,
-        )?;
-
-        // The sender charges the fee against ether. An ERC-20 send is checked against the
-        // token itself here: without it an over-large transfer is approved, broadcast,
-        // reverts on chain and burns the gas.
-        let mut token_route = None;
-        if let Some(t) = token.as_ref().filter(|t| !t.native) {
-            let addr = t.address.as_deref().unwrap_or_default()
-                .parse::<alloy::primitives::Address>()
-                .map_err(|e| format!("token has an unparseable address: {e}"))?;
-            let (held, r) = self.token_balance(chain_id, addr, from, b)?;
-            token_route = r;
-            send::token_affordable(held, amount, &t.symbol, t.decimals)?;
-        }
-
-        Ok(Resolved { chain_id, from, to, amount, token, decimals, symbol, native_symbol, token_route })
-    }
-
-    fn token_balance(
-        &self,
-        chain_id: u64,
-        token: alloy::primitives::Address,
-        owner: alloy::primitives::Address,
-        b: &Budget,
-    ) -> Result<(U256, Option<String>), String> {
-        let call = json!({
-            "to": token.to_string(),
-            "data": format!("0x{}", hex::encode(txbuild::erc20_balance_of_calldata(owner))),
-        });
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the token balance")?;
-        let raw = modules()
-            .eth_rpc_module
-            .call_with_timeout(chain_id as i64, &call.to_string(), callee_deadline(t), t)
-            .map_err(|e| format!("{e:?}"))?;
-        let a = unwrap_answer(&raw)?;
-        let v = a.value.as_str()
-            .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
-            .as_deref()
-            .and_then(txbuild::decode_uint256)
-            .ok_or_else(|| "could not read the token balance".to_string())?;
-        Ok((v, a.route))
-    }
-
-    /// The request `tx_sender_module` takes for a resolved send: one call, the fee controls
-    /// as the caller gave them, and the sender's own allowance cut to what is left here.
-    fn sender_request(r: &Resolved, req: &SendRequest, t: std::time::Duration) -> Result<Value, String> {
+    /// Convert a built asset transfer into the sender's request without reinterpreting any
+    /// asset fact. Fee controls remain the wallet caller's choice.
+    fn built_sender_request(
+        built: &Value,
+        req: &SendRequest,
+        t: std::time::Duration,
+    ) -> Result<Value, String> {
+        let calls = built.get("calls").and_then(Value::as_array)
+            .filter(|calls| calls.len() == 1).cloned()
+            .ok_or("evm_assets_module did not build exactly one call")?;
         let mut v = json!({
-            "chainId": r.chain_id,
-            "from": r.from.to_string(),
-            "calls": [r.call()?],
+            "chainId": built.get("chainId").cloned().unwrap_or(Value::Null),
+            "from": built.get("from").cloned().unwrap_or(Value::Null),
+            "calls": calls,
         });
         if let Some(x) = &req.tier { v["tier"] = json!(x); }
         if let Some(x) = &req.max_fee_per_gas { v["maxFeePerGas"] = json!(x); }
@@ -1051,102 +686,76 @@ impl EthWalletBackendImpl {
         Ok(v)
     }
 
-    /// Have the sender price the resolved send. Its reply carries the nonce, the gas limit,
-    /// the fee and the ether check; this module's reply wraps them around the token.
-    fn sender_prepare(&self, r: &Resolved, req: &SendRequest, b: &Budget) -> Result<Value, String> {
-        let t = b.take(SENDER_BUDGET).ok_or("no time left to price the send")?;
-        let request = Self::sender_request(r, req, t)?;
-        sender_reply(modules().tx_sender_module.prepare_with_timeout(&request.to_string(), t))
-    }
-
-    /// The `prepare_send` reply: the resolved transfer, plus what the sender priced it at.
-    fn quote_reply(r: &Resolved, priced: &Value) -> Value {
-        let mut v = json!({
-            "ok": true, "chainId": r.chain_id,
-            "from": r.from.to_string(), "to": r.to.to_string(),
-            "amount": r.amount.to_string(),
-            "amountSymbol": r.symbol,
-            "amountDecimals": r.decimals,
-            "nativeSymbol": r.native_symbol,
-            "token": r.token.as_ref().map(|t| t.symbol.clone()),
-            // WHICH contract the send will call, resolved. A symbol cannot say it: two tokens
-            // can share one, so a confirmation step showing only the symbol cannot reveal
-            // that the wrong asset is about to move. Null for a native send.
-            "tokenAddress": r.token_address(),
-            "nonce": priced.get("nonce").cloned().unwrap_or(Value::Null),
-            "gasLimit": priced.get("gasLimit").cloned().unwrap_or(Value::Null),
-            "maxFeePerGas": priced.get("maxFeePerGas").cloned().unwrap_or(Value::Null),
-            "maxPriorityFeePerGas": priced.get("maxPriorityFeePerGas").cloned().unwrap_or(Value::Null),
-            "feeSource": priced.get("feeSource").cloned().unwrap_or(json!("unknown")),
-            // `route` covers the sender's balance and nonce reads and this module's token
-            // read; the weakest of them. The fee is fee_module's, which emits no label, so it
-            // is never proof-backed whatever `route` says.
-            "route": verified::weakest_route(&[
-                priced.get("route").and_then(Value::as_str),
-                r.token_route.as_deref(),
-            ]),
-            "feeRoute": verified::UNKNOWN_ROUTE,
-        });
-        // The ceiling and the worst case, as the sender computed them, in the sender's own
-        // decoration: `maxFeePerGas × gasLimit` is a ceiling, never a price.
+    /// The assets module owns transfer facts; the sender owns nonce and pricing. This joins
+    /// their replies and folds the route without reconstructing either answer.
+    fn built_quote_reply(built: &Value, priced: &Value) -> Value {
+        let mut v = built.clone();
+        v.as_object_mut().map(|object| { object.remove("calls"); object.remove("purpose"); });
+        v["amountSymbol"] = built.get("symbol").cloned().unwrap_or(Value::Null);
+        v["amountDecimals"] = built.get("decimals").cloned().unwrap_or(Value::Null);
+        v["token"] = if built.get("native").and_then(Value::as_bool) == Some(true) {
+            Value::Null
+        } else {
+            built.get("symbol").cloned().unwrap_or(Value::Null)
+        };
+        for key in ["nonce", "gasLimit", "maxFeePerGas", "maxPriorityFeePerGas", "feeSource"] {
+            v[key] = priced.get(key).cloned().unwrap_or(Value::Null);
+        }
         for key in ["maxCostWei", "feeCeilingWei"] {
             for suffix in ["", "Display", "Exact"] {
-                let k = format!("{key}{suffix}");
-                if let Some(x) = priced.get(&k) {
-                    v[k] = x.clone();
-                }
+                let field = format!("{key}{suffix}");
+                if let Some(value) = priced.get(&field) { v[field] = value.clone(); }
             }
         }
-        units::decorate(&mut v, "amount", &r.amount.to_string(), Some(r.decimals));
+        v["route"] = json!(verified::weakest_route(&[
+            built.get("route").and_then(Value::as_str),
+            priced.get("route").and_then(Value::as_str),
+        ]));
+        v["feeRoute"] = json!(verified::UNKNOWN_ROUTE);
         v
     }
 
-    /// The sends THIS wallet made that a human has not answered yet, or an empty list when
-    /// the sender cannot be asked — a sender that is down holds nothing.
-    fn own_sends_in_flight(&self, b: &Budget) -> Vec<Value> {
-        let Some(t) = b.take(RPC_BUDGET) else { return Vec::new() };
-        let Ok(v) = sender_reply(modules().tx_sender_module.live_sends_with_timeout(t)) else {
-            return Vec::new();
-        };
-        v.get("sends")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter(|s| s.get("origin").and_then(Value::as_str) == Some(OWN_NAME))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The endpoint eth_rpc holds for `chain_id`, empty when it has none or when `b` had no
-    /// time left to ask. Read, never written: that store is shared with every wallet on the
-    /// device and `eth_rpc_ui` owns it.
-    fn chain_endpoint(&self, chain_id: u64, b: &Budget) -> String {
-        let Some(t) = b.take(PROBE_BUDGET) else { return String::new() };
-        modules()
+    fn chain_configs(&self, b: &Budget) -> Result<(String, Vec<Value>), String> {
+        let t = b.take(PROBE_BUDGET).ok_or("no time left to read the chain registry")?;
+        let raw = modules()
             .eth_rpc_module
-            .get_chain_config_with_timeout(chain_id as i64, t)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
-            .and_then(|v| Some(v.get("config")?.get("endpoint")?.as_str()?.to_string()))
-            .unwrap_or_default()
+            .list_chain_configs_with_timeout(t)
+            .map_err(|e| format!("{e:?}"))?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(v.to_string());
+        }
+        let scope = v.get("scope").and_then(Value::as_str).unwrap_or("mainnets").to_string();
+        let chains = v.get("chains").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok((scope, chains))
     }
 
-    /// One network entry. Endpoint and mode both come out of eth_rpc rather than a local
-    /// copy — one source of truth, and no way for the two to disagree. Two IPC calls, both
-    /// charged to `b`, and neither may run under the state guard.
-    fn network_json(&self, chain_id: u64, b: &Budget) -> Value {
-        let net = networks::by_chain_id(chain_id);
+    fn in_scope_chain(&self, chain_id: u64, b: &Budget) -> Result<Value, String> {
+        let (_, records) = self.chain_configs(b)?;
+        records
+            .into_iter()
+            .find(|v| {
+                v.get("chainId").and_then(Value::as_u64) == Some(chain_id)
+                    && v.get("inScope").and_then(Value::as_bool) == Some(true)
+            })
+            .ok_or_else(|| format!("chain {chain_id} is not enabled in the current network scope"))
+    }
+
+    /// One network entry, preserving the wallet's existing public shape while sourcing every
+    /// chain fact from eth_rpc's registry.
+    fn network_json(&self, record: &Value, b: &Budget) -> Value {
+        let chain_id = record.get("chainId").and_then(Value::as_u64).unwrap_or_default();
         let vp = self.verified_verdict_within(chain_id, b);
         json!({
             "chainId": chain_id,
-            "key": net.map(|n| n.key).unwrap_or_default(),
-            "name": net.map(|n| n.name).unwrap_or_default(),
-            "nativeSymbol": net.map(|n| n.native_symbol).unwrap_or_default(),
-            "testnet": net.map(|n| n.testnet).unwrap_or(false),
-            "rpcUrl": self.chain_endpoint(chain_id, b),
+            "key": "",
+            "name": record.get("name").cloned().unwrap_or(Value::Null),
+            "nativeSymbol": record.get("nativeSymbol").cloned().unwrap_or(Value::Null),
+            "nativeDecimals": record.get("nativeDecimals").cloned().unwrap_or(Value::Null),
+            "testnet": record.get("testnet").cloned().unwrap_or(Value::Null),
+            "rpcUrl": record.get("endpoint").cloned().unwrap_or(json!("")),
+            "enabled": record.get("enabled").cloned().unwrap_or(json!(true)),
+            "inScope": record.get("inScope").cloned().unwrap_or(json!(false)),
             "verifiedProxyMode": vp.get("mode").and_then(Value::as_str).unwrap_or("unknown"),
             "verifiedProxy": vp,
         })
@@ -1162,178 +771,129 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         if let Ok(mut g) = self.state.write() {
             *g = Some(Arc::new(State { settings, contacts }));
         }
-        // eth_rpc first: every balance, fee and send goes through it while token_list only
-        // decorates. Neither may fail startup, and neither writes over an existing config.
-        // ONE budget across both: the host is blocked in here, and six individually bounded
-        // calls still add up to ~26s. What does not fit is retried on the first read.
+        // Token-list initialization is best effort and remains inside one startup budget.
         let b = Budget::new(STARTUP_BUDGET);
-        self.ensure_eth_rpc(&b);
         self.ensure_token_list(&b);
         // After the state above exists: the relay's first act is a `list_accounts`, and a
         // consumer must never be told to re-read before this module can answer.
         self.watch_keystore();
         self.watch_sender();
-        // Arm before the first gated read rather than on it: the gate cache may only trust an
-        // answer read after its feed existed, so arming late costs a live read per chain.
-        self.watch_gate();
         self.watch_chain_config();
-        self.watch_token_list();
+        self.watch_chain_enabled();
+        self.watch_scope();
+        self.watch_assets();
     }
 
     fn list_networks(&self) -> String {
         let b = Budget::new(READ_BUDGET);
-        self.ensure_eth_rpc(&b);
         self.watch_chain_config();
-        // Copy out the one field this needs and drop the guard: ten outbound calls held
-        // under a read lock is how one slow dependency stalls every other reader.
-        let active = match self.active_chain() {
-            Ok(id) => id,
+        self.watch_chain_enabled();
+        self.watch_scope();
+        let (scope, all) = match self.chain_configs(&b) {
+            Ok(v) => v,
             Err(e) => return err(e),
         };
-        // Active network first so a short budget degrades the other two to `unknown` rather
-        // than the one the view is showing. The reply keeps the table's own order.
-        let mut order: Vec<usize> = (0..networks::ALL.len()).collect();
-        order.sort_by_key(|&i| networks::ALL[i].chain_id != active);
-        let mut built: Vec<Option<Value>> = vec![None; networks::ALL.len()];
-        for i in order {
-            built[i] = Some(self.network_json(networks::ALL[i].chain_id, &b));
-        }
-        let list: Vec<Value> = built.into_iter().flatten().collect();
-        json!({ "ok": true, "activeChainId": active, "networks": list }).to_string()
+        let configured: Vec<Value> = all.iter().map(|record| self.network_json(record, &b)).collect();
+        let networks: Vec<Value> = configured.iter()
+            .filter(|record| record.get("inScope").and_then(Value::as_bool) == Some(true))
+            .cloned().collect();
+        json!({ "ok": true, "scope": scope, "networks": networks,
+                "configuredNetworks": configured }).to_string()
     }
 
-    fn get_active_network(&self) -> String {
-        let b = Budget::new(READ_BUDGET);
-        // `network_json` is two IPC calls, so it runs against a released guard.
-        match self.active_chain() {
-            Ok(id) => json!({ "ok": true, "network": self.network_json(id, &b) }).to_string(),
-            Err(e) => err(e),
-        }
-    }
-
-    fn set_active_chain(&self, chain_id: i64) -> String {
+    fn set_chain_enabled(&self, chain_id: i64, enabled: bool) -> String {
         if chain_id < 0 {
             return err(format!("chain {chain_id} is not a valid chain id"));
         }
-        let st = match self.state() {
-            Ok(st) => st,
-            Err(e) => return err(e),
-        };
-        // A send this wallet made and a human has not answered names the network it was
-        // built for; moving the wallet under it would have them approve for a chain the
-        // wallet no longer shows. Only this wallet's own sends hold it — another app's is
-        // sent on its own chain either way.
         let b = Budget::new(READ_BUDGET);
-        if let Some(live) = self.own_sends_in_flight(&b).first() {
-            let on = live.get("chainId").and_then(Value::as_u64).unwrap_or(0);
-            let name = networks::by_chain_id(on).map(|n| n.name.to_string()).unwrap_or_else(|| on.to_string());
-            let id = live.get("requestId").and_then(Value::as_str).unwrap_or_default();
-            return err(format!("cannot switch network while a send is awaiting approval on {name} ({id})"));
+        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to update the chain") };
+        match modules().eth_rpc_module.set_chain_enabled_with_timeout(chain_id, enabled, t) {
+            Ok(reply) => reply,
+            Err(e) => err(format!("eth_rpc_module: {e:?}")),
         }
-        match st.settings.set_active_chain(chain_id as u64) {
-            Ok(a) => {
-                if a.changed {
-                    emit_active_chain_changed(chain_id);
-                }
-                json!({ "ok": true, "activeChainId": a.settings.active_chain_id }).to_string()
-            }
-            Err(e) => err(e),
+    }
+
+    fn set_network_scope(&self, scope: String) -> String {
+        let b = Budget::new(READ_BUDGET);
+        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to update the network scope") };
+        match modules().eth_rpc_module.set_network_scope_with_timeout(&scope, t) {
+            Ok(reply) => reply,
+            Err(e) => err(format!("eth_rpc_module: {e:?}")),
         }
     }
 
     fn verified_proxy_state(&self) -> String {
-        let b = Budget::new(VERDICT_BUDGET);
-        match self.active_chain() {
-            Ok(id) => self.verified_verdict_within(id, &b).to_string(),
-            Err(e) => err(e),
-        }
+        let b = Budget::new(READ_BUDGET);
+        let (_, records) = match self.chain_configs(&b) { Ok(v) => v, Err(e) => return err(e) };
+        let chains: Vec<Value> = records.into_iter()
+            .filter(|record| record.get("inScope").and_then(Value::as_bool) == Some(true))
+            .filter_map(|record| record.get("chainId").and_then(Value::as_u64))
+            .map(|chain_id| json!({
+                "chainId": chain_id,
+                "verdict": self.verified_verdict_within(chain_id, &b),
+            }))
+            .collect();
+        json!({ "ok": true, "chains": chains }).to_string()
     }
 
-    fn list_tokens(&self) -> String {
+    fn list_tokens(&self, chain_id: i64) -> String {
+        if chain_id < 0 {
+            return err(format!("chain {chain_id} is not a valid chain id"));
+        }
         let b = Budget::new(READ_BUDGET);
-        self.ensure_token_list(&b);
         let s = match self.settings() {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        let id = s.active_chain_id;
-        let list = tokens::for_chain(id, s.enabled_tokens(id));
-        let meta = self.list_meta(id as i64, &list, &b);
-        json!({ "ok": true, "chainId": id, "tokenSort": s.token_sort.as_str(),
-                "tokens": tokens::enrich(id, &list, &meta) })
-        .to_string()
+        let id = chain_id as u64;
+        if let Err(e) = self.in_scope_chain(id, &b) { return err(e); }
+        let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to read offered assets") };
+        match assets_reply(modules().evm_assets_module.list_offered_with_timeout(id as i64, t)) {
+            Ok(mut reply) => {
+                reply["tokenSort"] = json!(s.token_sort.as_str());
+                reply.to_string()
+            }
+            Err(e) => err(e),
+        }
     }
 
     fn list_available_tokens(&self, chain_id: i64, query: String, offset: i64, limit: i64) -> String {
-        if chain_id < 0 || !networks::is_supported(chain_id as u64) {
-            return err(format!("chain {chain_id} is not one of this wallet's networks"));
+        if chain_id < 0 {
+            return err(format!("chain {chain_id} is not a valid chain id"));
         }
         let b = Budget::new(READ_BUDGET);
-        self.ensure_token_list(&b);
         let chain_id = chain_id as u64;
+        if let Err(e) = self.in_scope_chain(chain_id, &b) { return err(e); }
         let s = match self.settings() {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        let (listed, list_error) = self.chain_catalogue(chain_id as i64, &b);
-        // A non-positive limit is no limit: "show me everything" needs a spelling, and zero
-        // meaning "nothing" would make an off-by-one in a caller look like an empty chain.
-        let cut = usize::try_from(limit).ok().filter(|n| *n > 0);
-        let offset = usize::try_from(offset).unwrap_or(0);
-        let (total, rows) =
-            tokens::available(chain_id, &listed, s.enabled_tokens(chain_id), &query, offset, cut);
-        let has_more = offset.saturating_add(rows.len()) < total;
-        let mut v = json!({ "ok": true, "chainId": chain_id, "tokenSort": s.token_sort.as_str(),
-                            "total": total, "offset": offset, "shown": rows.len(),
-                            "hasMore": has_more, "listed": listed.len(), "tokens": rows });
-        // Only when the call itself failed. Its ABSENCE is what makes `listed: 0` readable as
-        // "this chain has none" — the ordinary answer on sepolia and hoodi.
-        if let Some(e) = list_error {
-            v["listError"] = json!(e);
+        let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to read the token picker") };
+        match assets_reply(modules().evm_assets_module.list_available_with_timeout(
+            chain_id as i64, &query, offset, limit, t,
+        )) {
+            Ok(mut reply) => {
+                reply["tokenSort"] = json!(s.token_sort.as_str());
+                reply.to_string()
+            }
+            Err(e) => err(e),
         }
-        v.to_string()
     }
 
     fn set_token_enabled(&self, chain_id: i64, address: String, enabled: bool) -> String {
-        if chain_id < 0 || !networks::is_supported(chain_id as u64) {
-            return err(format!("chain {chain_id} is not one of this wallet's networks"));
+        if chain_id < 0 {
+            return err(format!("chain {chain_id} is not a valid chain id"));
         }
         let b = Budget::new(READ_BUDGET);
-        // Normalised once, before anything is asked or written: token_list matches an address
-        // case-insensitively and the store keeps one casing, so both halves must agree on
-        // which 20 bytes are meant.
-        let addr = match address.trim().parse::<alloy::primitives::Address>() {
-            Ok(a) => a.to_string(),
-            Err(e) => return err(format!("'{}' is not a token address: {e}", address.trim())),
-        };
-        let st = match self.state() {
-            Ok(st) => st,
-            Err(e) => return err(e),
-        };
-        // A built-in row is offered unconditionally, so turning it on costs no round trip and
-        // stores nothing. Turning it off is the store's refusal to make.
-        if enabled && tokens::is_builtin(chain_id as u64, &addr) {
-            return json!({ "ok": true }).to_string();
+        if let Err(e) = self.in_scope_chain(chain_id as u64, &b) {
+            return err(e);
         }
-        let outcome = if enabled {
-            self.ensure_token_list(&b);
-            match self.snapshot(chain_id, &addr, &b) {
-                Ok(t) => st.settings.enable_token(chain_id as u64, t),
-                Err(e) => return err(e),
-            }
-        } else {
-            st.settings.disable_token(chain_id as u64, &addr)
-        };
-        match outcome {
-            Ok(a) => {
-                // After the write, and only when it moved: re-enabling a row whose snapshot
-                // is already stored offers nothing new.
-                if a.changed {
-                    emit_tokens_changed(chain_id);
-                }
-                json!({ "ok": true }).to_string()
-            }
-            Err(e) => err(e),
+        self.watch_assets();
+        self.ensure_token_list(&b);
+        let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to update the token set") };
+        match modules().token_list_module.set_token_enabled_with_timeout(chain_id, &address, enabled, t) {
+            Ok(reply) => reply,
+            Err(e) => err(format!("token_list_module: {e:?}")),
         }
     }
 
@@ -1372,49 +932,11 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn get_account_wallets(&self) -> String {
-        // Bounded, unlike its two siblings: they are one passthrough call each, this is two,
-        // so an unbounded pair could hold the host for twice the protocol's own default.
-        let b = Budget::new(READ_BUDGET);
         self.watch_keystore();
-        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to read the wallets") };
-        let provenance = match modules().keystore_module.get_provenance_with_timeout(t) {
-            Ok(r) => r,
-            Err(e) => return err(format!("{e:?}")),
-        };
-        let Some(t) = b.take(RPC_BUDGET) else { return err("no time left to name the wallets") };
-        let labels = match modules().keystore_module.get_group_labels_with_timeout(t) {
-            Ok(r) => r,
-            Err(e) => return err(format!("{e:?}")),
-        };
-        let provenance: Value = match serde_json::from_str(&provenance) {
-            Ok(v) => v,
-            Err(e) => return err(e.to_string()),
-        };
-        let labels: Value = match serde_json::from_str(&labels) {
-            Ok(v) => v,
-            Err(e) => return err(e.to_string()),
-        };
-        let by_group = labels.get("labels").and_then(Value::as_object);
-        let accounts = provenance.get("accounts").and_then(Value::as_object);
-        let mut wallets = serde_json::Map::new();
-        if let (Some(accounts), Some(by_group)) = (accounts, by_group) {
-            for (address, row) in accounts {
-                let Some(group) = row.get("group").and_then(Value::as_str) else { continue };
-                // An unnamed wallet contributes nothing: the view's fallback is the address,
-                // and an empty string here would read as a name that happens to be blank.
-                match by_group.get(group).and_then(Value::as_str) {
-                    Some(name) if !name.trim().is_empty() => {
-                        let mut entry = json!({ "wallet": name });
-                        if let Some(i) = row.get("index").and_then(Value::as_i64) {
-                            entry["index"] = json!(i);
-                        }
-                        wallets.insert(address.clone(), entry);
-                    }
-                    _ => {}
-                }
-            }
+        match modules().keystore_module.get_account_wallets() {
+            Ok(reply) => reply,
+            Err(e) => err(format!("{e:?}")),
         }
-        json!({ "ok": true, "wallets": wallets }).to_string()
     }
 
     fn list_contacts(&self) -> String {
@@ -1451,101 +973,76 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn get_balances(&self, address: String) -> String {
-        // ONE allowance across the retry, the gate and the Multicall3 read. An unbounded probe
-        // in front of a read is time a user waits that the method's own budget cannot see.
-        let b = Budget::new(BALANCES_BUDGET);
-        self.ensure_eth_rpc(&b);
         let settings = match self.settings() {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        let chain_id = settings.active_chain_id;
-        if let Err(v) = self.verified_gate_within(chain_id, &b) {
-            return blocked(&v).to_string();
-        }
-        let owner = match address.trim().parse::<alloy::primitives::Address>() {
-            Ok(a) => a,
-            Err(e) => return err(format!("invalid address: {e}")),
-        };
-
-        // Every offered token, enabled ones included — so a token the user turned on has a row
-        // even at zero. A token that silently vanishes from the list reads as a lost balance.
-        let list = tokens::for_chain(chain_id, settings.enabled_tokens(chain_id));
-        let mut calls: Vec<(alloy::primitives::Address, Vec<u8>)> = Vec::new();
-        for t in &list {
-            match &t.address {
-                None => calls
-                    .push((txbuild::multicall3_address(), txbuild::multicall3_get_eth_balance_calldata(owner))),
-                Some(a) => match a.parse::<alloy::primitives::Address>() {
-                    Ok(token) => calls.push((token, txbuild::erc20_balance_of_calldata(owner))),
-                    Err(e) => return err(format!("token {} has an unparseable address: {e}", t.symbol)),
-                },
-            }
-        }
-
-        let data = txbuild::multicall3_aggregate3_calldata(&calls);
-        let call = json!({
-            "to": txbuild::multicall3_address().to_string(),
-            "data": format!("0x{}", hex::encode(&data)),
-        });
-        let Some(t) = b.take(RPC_BUDGET) else {
-            return err("no time left to read the balances");
-        };
-        let payload = call.to_string();
-        let raw = match modules().eth_rpc_module.call_with_timeout(chain_id as i64, &payload, callee_deadline(t), t) {
-            Ok(r) => r,
-            Err(e) => return err(format!("{e:?}")),
-        };
-        let Answer { value: result, route } = match unwrap_answer(&raw) {
-            Ok(a) => a,
-            Err(e) => return err(e),
-        };
-        let bytes = match result.as_str().and_then(|s| hex::decode(s.trim_start_matches("0x")).ok()) {
-            Some(b) => b,
-            None => return err("eth_call returned no decodable data"),
-        };
-        let Some(returns) = txbuild::decode_aggregate3_returns(&bytes) else {
-            return err("could not decode the Multicall3 response");
-        };
-
-        // Assembled and sorted in `tokens`, against U256, rather than here: comparing
-        // 18-decimal amounts in QML means parseFloat, and a double loses the digits that
-        // decide the order. Keeping it out of the glue is also what makes it testable —
-        // this file is behind the module feature and `cargo test` never compiles it.
-        let decoded: Vec<Option<String>> = returns
-            .iter()
-            .map(|ret| ret.as_deref().and_then(txbuild::decode_uint256).map(|v| v.to_string()))
-            .collect();
-        let balances = tokens::balance_rows(chain_id, &list, &decoded, settings.token_sort);
-
-        // Deliberately no `balances_updated` here: a read must not announce itself, or the
-        // view's own subscription drives it round again forever.
-        json!({ "ok": true, "chainId": chain_id, "address": address, "balances": balances,
-                "tokenSort": settings.token_sort.as_str(),
-                "route": verified::weakest_route(&[route.as_deref()]) })
-        .to_string()
-    }
-
-    fn get_history(&self, address: String) -> String {
-        let b = Budget::new(HISTORY_BUDGET);
-        let settings = match self.settings() {
-            Ok(s) => s,
-            Err(e) => return err(e),
-        };
-        let chain_id = settings.active_chain_id;
-        let Some(t) = b.take(HISTORY_BUDGET) else { return err("no time left to read the history") };
-        // The sender sweeps due receipts and announces what moved; this read announces
-        // nothing of its own.
-        let mut v = match sender_reply(
-            modules().tx_sender_module.history_with_timeout(&address, chain_id as i64, t),
-        ) {
+        let registry_budget = Budget::new(READ_BUDGET);
+        let (_, records) = match self.chain_configs(&registry_budget) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        // The same offered set the balance list and the send path read, so a transfer in an
-        // enabled token is decoded rather than shown as an unknown contract.
-        rows::decorate_history(&mut v, chain_id, settings.enabled_tokens(chain_id));
-        v.to_string()
+        let ids: Vec<u64> = records.into_iter()
+            .filter(|record| record.get("inScope").and_then(Value::as_bool) == Some(true))
+            .filter_map(|record| record.get("chainId").and_then(Value::as_u64))
+            .collect();
+        // `logos_module` is multi-concurrency and dependency clients are thread-safe. Keep
+        // one handle per chain and join in registry order: wall-clock cost is one bounded
+        // Multicall round trip, while the stable order keeps rendering deterministic.
+        let chains: Vec<Value> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ids.into_iter().map(|chain_id| {
+                let address = &address;
+                let token_sort = settings.token_sort.as_str();
+                (chain_id, scope.spawn(move || {
+                    modules().evm_assets_module.get_balances_with_timeout(
+                        chain_id as i64, address, token_sort, BALANCES_BUDGET,
+                    )
+                }))
+            }).collect();
+            handles.into_iter().map(|(chain_id, handle)| match handle.join() {
+                Ok(Ok(reply)) => match serde_json::from_str::<Value>(&reply) {
+                    Ok(mut value) => {
+                        if value.get("chainId").is_none() { value["chainId"] = json!(chain_id); }
+                        value
+                    }
+                    Err(e) => json!({ "chainId": chain_id, "ok": false,
+                                      "error": format!("unreadable assets reply: {e}") }),
+                },
+                Ok(Err(e)) => json!({ "chainId": chain_id, "ok": false,
+                                      "error": format!("evm_assets_module: {e:?}") }),
+                Err(_) => json!({ "chainId": chain_id, "ok": false,
+                                  "error": "evm_assets_module balance worker panicked" }),
+            }).collect()
+        });
+        json!({ "ok": true, "address": address, "tokenSort": settings.token_sort.as_str(),
+                "chains": chains }).to_string()
+    }
+
+    fn get_history(&self, address: String) -> String {
+        let registry_budget = Budget::new(READ_BUDGET);
+        let (_, records) = match self.chain_configs(&registry_budget) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let ids: std::collections::BTreeSet<u64> = records.into_iter()
+            .filter(|record| record.get("inScope").and_then(Value::as_bool) == Some(true))
+            .filter_map(|record| record.get("chainId").and_then(Value::as_u64))
+            .collect();
+        let b = Budget::new(HISTORY_BUDGET);
+        let Some(t) = b.take(SENDER_BUDGET) else { return err("no time left to read the history") };
+        // Chain zero asks the sender for this address across every chain it has recorded.
+        let history = match sender_reply(
+            modules().tx_sender_module.history_with_timeout(&address, 0, t),
+        ) {
+            Ok(value) => value,
+            Err(e) => return err(e),
+        };
+        let history = history::scope(history, &ids);
+        let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to decorate the history") };
+        match modules().evm_assets_module.decorate_history_with_timeout(&history.to_string(), t) {
+            Ok(reply) => reply,
+            Err(e) => err(format!("evm_assets_module: {e:?}")),
+        }
     }
 
     fn refresh_pending(&self, address: String) -> String {
@@ -1560,19 +1057,17 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Ok(r) => r,
             Err(e) => return err(format!("invalid send request: {e}")),
         };
-        let chain_id = match self.active_chain() {
-            Ok(id) => id,
+        if req.chain_id < 0 { return err(format!("chain {} is not a valid chain id", req.chain_id)); }
+        let chain_id = req.chain_id as u64;
+        if let Err(e) = self.in_scope_chain(chain_id, &b) { return err(e); }
+        let built = match self.build_transfer(chain_id, &request_json, &b) {
+            Ok(built) => built,
             Err(e) => return err(e),
         };
-        if let Err(v) = self.verified_gate_within(chain_id, &b) {
-            return blocked(&v).to_string();
-        }
-        let r = match self.resolve(&req, chain_id, &b) {
-            Ok(r) => r,
-            Err(e) => return err(e),
-        };
-        match self.sender_prepare(&r, &req, &b) {
-            Ok(priced) => Self::quote_reply(&r, &priced).to_string(),
+        let Some(t) = b.take(SENDER_BUDGET) else { return err("no time left to price the send") };
+        let request = match Self::built_sender_request(&built, &req, t) { Ok(v) => v, Err(e) => return err(e) };
+        match sender_reply(modules().tx_sender_module.prepare_with_timeout(&request.to_string(), t)) {
+            Ok(priced) => Self::built_quote_reply(&built, &priced).to_string(),
             Err(e) => err(e),
         }
     }
@@ -1583,33 +1078,21 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Ok(r) => r,
             Err(e) => return err(format!("invalid send request: {e}")),
         };
-        let st = match self.state() {
-            Ok(st) => st,
-            Err(e) => return err(e),
-        };
-        // Read ONCE. Gating on one chain and pricing on another is how a send is checked
-        // against a network it is not on.
-        let chain_id = match st.settings.try_load() {
-            Ok(s) => s.active_chain_id,
-            Err(e) => return err(e.to_string()),
-        };
-        if let Err(v) = self.verified_gate_within(chain_id, &b) {
-            return blocked(&v).to_string();
-        }
-        let r = match self.resolve(&req, chain_id, &b) {
-            Ok(r) => r,
+        if req.chain_id < 0 { return err(format!("chain {} is not a valid chain id", req.chain_id)); }
+        // Read the request's chain once and validate it against the shared registry before
+        // building. The assets reply stamps the same id into the sender request.
+        let chain_id = req.chain_id as u64;
+        if let Err(e) = self.in_scope_chain(chain_id, &b) { return err(e); }
+        let built = match self.build_transfer(chain_id, &request_json, &b) {
+            Ok(built) => built,
             Err(e) => return err(e),
         };
         let Some(t) = b.take(SENDER_BUDGET) else { return err("no time left to request approval") };
-        let mut request = match Self::sender_request(&r, &req, t) {
+        let mut request = match Self::built_sender_request(&built, &req, t) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        // What a human reads at the moment of approval: exact to the last digit and in the
-        // token's own units. Nobody can check a figure denominated in wei.
-        let amount = units::format_exact(&r.amount.to_string(), r.decimals)
-            .unwrap_or_else(|| r.amount.to_string());
-        request["purpose"] = json!(send::purpose(&amount, &r.symbol, &r.from.to_string(), &r.to.to_string()));
+        request["purpose"] = built.get("purpose").cloned().unwrap_or(Value::Null);
         // Deliberately no hash: nothing is signed or broadcast until a human approves. The
         // sender's `{ ok, pending, requestId, handle }` is this module's own reply.
         relay(modules().tx_sender_module.send_with_timeout(&request.to_string(), t))
@@ -1643,19 +1126,16 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         relay(modules().tx_sender_module.tx_details_with_timeout(&address, &hash_hex, t))
     }
 
-    fn suggest_fees(&self) -> String {
-        let b = Budget::new(FEES_BUDGET);
-        let chain_id = match self.active_chain() {
-            Ok(id) => id,
-            Err(e) => return err(e),
-        };
-        if let Err(v) = self.verified_gate_within(chain_id, &b) {
-            return blocked(&v).to_string();
+    fn suggest_fees(&self, chain_id: i64) -> String {
+        if chain_id < 0 {
+            return err(format!("chain {chain_id} is not a valid chain id"));
         }
+        let b = Budget::new(FEES_BUDGET);
+        if let Err(e) = self.in_scope_chain(chain_id as u64, &b) { return err(e); }
         let Some(t) = b.take(RPC_BUDGET) else {
             return err("no time left to price the fee");
         };
-        match modules().fee_module.suggest_fees_with_timeout(chain_id as i64, t) {
+        match modules().fee_module.suggest_fees_with_timeout(chain_id, t) {
             Ok(reply) => reply,
             Err(e) => err(format!("{e:?}")),
         }

@@ -2,7 +2,7 @@
 name = "eth_wallet_backend"
 version = "0.1.0"
 edition = "2021"
-description = "Logos eth_wallet_backend — Ethereum-only wallet coordinator (one active network, fixed token table, Send with full fee control, local history)."
+description = "Logos eth_wallet_backend — multi-chain EVM wallet composer over reusable modules."
 # Pin to the nix toolchain's rustc; resolver "3" then selects MSRV-compatible deps.
 rust-version = "1.89"
 
