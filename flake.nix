@@ -1,5 +1,5 @@
 {
-  description = "Logos eth_wallet_backend — Ethereum-only wallet coordinator (one active network, fixed token table, Send with full fee control).";
+  description = "Logos eth_wallet_backend — multi-chain EVM wallet composer over reusable modules.";
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
@@ -17,23 +17,34 @@
     fee_module = {
       url = "github:logos-co/logos-evm-fee-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
+      inputs.eth_rpc_module.follows = "eth_rpc_module";
     };
     keystore_module = {
       url = "github:logos-co/logos-evm-keystore-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
-    # Metadata only — it decorates the allowlist and can never add a row to it. Declared
-    # rather than reached untyped because it carries no external libraries of its own.
+    # Catalogue and persisted enabled-token snapshots. The composer relays its explicit
+    # enable/disable mutation while asset composition reads the same instance below.
     token_list_module = {
       url = "github:logos-co/logos-evm-token-list-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
+    # Reusable asset composition: native + enabled ERC-20 rows, balances, unsigned
+    # transfers and history decoration. Its diamonds follow the same provider instances.
+    evm_assets_module = {
+      url = "github:logos-co/logos-evm-assets-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+      inputs.eth_rpc_module.follows = "eth_rpc_module";
+      inputs.token_list_module.follows = "token_list_module";
+    };
     # The one sender on the device. Every transaction this wallet makes leaves through it:
-    # it reserves the nonce, asks the keystore, broadcasts and records. Until the repo is
-    # published, build with `--override-input tx_sender_module path:../logos-evm-tx-sender-module`.
+    # it reserves the nonce, asks the keystore, broadcasts and records.
     tx_sender_module = {
       url = "github:logos-co/logos-evm-tx-sender-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
+      inputs.eth_rpc_module.follows = "eth_rpc_module";
+      inputs.fee_module.follows = "fee_module";
+      inputs.keystore_module.follows = "keystore_module";
     };
   };
 

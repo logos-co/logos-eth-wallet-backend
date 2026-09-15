@@ -4,8 +4,8 @@ name: eth_wallet_backend Unit Tests
 #
 # Nothing else here can go red. The doctests drive a real daemon against a live
 # chain, so they cannot run on a PR; `nix build` proves the module links, which
-# says nothing about whether a nonce is ever handed out twice or a refused gate
-# loses a send. Those are the questions rust-lib/tests/ exists to answer, and
+# says nothing about whether a composer holds a lock across a dependency call or
+# silently grows a second broadcast path. Those are the questions rust-lib/tests/ asks, and
 # until this workflow they were only ever asked on a developer's laptop.
 #
 # `--no-default-features` drops the `logos_module` glue, and with it the
@@ -59,11 +59,10 @@ jobs:
         run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
 
       - name: The source-shape guards must actually be present
-        # Four files under rust-lib/tests/ assert things about the SHAPE of
+        # Three files under rust-lib/tests/ assert things about the SHAPE of
         # src/glue.rs rather than about a value it returns: that no outbound
         # call is made under a lock, that money leaves only through
-        # tx_sender_module, that the gate cache is opened by an arm and by
-        # nothing else, that every declared event is fired somewhere. A guard
+        # tx_sender_module and that every declared event is fired somewhere. A guard
         # like that goes green the moment it stops being compiled, and green is
         # exactly what it looks like when it has been deleted -- so name one
         # test from each file rather than trusting the run above.
@@ -71,11 +70,10 @@ jobs:
           out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
           for t in money_leaves_only_through_tx_sender_module \
                    the_send_path_resolves_a_token_to_one_contract \
-                   only_an_arm_opens_the_cache \
                    every_event_this_module_declares_is_emitted_somewhere \
                    the_sender_relay_re_emits_every_event_it_subscribes_to \
                    the_keystore_relay_arms_once_listens_off_thread_and_closes_its_own_window; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 190 ]
+          echo "tests: $n"; [ "$n" -ge 75 ]

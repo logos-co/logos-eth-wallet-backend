@@ -47,17 +47,20 @@ const CALLEE_MARGIN: Duration = Duration::from_millis(300);
 pub const READ_BUDGET: Duration = Duration::from_secs(4);
 pub const STARTUP_BUDGET: Duration = Duration::from_secs(6);
 
-/// A send's own outbound work: the verified gate, a token balance read for an ERC-20 send,
-/// and the delegated `tx_sender_module` call that prices the fee, reads the nonce and
-/// registers the approval. Larger than a read because a wrong quote is worse than a slow one
-/// — the figure a human is about to approve must not be shortened into an error.
-pub const SEND_BUDGET: Duration = Duration::from_millis(13_500);
+/// A send's outbound work: validate the requested chain against the registry, delegate one
+/// transfer build, then ask `tx_sender_module` to price or submit it.
+pub const SEND_BUDGET: Duration = Duration::from_secs(15);
 
 /// The one delegated call of a send: `tx_sender_module.prepare` or `.send`, which itself runs
 /// a gate, a fee estimate, a balance and a nonce read, and the approval request. Its own
 /// allowance is handed down as `deadlineMs` so its error sentence comes home rather than a
 /// bare transport timeout.
 pub const SENDER_BUDGET: Duration = Duration::from_secs(9);
+
+/// Resolve and build one transfer in `evm_assets_module`. Together with the registry read
+/// and sender allowance this exactly fits the public send budget; the callee gets a slightly
+/// shorter deadline so its structured error still has time to return.
+pub const ASSETS_BUDGET: Duration = Duration::from_millis(4_500);
 
 /// One relayed `send_status`: the sender reads the approval, collects the signatures, gates,
 /// and broadcasts — the broadcast itself deliberately unbounded on its side. Under the
@@ -154,7 +157,7 @@ mod tests {
     /// approval happen — and it must fit AFTER the two reads in front of it.
     #[test]
     fn a_send_is_bounded_across_its_reads_and_the_delegated_call() {
-        let calls = [PROBE_BUDGET, RPC_BUDGET, SENDER_BUDGET];
+        let calls = [PROBE_BUDGET, ASSETS_BUDGET, SENDER_BUDGET];
         assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
         assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "every call must fit");
         assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
@@ -185,6 +188,13 @@ mod tests {
         // The two calls that actually answer must BOTH fit, gate included, or a wallet whose
         // dependency is merely slow reports no balances at all.
         assert!(PROBE_BUDGET + RPC_BUDGET <= BALANCES_BUDGET);
+    }
+
+    #[test]
+    fn a_portfolio_fans_out_without_multiplying_the_interaction_deadline() {
+        // Registry discovery is one bounded phase, followed by any number of concurrent
+        // per-chain reads. Adding a chain adds work, but not another serial allowance.
+        assert!(READ_BUDGET + BALANCES_BUDGET < Duration::from_secs(20));
     }
 
     #[test]

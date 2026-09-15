@@ -20,11 +20,7 @@ pub struct Answer {
 pub fn unwrap_answer(reply: &str) -> Result<Answer, String> {
     let v: Value = serde_json::from_str(reply).map_err(|e| e.to_string())?;
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(v
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("eth_rpc call failed")
-            .to_string());
+        return Err(v.to_string());
     }
     Ok(Answer {
         value: v.get("result").or_else(|| v.get("hash")).cloned().unwrap_or(Value::Null),
@@ -117,8 +113,8 @@ pub fn held_by_the_gate(reply: &Value, verdict: &Value) -> Value {
 }
 
 /// One chain whose blocking proxy froze rows during a sweep: what it cost, which rows, and
-/// the verdict that says why. A row on a NON-active chain is explainable nowhere else —
-/// the view's banner is keyed on the active chain and never mentions this one.
+/// the verdict that says why. The row carries its chain because a portfolio can contain
+/// several independently healthy or blocked networks at once.
 pub fn blocked_chain_json(chain_id: u64, network: &str, hashes: &[String], verdict: &Value) -> Value {
     let s = |k: &str| verdict.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     json!({
@@ -185,9 +181,11 @@ mod tests {
     }
 
     #[test]
-    fn an_envelope_surfaces_the_inner_error_not_a_generic_one() {
+    fn an_envelope_preserves_the_structured_refusal() {
         let e = unwrap_rpc(r#"{"ok":false,"error":"no configuration for chain 7"}"#).unwrap_err();
-        assert_eq!(e, "no configuration for chain 7");
+        assert_eq!(serde_json::from_str::<Value>(&e).unwrap()["error"], "no configuration for chain 7");
+        let blocked = r#"{"ok":false,"code":"verified_blocked","blocked":true,"verifiedProxy":{"state":"wrong_chain"}}"#;
+        assert_eq!(serde_json::from_str::<Value>(&unwrap_rpc(blocked).unwrap_err()).unwrap()["verifiedProxy"]["state"], "wrong_chain");
         assert!(unwrap_rpc("not json").is_err());
         // A failure carries no route, and nothing may invent one for it.
         assert!(unwrap_answer(r#"{"ok":false,"route":"verified"}"#).is_err());
