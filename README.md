@@ -28,7 +28,8 @@ device scope is the `mainnets`, `testnets`, or `both` setting owned by `eth_rpc_
   keystore inventory. They cannot create, import, export or sign.
 - `get_balances(address)` reads every enabled in-scope chain concurrently. Its top-level
   answer remains usable when one chain fails: each item in `chains` carries its own `ok`,
-  `chainId`, balances/route or error.
+  `chainId`, balances/route or error. Each chain gets a bounded fifteen-second allowance so
+  proof-backed multi-token reads are not mistaken for a dead proxy.
 - `get_history(address)` asks the sender for all locally recorded chains, filters to the
   current device scope, then asks `evm_assets_module` to decorate every row by its own
   `(chainId, contract)`. This is local sender history, not a chain indexer.

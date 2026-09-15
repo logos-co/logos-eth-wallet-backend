@@ -74,7 +74,10 @@ pub const HISTORY_BUDGET: Duration = Duration::from_secs(12);
 /// read that answers every row. The gate is INSIDE it — an unbounded probe in front of a
 /// read is time a user waits that no budget can see — and it is sized so the gate and the
 /// read both fit, because a balance list cannot degrade the way a network row can.
-pub const BALANCES_BUDGET: Duration = Duration::from_secs(6);
+/// evm_assets reserves up to fourteen seconds for catalogue composition plus a verified
+/// Multicall3 proof. Leave it one second for the reply to cross back through this composer;
+/// together with registry discovery the public call still fits the UI's 20s transport bound.
+pub const BALANCES_BUDGET: Duration = Duration::from_secs(15);
 
 /// One `suggest_fees`: the verified gate and one `fee_module` estimate.
 pub const FEES_BUDGET: Duration = Duration::from_secs(5);
