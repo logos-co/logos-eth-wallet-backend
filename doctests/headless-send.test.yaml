@@ -193,13 +193,15 @@ sections:
       - title: "Point eth_rpc at Anvil"
         text: |
           `eth_rpc_module` owns the endpoint table for every wallet on the device. The
-          Sepolia row is repointed at the local chain, and the chain is asked to confirm
-          it is who the row says.
+          Sepolia row is repointed at the local chain, enabled for this device, and the
+          chain is asked to confirm it is who the row says.
         run: |
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}' --human
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_enabled 11155111 true --human
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module verify_chain_id 11155111 --human
         code_block: |
           logosctl call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}'
+          logosctl call eth_rpc_module set_chain_enabled 11155111 true
           logosctl call eth_rpc_module verify_chain_id 11155111
         expect_contains:
           - '"chainId":11155111'
