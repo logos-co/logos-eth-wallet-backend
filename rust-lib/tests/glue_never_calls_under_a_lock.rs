@@ -192,7 +192,7 @@ fn guard_scopes(code: &str) -> Vec<(usize, usize)> {
 }
 
 /// Every method of the glue that reaches `modules()`, directly or through another of its own
-/// methods. A scan for the literal token cannot see `self.verified_gate_within(..)` or
+/// methods. A scan for the literal token cannot see `self.chain_configs(..)` or
 /// `self.resolve(..)` — each an IPC round trip one level down, and each invisible to the
 /// check that was supposed to keep calls out of a lock scope.
 fn reaches_modules(code: &str, fns: &[Func]) -> BTreeSet<String> {
@@ -269,10 +269,10 @@ fn an_outbound_call_reached_through_a_helper_is_caught() {
     let mutant = mutate(
         GLUE,
         "guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
-        "let _ = self.verified_gate_within(1, b);\n        guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
+        "let _ = self.chain_configs(b);\n        guard.clone().ok_or_else(|| NO_CONTEXT.to_string())",
     );
     let e = check_no_call_under_a_lock(&mutant).unwrap_err();
-    assert!(e.contains("self.verified_gate_within()"), "{e}");
+    assert!(e.contains("self.chain_configs()"), "{e}");
 
     let code = code_only(&mutant);
     assert!(
@@ -320,11 +320,11 @@ fn the_glue_takes_no_lock_except_the_one_that_hands_back_a_handle() {
 fn a_third_lock_anywhere_else_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        // A send this wallet made and a human has not answered names the network it was\n",
-        "        let _a = self.state.read();\n        // A send this wallet made and a human has not answered names the network it was\n",
+        "        // Read the request's chain once and validate it against the shared registry before\n",
+        "        let _a = self.state.read();\n        // Read the request's chain once and validate it against the shared registry before\n",
     );
     let e = check_lock_sites(&mutant).unwrap_err();
-    assert!(e.contains("set_active_chain"), "{e}");
+    assert!(e.contains("send"), "{e}");
 }
 
 #[test]
@@ -345,16 +345,15 @@ const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
     // One call each, and neither sits behind a gate.
     ("keystore_module", "list_accounts", "a passthrough, one call"),
     ("keystore_module", "get_labels", "a passthrough, one call"),
+    ("keystore_module", "get_account_wallets", "a passthrough, one call"),
     // Not calls at all: each arms an `EventSubscription` and the generated client emits no
     // bounded twin for one. A deadline on arming would be a deadline on the SUBSCRIPTION,
     // which is meant to outlive every call this module makes.
     ("keystore_module", "on_accounts_changed", "a subscription has no bounded twin"),
-    ("eth_rpc_module", "on_verified_proxy_mode_changed", "a subscription has no bounded twin"),
-    // Neither is the status watcher: it installs a callback and returns, and the C side
-    // replays the current state from inside the call rather than waiting on the provider.
-    ("eth_rpc_module", "on_subscription_status", "installs a callback; nothing is dispatched"),
     ("eth_rpc_module", "on_chain_config_changed", "a subscription has no bounded twin"),
-    ("token_list_module", "on_tokens_updated", "a subscription has no bounded twin"),
+    ("eth_rpc_module", "on_chain_enabled_changed", "a subscription has no bounded twin"),
+    ("eth_rpc_module", "on_network_scope_changed", "a subscription has no bounded twin"),
+    ("evm_assets_module", "on_offered_changed", "a subscription has no bounded twin"),
     ("tx_sender_module", "on_send_status_changed", "a subscription has no bounded twin"),
     ("tx_sender_module", "on_tx_status_changed", "a subscription has no bounded twin"),
     ("tx_sender_module", "on_history_changed", "a subscription has no bounded twin"),
@@ -402,11 +401,11 @@ fn every_outbound_call_is_bounded_except_the_ones_argued_for_here() {
 fn a_new_unbounded_call_is_caught() {
     let mutant = mutate(
         GLUE,
-        "modules().token_list_module.get_tokens_with_timeout(chain_id, t)",
-        "modules().token_list_module.get_tokens(chain_id)",
+        "modules().evm_assets_module.list_offered_with_timeout(id as i64, t)",
+        "modules().evm_assets_module.list_offered(id as i64)",
     );
     let e = check_calls_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("token_list_module.get_tokens with no deadline"), "{e}");
+    assert!(e.contains("evm_assets_module.list_offered with no deadline"), "{e}");
 }
 
 /// The delegated send is a call across a process boundary too, and the one that registers
@@ -434,121 +433,32 @@ fn an_entry_the_glue_no_longer_calls_is_caught() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 4. The enabled token set is written only from a token_list snapshot.
-// ---------------------------------------------------------------------------------------
-
-/// `decimals` scales every amount this wallet renders AND every amount it signs, so an
-/// enabled token's record has exactly one honest source: the list the user picked it from.
-fn check_enabled_set_is_snapshotted(src: &str) -> Result<(), String> {
-    let full = code_only(src);
-    let code = non_test(&full);
-    let fns = functions(code);
-    let writes = sites(code, "enable_token(");
-    if writes.len() != 1 {
-        return Err(format!(
-            "`enable_token` must have exactly ONE call site in the glue — the one that has \
-             just read the record from token_list. Found {}.",
-            writes.len()
-        ));
-    }
-    let owner = enclosing_fn(&fns, writes[0]);
-    if owner != "set_token_enabled" {
-        return Err(format!("the enabled set is written from `{owner}`, not `set_token_enabled`"));
-    }
-    let body = bodies_of(&fns, code, "set_token_enabled")[0];
-    let Some(snap) = body.find("self.snapshot(") else {
-        return Err("`set_token_enabled` writes the enabled set without asking token_list for \
-                    the record first, so it is inventing one"
-            .into());
-    };
-    if snap > body.find("enable_token(").expect("the site found above") {
-        return Err("`set_token_enabled` writes the enabled set BEFORE it reads the record from \
-                    token_list"
-            .into());
-    }
-    if let Some(at) = code.find("Token {") {
-        return Err(format!(
-            "glue.rs:{} builds a `Token` by hand. Every enabled record comes from \
-             `tokens::snapshot_of` reading token_list — a `decimals` invented here mis-scales \
-             every amount that token is ever rendered or signed in.",
-            line_of(src, at)
-        ));
-    }
-    Ok(())
-}
-
-#[test]
-fn the_enabled_set_is_only_ever_written_from_a_token_list_snapshot() {
-    check_enabled_set_is_snapshotted(GLUE).unwrap();
-}
-
-#[test]
-fn enabling_a_token_the_list_never_described_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "match self.snapshot(chain_id, &addr, &b) {\n                Ok(t) => st.settings.enable_token(chain_id as u64, t),\n                Err(e) => return err(e),\n            }",
-        "st.settings.enable_token(chain_id as u64, Token { symbol: address.clone(), \
-         name: address.clone(), decimals: 18, address: Some(addr.clone()), native: false })",
-    );
-    let e = check_enabled_set_is_snapshotted(&mutant).unwrap_err();
-    assert!(e.contains("without asking token_list"), "{e}");
-}
-
-#[test]
-fn a_second_door_into_the_enabled_set_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "        match self.state().and_then(|st| st.settings.set_token_sort(o)",
-        "        let _ = self.state().map(|st| st.settings.enable_token(1, Token::default()));\n        match self.state().and_then(|st| st.settings.set_token_sort(o)",
-    );
-    let e = check_enabled_set_is_snapshotted(&mutant).unwrap_err();
-    assert!(e.contains("exactly ONE call site"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
 // 5. A send names ONE contract.
 // ---------------------------------------------------------------------------------------
 
-/// A token's identity is its `(chainId, address)`, and the shipped list holds two mainnet
-/// contracts both calling themselves `LIT`. `tokens::find` answers `None` for that ambiguity
-/// and a `None` is easy to ignore, so the send path takes the address when it has one, relays
-/// `tokens::resolve`'s refusal when it does not, and reports which contract it settled on.
+/// Asset resolution and call construction happen exactly once in the assets module. The
+/// composer forwards that one call and clones the built facts into its quote.
 fn check_a_send_names_one_contract(src: &str) -> Result<(), String> {
     let full = code_only(src);
     let code = non_test(&full);
     let fns = functions(code);
-    if let Some(at) = code.find("tokens::find(") {
+    let found = sites(code, ".evm_assets_module.build_transfer_with_timeout(");
+    if found.len() != 1 {
         return Err(format!(
-            "glue.rs:{} resolves a token through `tokens::find`, which answers `None` for a \
-             symbol two contracts share. Use `tokens::resolve` and relay its refusal.",
-            line_of(src, at)
+            "`evm_assets_module.build_transfer_with_timeout` must have exactly one site; found {}",
+            found.len()
         ));
     }
-    for (call, what) in [("tokens::by_address(", "an address"), ("tokens::resolve(", "a symbol")] {
-        let found = sites(code, call);
-        if found.len() != 1 {
-            return Err(format!(
-                "`{call}` resolves {what} for the send path and must have exactly ONE call \
-                 site. Found {}.",
-                found.len()
-            ));
-        }
-        let owner = enclosing_fn(&fns, found[0]);
-        if owner != "resolve" {
-            return Err(format!("`{call}` is called from `{owner}`, not `resolve`"));
-        }
+    if enclosing_fn(&fns, found[0]) != "build_transfer" {
+        return Err("asset building must be isolated in `build_transfer`".into());
     }
-    // The reply is read from the RAW source: `code_only` blanks string literals, and the key
-    // being looked for is one.
-    let body = fns
-        .iter()
-        .find(|f| f.name == "quote_reply")
-        .map(|f| &src[f.body.0..f.body.1])
-        .ok_or("no fn quote_reply")?;
-    if !body.contains("\"tokenAddress\"") {
-        return Err("`quote_reply` reports no `tokenAddress`, so nothing downstream can say \
-                    WHICH contract the send will call"
-            .into());
+    let sender = bodies_of(&fns, code, "built_sender_request")[0];
+    if !no_ws(sender).contains(".filter(|calls|calls.len()==1)") {
+        return Err("the composer must accept exactly one built call".into());
+    }
+    let quote = bodies_of(&fns, code, "built_quote_reply")[0];
+    if !quote.contains("built.clone()") {
+        return Err("the quote must preserve the assets module's resolved contract facts".into());
     }
     Ok(())
 }
@@ -562,108 +472,18 @@ fn the_send_path_resolves_a_token_to_one_contract() {
 fn resolving_a_send_by_first_match_is_caught() {
     let mutant = mutate(
         GLUE,
-        "Some(tokens::resolve(chain_id, k, settings.enabled_tokens(chain_id))?)",
-        "Some(tokens::find(chain_id, k, settings.enabled_tokens(chain_id)).unwrap())",
+        ".filter(|calls| calls.len() == 1).cloned()",
+        ".filter(|calls| !calls.is_empty()).cloned()",
     );
     let e = check_a_send_names_one_contract(&mutant).unwrap_err();
-    assert!(e.contains("two contracts share"), "{e}");
+    assert!(e.contains("exactly one built call"), "{e}");
 }
 
 #[test]
 fn a_reply_that_names_only_the_symbol_is_caught() {
-    let mutant = mutate(GLUE, "\"tokenAddress\": r.token_address(),", "");
+    let mutant = mutate(GLUE, "let mut v = built.clone();", "let mut v = json!({ \"symbol\": built.get(\"symbol\") });");
     let e = check_a_send_names_one_contract(&mutant).unwrap_err();
-    assert!(e.contains("WHICH contract"), "{e}");
-}
-
-// ---------------------------------------------------------------------------------------
-// 6. Every gated path is bounded across its gate.
-// ---------------------------------------------------------------------------------------
-
-/// The unbounded probe is what the protocol ABI answers with its 20s default; every gate
-/// site takes its allowance first and spends the gate out of it.
-const GATED: &[(&str, &str)] = &[
-    ("get_balances", "BALANCES_BUDGET"),
-    ("prepare_send", "SEND_BUDGET"),
-    ("send", "SEND_BUDGET"),
-    ("suggest_fees", "FEES_BUDGET"),
-    ("verified_proxy_state", "VERDICT_BUDGET"),
-];
-
-fn check_gated_paths_are_bounded(src: &str) -> Result<(), String> {
-    let code = code_only(src);
-    let fns = functions(&code);
-    for call in ["self.verified_gate(", "self.verified_verdict("] {
-        if let Some(at) = sites(&code, call).first() {
-            return Err(format!(
-                "glue.rs:{} calls the unbounded `{call}`, which the protocol ABI answers with \
-                 its 20s default. Take a Budget and spend the gate out of it.",
-                line_of(src, *at)
-            ));
-        }
-    }
-    for (name, budget) in GATED {
-        for body in bodies_of(&fns, &code, name) {
-            let gate = body
-                .find("verified_gate_within")
-                .or_else(|| body.find("verified_verdict_within"))
-                .ok_or_else(|| format!("`{name}` no longer gates"))?;
-            let taken = body
-                .find(&format!("Budget::new({budget})"))
-                .ok_or_else(|| format!("`{name}` no longer takes a {budget}"))?;
-            if taken > gate {
-                return Err(format!(
-                    "`{name}` takes its {budget} AFTER the gate, so the gate is outside the \
-                     allowance and the method is bounded by nothing a user can feel."
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn every_gated_path_takes_its_allowance_before_the_gate() {
-    check_gated_paths_are_bounded(GLUE).unwrap();
-}
-
-#[test]
-fn a_gate_site_left_on_the_unbounded_probe_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "if let Err(v) = self.verified_gate_within(chain_id, &b) {\n            return blocked(&v).to_string();\n        }\n        let owner",
-        "if let Err(v) = self.verified_gate(chain_id) {\n            return blocked(&v).to_string();\n        }\n        let owner",
-    );
-    let e = check_gated_paths_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("calls the unbounded"), "{e}");
-}
-
-#[test]
-fn an_allowance_opened_after_the_gate_is_caught() {
-    let mutant = mutate(
-        GLUE,
-        "        let b = Budget::new(BALANCES_BUDGET);\n        self.ensure_eth_rpc(&b);",
-        "        self.ensure_eth_rpc(&Budget::new(READ_BUDGET));",
-    );
-    let mutant = mutate(
-        &mutant,
-        "        let owner = match address.trim()",
-        "        let b = Budget::new(BALANCES_BUDGET);\n        let owner = match address.trim()",
-    );
-    let e = check_gated_paths_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("AFTER the gate"), "{e}");
-}
-
-/// The read BEHIND the gate is bounded too.
-#[test]
-fn the_read_behind_the_gate_is_bounded_too() {
-    let mutant = mutate(
-        GLUE,
-        ".call_with_timeout(chain_id as i64, &payload, callee_deadline(t), t)",
-        ".call(chain_id as i64, &payload, None)",
-    );
-    let e = check_calls_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("eth_rpc_module.call with no deadline"), "{e}");
+    assert!(e.contains("resolved contract facts"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -694,16 +514,14 @@ fn check_money_leaves_through_the_sender(src: &str) -> Result<(), String> {
             sends.iter().map(|a| enclosing_fn(&fns, *a)).collect::<Vec<_>>()
         ));
     }
-    // The request carries the claim the human reads and the meta this wallet reads back.
+    // The request carries the claim the assets module authored; this composer never rebuilds
+    // human-facing asset text itself.
     let body = bodies_of(&fns, &code, "send")[0];
-    if !body.contains("send::purpose(") {
-        return Err("`send` hands the sender no `purpose`, so the signer shows the human an \
-                    unnamed transaction"
-            .into());
+    if !(body.contains("request[") && body.contains("] = built.get(")) {
+        return Err("`send` does not forward the built purpose".into());
     }
-    let call = bodies_of(&fns, &code, "call")[0];
-    if !call.contains("erc20_transfer_calldata(") {
-        return Err("`call` no longer encodes the ERC-20 transfer this wallet is sending".into());
+    if code.contains("send::purpose(") {
+        return Err("the composer reconstructs `purpose` instead of forwarding it".into());
     }
     Ok(())
 }
@@ -728,9 +546,9 @@ fn a_wallet_that_broadcasts_itself_is_caught() {
 fn a_send_with_no_claim_line_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        request[\"purpose\"] = json!(send::purpose(&amount, &r.symbol, &r.from.to_string(), &r.to.to_string()));\n",
-        "        let _ = amount;\n",
+        "        request[\"purpose\"] = built.get(\"purpose\").cloned().unwrap_or(Value::Null);\n",
+        "",
     );
     let e = check_money_leaves_through_the_sender(&mutant).unwrap_err();
-    assert!(e.contains("no `purpose`"), "{e}");
+    assert!(e.contains("does not forward"), "{e}");
 }

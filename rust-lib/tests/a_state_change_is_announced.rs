@@ -153,14 +153,14 @@ fn declared_events(code: &str) -> Vec<String> {
         .collect()
 }
 
-/// The three methods that write `settings.json`. Each must announce, on the change alone.
-const SETTINGS_MUTATORS: &[&str] = &["set_active_chain", "set_token_enabled", "set_token_sort"];
+/// The one method that writes `settings.json`. Chain scope and token membership live in
+/// their reusable providers.
+const SETTINGS_MUTATORS: &[&str] = &["set_token_sort"];
 
 /// Methods that only read, or relay a read. The sender announces what its sweep moves; a
 /// relay that announced on top would be a view driving its own subscription round forever.
 const READERS: &[&str] = &[
     "list_networks",
-    "get_active_network",
     "verified_proxy_state",
     "list_tokens",
     "list_available_tokens",
@@ -260,22 +260,22 @@ fn every_settings_mutator_announces_its_change_and_only_its_change() {
 fn a_silent_mutator_is_caught() {
     let mutant = mutate(
         GLUE,
-        "                if a.changed {\n                    emit_tokens_changed(chain_id);\n                }\n",
+        "                    emit_token_sort_changed(order);\n",
         "",
     );
     let e = check_mutators_announce_a_change(&mutant).unwrap_err();
-    assert!(e.contains("set_token_enabled"), "{e}");
+    assert!(e.contains("set_token_sort"), "{e}");
 }
 
 #[test]
 fn announcing_a_write_that_moved_nothing_is_caught() {
     let mutant = mutate(
         GLUE,
-        "                if a.changed {\n                    emit_tokens_changed(chain_id);\n                }",
-        "                if true {\n                    emit_tokens_changed(chain_id);\n                }",
+        "                if a.changed {\n                    emit_token_sort_changed(order);\n                }",
+        "                if true {\n                    emit_token_sort_changed(order);\n                }",
     );
     let e = check_mutators_announce_a_change(&mutant).unwrap_err();
-    assert!(e.contains("set_token_enabled") && e.contains("loops"), "{e}");
+    assert!(e.contains("set_token_sort") && e.contains("loops"), "{e}");
 }
 
 #[test]
@@ -318,8 +318,8 @@ fn no_read_announces_itself() {
 fn a_read_that_announces_itself_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        rows::decorate_history(&mut v, chain_id, settings.enabled_tokens(chain_id));\n        v.to_string()",
-        "        rows::decorate_history(&mut v, chain_id, settings.enabled_tokens(chain_id));\n        emit_balances_updated(&address);\n        v.to_string()",
+        "        match modules().evm_assets_module.decorate_history_with_timeout(&history.to_string(), t) {",
+        "        emit_balances_updated(&address);\n        match modules().evm_assets_module.decorate_history_with_timeout(&history.to_string(), t) {",
     );
     let e = check_readers_stay_silent(&mutant).unwrap_err();
     assert!(e.contains("get_history"), "{e}");

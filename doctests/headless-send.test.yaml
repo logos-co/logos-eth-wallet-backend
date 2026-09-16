@@ -17,7 +17,7 @@ intro: |
   second send is refused.
 
 what_you_learn:
-  - Which eight modules a headless eth wallet needs, and the order to load them in
+  - Which nine modules a headless eth wallet needs, and the order to load them in
   - How to point `eth_rpc_module` at a local chain
   - Why `send` returns no hash, and how to prove it
   - How the approval prompt reaches an operator, and what it says
@@ -54,13 +54,14 @@ sections:
         expect_contains:
           - "cast"
 
-  - title: "Build the eight modules"
+  - title: "Build the nine modules"
     step: true
     text: |
-      `eth_wallet_backend` and its five providers — `keystore_module` for keys and the
+      `eth_wallet_backend` and its six providers — `keystore_module` for keys and the
       approval queue, `eth_rpc_module` for the chain, `fee_module` for the fee estimate,
-      `token_list_module` for token metadata, `tx_sender_module` for the nonce, the
-      approval request, the broadcast and the record — plus the two headless surfaces:
+      `token_list_module` for token metadata, `evm_assets_module` for balances and unsigned
+      transfer construction, and `tx_sender_module` for the nonce, approval request,
+      broadcast and record — plus the two headless surfaces:
       `evm_keystore_cli`, the custodian that imports the key, and `evm_signer_cli`, the
       approver that shows the request and takes the decision. Each `#install` output is
       copied into the session's `modules/` directory next to the bundled
@@ -71,19 +72,21 @@ sections:
         code_block: |
           # From inside the clone this is simply: nix build '.#install'
           nix build 'github:logos-co/logos-eth-wallet-backend#install' --out-link ./result-ewb
-      - title: "Build the five providers"
+      - title: "Build the six providers"
         run: |
           set -e
           nix build "github:logos-co/logos-evm-keystore-module#install" --out-link ./result-keystore
           nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
           nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
           nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
+          nix build "github:logos-co/logos-evm-assets-module#install" --out-link ./result-assets
           nix build "github:logos-co/logos-evm-tx-sender-module#install" --out-link ./result-sender
         code_block: |
           nix build 'github:logos-co/logos-evm-keystore-module#install' --out-link ./result-keystore
           nix build 'github:logos-co/logos-evm-eth-rpc-module#install' --out-link ./result-rpc
           nix build 'github:logos-co/logos-evm-fee-module#install' --out-link ./result-fee
           nix build 'github:logos-co/logos-evm-token-list-module#install' --out-link ./result-tl
+          nix build 'github:logos-co/logos-evm-assets-module#install' --out-link ./result-assets
           nix build 'github:logos-co/logos-evm-tx-sender-module#install' --out-link ./result-sender
       - title: "Build the two headless surfaces"
         run: |
@@ -97,7 +100,7 @@ sections:
         run: |
           mkdir -p session/modules
           cp -RL ./logos/modules/. ./session/modules/
-          for r in result-keystore result-rpc result-fee result-tl result-sender result-ewb result-signer result-kcli; do
+          for r in result-keystore result-rpc result-fee result-tl result-assets result-sender result-ewb result-signer result-kcli; do
             cp -RL ./$r/modules/. ./session/modules/
           done
           chmod -R u+w session/modules
@@ -112,6 +115,7 @@ sections:
           - "eth_rpc_module"
           - "fee_module"
           - "token_list_module"
+          - "evm_assets_module"
           - "tx_sender_module"
           - "eth_wallet_backend"
           - "evm_signer_cli"
@@ -146,16 +150,16 @@ sections:
           up **before** the first `send`: an approval request nobody claims is swept after
           60 seconds, and the wallet reports that send as `failed`.
         run: |
-          for m in keystore_module eth_rpc_module fee_module token_list_module tx_sender_module eth_wallet_backend evm_signer_cli evm_keystore_cli; do
+          for m in keystore_module eth_rpc_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend evm_signer_cli evm_keystore_cli; do
             ./logos/bin/logosctl --config-dir ./session module load $m || exit 1
           done
         code_block: |
-          for m in keystore_module eth_rpc_module fee_module token_list_module tx_sender_module \
+          for m in keystore_module eth_rpc_module fee_module token_list_module evm_assets_module tx_sender_module \
                    eth_wallet_backend evm_signer_cli evm_keystore_cli; do
             logosctl module load $m
           done
       - run: "sleep 2"
-      - title: "All eight are up"
+      - title: "All nine are up"
         run: "./logos/bin/logosctl --config-dir ./session daemon status --json"
         code_block: "logosctl daemon status --json"
         expect_contains:
@@ -163,6 +167,7 @@ sections:
           - '"name":"eth_rpc_module","status":"loaded"'
           - '"name":"fee_module","status":"loaded"'
           - '"name":"token_list_module","status":"loaded"'
+          - '"name":"evm_assets_module","status":"loaded"'
           - '"name":"tx_sender_module","status":"loaded"'
           - '"name":"eth_wallet_backend","status":"loaded"'
           - '"name":"evm_signer_cli","status":"loaded"'
@@ -188,13 +193,18 @@ sections:
       - title: "Point eth_rpc at Anvil"
         text: |
           `eth_rpc_module` owns the endpoint table for every wallet on the device. The
-          Sepolia row is repointed at the local chain, and the chain is asked to confirm
-          it is who the row says.
+          shared defaults are seeded first so Sepolia keeps its testnet identity when its
+          endpoint is repointed at the local chain. The row is enabled for this device,
+          and the chain is asked to confirm it is who the row says.
         run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module init_defaults --human
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}' --human
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_enabled 11155111 true --human
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module verify_chain_id 11155111 --human
         code_block: |
+          logosctl call eth_rpc_module init_defaults
           logosctl call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}'
+          logosctl call eth_rpc_module set_chain_enabled 11155111 true
           logosctl call eth_rpc_module verify_chain_id 11155111
         expect_contains:
           - '"chainId":11155111'
@@ -210,15 +220,19 @@ sections:
         expect_contains:
           - "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
           - '"ok":true'
-      - title: "Select the network; the wallet sees the account"
+      - title: "Select the testnet scope; the wallet sees the account"
         run: |
-          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend set_active_chain 11155111 --human
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend set_network_scope testnets --human
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module list_chain_configs --human
           ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend list_accounts --human
         code_block: |
-          logosctl call eth_wallet_backend set_active_chain 11155111
+          logosctl call eth_wallet_backend set_network_scope testnets
+          logosctl call eth_rpc_module list_chain_configs
           logosctl call eth_wallet_backend list_accounts
         expect_contains:
-          - '"activeChainId":11155111'
+          - '"scope":"testnets"'
+          - '"chainId":11155111'
+          - '"inScope":true'
           - '"accounts":["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]'
       - title: "The recipient's balance, before"
         run: "./foundry/bin/cast balance 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://127.0.0.1:8545 --ether"
@@ -244,10 +258,10 @@ sections:
           `amountUnits` is in ETH, as a user would type it. The reply is a request id and
           the keystore's handle for the approval record — and nothing else.
         run: |
-          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send '{"from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","amountUnits":"1"}' --human | tee send.json
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send '{"chainId":11155111,"from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","amountUnits":"1"}' --human | tee send.json
           python3 -c 'import json; open("rid.txt","w").write(json.load(open("send.json"))["requestId"])'
         code_block: |
-          logosctl call eth_wallet_backend send '{"from":"0xf39F…2266","to":"0x7099…79C8","amountUnits":"1"}'
+          logosctl call eth_wallet_backend send '{"chainId":11155111,"from":"0xf39F…2266","to":"0x7099…79C8","amountUnits":"1"}'
         expect_contains:
           - '"pending":true'
           - '"requestId":"snd_ksh_'
@@ -367,14 +381,14 @@ sections:
     steps:
       - title: "Ask for 2 ETH, and say no"
         run: |
-          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send '{"from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","amountUnits":"2"}' --human \
+          ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send '{"chainId":11155111,"from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","amountUnits":"2"}' --human \
             | python3 -c 'import sys,json; open("rid2.txt","w").write(json.load(sys.stdin)["requestId"])'
           sleep 3
           ./logos/bin/logosctl --config-dir ./session call evm_signer_cli status --human \
             | python3 -c 'import sys,json; open("h2.txt","w").write(json.load(sys.stdin)["rendered"]["handle"])'
           ./logos/bin/logosctl --config-dir ./session call evm_signer_cli reject "$(cat h2.txt)" --human
         code_block: |
-          logosctl call eth_wallet_backend send '{"from":"0xf39F…2266","to":"0x7099…79C8","amountUnits":"2"}'
+          logosctl call eth_wallet_backend send '{"chainId":11155111,"from":"0xf39F…2266","to":"0x7099…79C8","amountUnits":"2"}'
           logosctl call evm_signer_cli reject <handle>
         expect_contains:
           - "true"
