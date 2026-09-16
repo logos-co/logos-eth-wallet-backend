@@ -193,13 +193,16 @@ sections:
       - title: "Point eth_rpc at Anvil"
         text: |
           `eth_rpc_module` owns the endpoint table for every wallet on the device. The
-          Sepolia row is repointed at the local chain, enabled for this device, and the
-          chain is asked to confirm it is who the row says.
+          shared defaults are seeded first so Sepolia keeps its testnet identity when its
+          endpoint is repointed at the local chain. The row is enabled for this device,
+          and the chain is asked to confirm it is who the row says.
         run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module init_defaults --human
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}' --human
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_enabled 11155111 true --human
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module verify_chain_id 11155111 --human
         code_block: |
+          logosctl call eth_rpc_module init_defaults
           logosctl call eth_rpc_module set_chain_config 11155111 '{"endpoint":"http://127.0.0.1:8545"}'
           logosctl call eth_rpc_module set_chain_enabled 11155111 true
           logosctl call eth_rpc_module verify_chain_id 11155111
@@ -220,12 +223,16 @@ sections:
       - title: "Select the testnet scope; the wallet sees the account"
         run: |
           ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend set_network_scope testnets --human
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module list_chain_configs --human
           ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend list_accounts --human
         code_block: |
           logosctl call eth_wallet_backend set_network_scope testnets
+          logosctl call eth_rpc_module list_chain_configs
           logosctl call eth_wallet_backend list_accounts
         expect_contains:
           - '"scope":"testnets"'
+          - '"chainId":11155111'
+          - '"inScope":true'
           - '"accounts":["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]'
       - title: "The recipient's balance, before"
         run: "./foundry/bin/cast balance 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://127.0.0.1:8545 --ether"
