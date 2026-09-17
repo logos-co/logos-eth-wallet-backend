@@ -10,12 +10,30 @@
   "author": "Logos Core Team",
   "main": "eth_wallet_backend_plugin",
   "dependencies": [
-    "eth_rpc_module",
-    "fee_module",
-    "keystore_module",
-    "token_list_module",
-    "evm_assets_module",
-    "tx_sender_module"
+    {
+      "name": "eth_rpc_module",
+      "version": "~0.1.0"
+    },
+    {
+      "name": "fee_module",
+      "version": "~0.1.0"
+    },
+    {
+      "name": "keystore_module",
+      "version": "~0.1.0"
+    },
+    {
+      "name": "token_list_module",
+      "version": "~0.1.0"
+    },
+    {
+      "name": "evm_assets_module",
+      "version": "~0.1.0"
+    },
+    {
+      "name": "tx_sender_module",
+      "version": "~0.1.0"
+    }
   ],
   "include": [],
   "capabilities": [],
