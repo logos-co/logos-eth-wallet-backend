@@ -1,4 +1,4 @@
-//! Portfolio scoping for the sender's all-chain history reply.
+//! Portfolio scoping for the sender's all-chain history reply, and what its decoration reports.
 
 use std::collections::BTreeSet;
 
@@ -40,6 +40,37 @@ pub fn scope(mut history: Value, allowed: &BTreeSet<u64>) -> Value {
     history
 }
 
+/// Every chain the rows name, once each, in the order they first appear.
+pub fn chains(history: &Value) -> Vec<u64> {
+    let mut out = Vec::new();
+    let rows = history.get("transactions").and_then(Value::as_array).into_iter().flatten();
+    for id in rows.filter_map(chain_id) {
+        if !out.contains(&id) { out.push(id); }
+    }
+    out
+}
+
+/// Report the chains whose offered tokens went unread in the decorated reply's
+/// `decorationErrors`, one entry per chain as when evm_assets read them. A refusal is relayed.
+pub fn add_decoration_errors(reply: String, unread: Vec<Value>) -> String {
+    if unread.is_empty() {
+        return reply;
+    }
+    let Ok(mut v) = serde_json::from_str::<Value>(&reply) else { return reply };
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return reply;
+    }
+    let mut errors = v.get("decorationErrors").and_then(Value::as_array).cloned().unwrap_or_default();
+    for e in unread {
+        // A chain evm_assets could not decorate at all keeps its own, earlier reason.
+        if !errors.iter().any(|r| r.get("chainId") == e.get("chainId")) {
+            errors.push(e);
+        }
+    }
+    v["decorationErrors"] = json!(errors);
+    v.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +103,31 @@ mod tests {
             {"chainId":1,"status":"pending","stalled":false}
         ]}), &BTreeSet::from([1]));
         assert_eq!(out["stillDue"], json!(true));
+    }
+
+    #[test]
+    fn each_chain_the_rows_name_is_listed_once_in_row_order() {
+        let value = json!({"transactions":[{"chainId":10},{"chainId":1},{"chainId":10}],
+                           "blockedChains":[{"chainId":5}]});
+        assert_eq!(chains(&value), [10, 1], "blocked chains carry no rows to decorate");
+        assert!(chains(&json!({"ok":true})).is_empty());
+    }
+
+    #[test]
+    fn a_chain_whose_offered_tokens_went_unread_is_reported_once() {
+        let decorated = json!({"ok":true,"transactions":[],
+                               "decorationErrors":[{"chainId":10,"error":"no record"}]});
+        let unread = vec![json!({"chainId":10,"error":"token_list_module: down"}),
+                          json!({"chainId":1,"error":"token_list_module: down"})];
+        let out: Value =
+            serde_json::from_str(&add_decoration_errors(decorated.to_string(), unread)).unwrap();
+        assert_eq!(out["decorationErrors"], json!([{"chainId":10,"error":"no record"},
+                                                   {"chainId":1,"error":"token_list_module: down"}]));
+
+        let clean = json!({"ok":true,"transactions":[]}).to_string();
+        assert_eq!(add_decoration_errors(clean.clone(), vec![]), clean, "nothing unread, verbatim");
+        let refused = json!({"ok":false,"error":"invalid history"}).to_string();
+        let unread = vec![json!({"chainId":1,"error":"x"})];
+        assert_eq!(add_decoration_errors(refused.clone(), unread), refused, "a refusal stays one");
     }
 }

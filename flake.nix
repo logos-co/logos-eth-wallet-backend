@@ -23,19 +23,18 @@
       url = "github:logos-co/logos-evm-keystore-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
-    # Catalogue and persisted enabled-token snapshots. The composer relays its explicit
-    # enable/disable mutation while asset composition reads the same instance below.
+    # Catalogue and persisted enabled-token snapshots. The composer reads the offered rows and
+    # the catalogue here, hands the rows to asset composition below, and relays enable/disable.
     token_list_module = {
       url = "github:logos-co/logos-evm-token-list-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
-    # Reusable asset composition: native + enabled ERC-20 rows, balances, unsigned
-    # transfers and history decoration. Its diamonds follow the same provider instances.
+    # Reusable asset composition: native + given ERC-20 rows, balances, unsigned transfers
+    # and history decoration. Its eth_rpc diamond follows the same provider instance.
     evm_assets_module = {
       url = "github:logos-co/logos-evm-assets-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
       inputs.eth_rpc_module.follows = "eth_rpc_module";
-      inputs.token_list_module.follows = "token_list_module";
     };
     # The one sender on the device. Every transaction this wallet makes leaves through it:
     # it reserves the nonce, asks the keystore, broadcasts and records.

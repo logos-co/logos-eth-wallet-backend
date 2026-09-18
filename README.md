@@ -22,17 +22,21 @@ device scope is the `mainnets`, `testnets`, or `both` setting owned by `eth_rpc_
   `configuredNetworks`, and the current `scope`. Chain records include authoritative native
   symbol/decimals and their verified-proxy verdict.
 - `verified_proxy_state()` reports a verdict for every enabled in-scope chain.
-- `list_tokens(chain_id)` and `list_available_tokens(chain_id, query, offset, limit)` delegate
-  asset identity and catalogue composition to `evm_assets_module`.
+- `list_tokens(chain_id)` hands the rows `token_list_module` offers to `evm_assets_module`,
+  which answers them as asset rows behind the chain's native one.
+  `list_available_tokens(chain_id, query, offset, limit)` pages `token_list_module`'s
+  catalogue, with that native row first on the first page.
 - `list_accounts()`, `get_account_labels()` and `get_account_wallets()` relay the ungated
   keystore inventory. They cannot create, import, export or sign.
-- `get_balances(address)` reads every enabled in-scope chain concurrently. Its top-level
-  answer remains usable when one chain fails: each item in `chains` carries its own `ok`,
-  `chainId`, balances/route or error. Each chain gets a bounded fifteen-second allowance so
-  proof-backed multi-token reads are not mistaken for a dead proxy.
+- `get_balances(address)` reads every enabled in-scope chain concurrently: its offered tokens,
+  then one `evm_assets_module` balance read. Its top-level answer remains usable when one
+  chain fails: each item in `chains` carries its own `ok`, `chainId`, balances/route or error.
+  Each chain gets a bounded fifteen-second allowance so proof-backed multi-token reads are not
+  mistaken for a dead proxy.
 - `get_history(address)` asks the sender for all locally recorded chains, filters to the
   current device scope, then asks `evm_assets_module` to decorate every row by its own
-  `(chainId, contract)`. This is local sender history, not a chain indexer.
+  `(chainId, contract)` against that chain's offered tokens. This is local sender history,
+  not a chain indexer.
 - `suggest_fees(chain_id)`, `refresh_pending(address)`, `refresh_tx_status(address, hash)` and
   `get_tx_details(address, hash)` preserve the owning module's structured reply.
 
@@ -60,9 +64,10 @@ Every send request must name `chainId`:
 ```
 
 `prepare_send` and `send` reject a chain outside the current scope. The composer delegates
-asset resolution and construction to `evm_assets_module`, then passes the resulting unsigned
-call to `tx_sender_module`. It never signs or broadcasts itself. `send` returns a pending
-request; `send_status` advances the approval/broadcast state machine.
+asset resolution and construction to `evm_assets_module`, with the chain's offered tokens as
+the candidates, then passes the resulting unsigned call to `tx_sender_module`. It never signs
+or broadcasts itself. `send` returns a pending request; `send_status` advances the
+approval/broadcast state machine.
 
 For ERC-20s, `tokenAddress` is the identity and wins over `token`. An ambiguous symbol is
 refused. For native sends the sender remains responsible for native affordability and fees.
@@ -83,7 +88,8 @@ No dependency call is made while composer state is locked.
 The composer relays or emits:
 
 - `networks_changed(chainId)`
-- `tokens_changed(chainId)`
+- `tokens_changed(chainId)`, from `token_list_module` and from the chain record that names the
+  native asset
 - `accounts_changed(count)`
 - `balances_updated(address)`
 - `history_changed(address)` and `tx_status_changed(hash)`

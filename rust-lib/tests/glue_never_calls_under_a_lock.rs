@@ -353,7 +353,7 @@ const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
     ("eth_rpc_module", "on_chain_config_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_chain_enabled_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_network_scope_changed", "a subscription has no bounded twin"),
-    ("evm_assets_module", "on_offered_changed", "a subscription has no bounded twin"),
+    ("token_list_module", "on_tokens_updated", "a subscription has no bounded twin"),
     ("tx_sender_module", "on_send_status_changed", "a subscription has no bounded twin"),
     ("tx_sender_module", "on_tx_status_changed", "a subscription has no bounded twin"),
     ("tx_sender_module", "on_history_changed", "a subscription has no bounded twin"),
@@ -401,11 +401,11 @@ fn every_outbound_call_is_bounded_except_the_ones_argued_for_here() {
 fn a_new_unbounded_call_is_caught() {
     let mutant = mutate(
         GLUE,
-        "modules().evm_assets_module.list_offered_with_timeout(id as i64, t)",
-        "modules().evm_assets_module.list_offered(id as i64)",
+        "modules().token_list_module.list_offered_with_timeout(chain_id as i64, t)",
+        "modules().token_list_module.list_offered(chain_id as i64)",
     );
     let e = check_calls_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("evm_assets_module.list_offered with no deadline"), "{e}");
+    assert!(e.contains("token_list_module.list_offered with no deadline"), "{e}");
 }
 
 /// The delegated send is a call across a process boundary too, and the one that registers

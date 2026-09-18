@@ -24,9 +24,10 @@ use serde_json::{json, Value};
 
 use crate::budget::{
     callee_deadline, Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET,
-    HISTORY_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET,
-    ASSETS_BUDGET, SENDER_BUDGET, SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET,
+    HISTORY_BUDGET, INIT_BUDGET, OFFERED_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET,
+    RPC_BUDGET, ASSETS_BUDGET, SENDER_BUDGET, SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET,
 };
+use crate::catalogue;
 use crate::contacts::ContactsStore;
 use crate::depinit::{self, Next};
 use crate::history;
@@ -366,6 +367,16 @@ fn assets_reply(raw: Result<String, impl std::fmt::Debug>) -> Result<Value, Stri
     Ok(v)
 }
 
+/// The same, for a `token_list_module` read: its refusal stays the object it was.
+fn token_list_reply(raw: Result<String, impl std::fmt::Debug>) -> Result<Value, String> {
+    let raw = raw.map_err(|e| format!("token_list_module: {e:?}"))?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(v.to_string());
+    }
+    Ok(v)
+}
+
 /// A reply relayed to the view VERBATIM — the sender's refusals included, because they are
 /// already in the `{ ok: false, error, verifiedProxy? }` shape the view renders.
 fn relay(raw: Result<String, impl std::fmt::Debug>) -> String {
@@ -536,6 +547,8 @@ impl EthWalletBackendImpl {
                 if let Some(e) = eth_rpc_module::EthRpcModuleClient::decode_chain_config_changed(&ev)
                 {
                     emit_networks_changed(e.chain_id);
+                    // The record names the native asset, and its row heads every token list.
+                    emit_tokens_changed(e.chain_id);
                 }
             }
         });
@@ -577,20 +590,20 @@ impl EthWalletBackendImpl {
         });
     }
 
-    /// Relay the assets module's composed offered-set event. It already joins token-list
-    /// membership with chain-native metadata, so the wallet observes one authoritative feed.
-    fn watch_assets(&self) {
+    /// Relay token_list's own feed: the rows it serves on a chain moved. The native row that
+    /// heads them moves with the chain record, which `watch_chain_config` announces.
+    fn watch_tokens(&self) {
         if self.feeds.tokens.swap(true, Ordering::SeqCst) {
             return;
         }
-        let mut assets = modules().evm_assets_module;
-        let Ok(sub) = assets.on_offered_changed() else {
+        let mut c = modules().token_list_module;
+        let Ok(sub) = c.on_tokens_updated() else {
             self.feeds.tokens.store(false, Ordering::SeqCst);
             return;
         };
         listen(self.feeds.tokens.clone(), sub, |sub| {
             for ev in sub {
-                if let Some(e) = evm_assets_module::EvmAssetsModuleClient::decode_offered_changed(&ev) {
+                if let Some(e) = token_list_module::TokenListModuleClient::decode_tokens_updated(&ev) {
                     emit_tokens_changed(e.chain_id);
                 }
             }
@@ -647,13 +660,25 @@ impl EthWalletBackendImpl {
         }
     }
 
+    /// The rows token_list offers on `chain_id`, pinned then enabled: evm_assets' token
+    /// descriptors, passed on unchanged. A local read, so it takes a small slice.
+    fn offered_tokens(&self, chain_id: u64, b: &Budget) -> Result<Vec<Value>, String> {
+        let t = b.take(OFFERED_BUDGET).ok_or("no time left to read offered tokens")?;
+        let raw = modules().token_list_module.list_offered_with_timeout(chain_id as i64, t);
+        let v = token_list_reply(raw)?;
+        Ok(v.get("tokens").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
     /// Ask the reusable asset module to resolve units, check one ERC-20 balance when needed,
     /// and build the single unsigned call. It receives only its slice of the send budget.
     fn build_transfer(&self, chain_id: u64, request_json: &str, b: &Budget) -> Result<Value, String> {
+        // The candidates `token` and `tokenAddress` resolve against; native is implicit.
+        let tokens = self.offered_tokens(chain_id, b)?;
         let t = b.take(ASSETS_BUDGET).ok_or("no time left to build the transfer")?;
         let mut request: Value = serde_json::from_str(request_json)
             .map_err(|e| format!("invalid send request: {e}"))?;
         let object = request.as_object_mut().ok_or("send request must be a JSON object")?;
+        object.insert("tokens".into(), json!(tokens));
         if let Some(deadline) = callee_deadline(t) {
             object.insert("deadlineMs".into(), json!(deadline));
         }
@@ -781,7 +806,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         self.watch_chain_config();
         self.watch_chain_enabled();
         self.watch_scope();
-        self.watch_assets();
+        self.watch_tokens();
     }
 
     fn list_networks(&self) -> String {
@@ -847,8 +872,13 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         };
         let id = chain_id as u64;
         if let Err(e) = self.in_scope_chain(id, &b) { return err(e); }
+        self.ensure_token_list(&b);
+        let tokens = match self.offered_tokens(id, &b) {
+            Ok(rows) => json!(rows).to_string(),
+            Err(e) => return err(e),
+        };
         let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to read offered assets") };
-        match assets_reply(modules().evm_assets_module.list_offered_with_timeout(id as i64, t)) {
+        match assets_reply(modules().evm_assets_module.list_assets_with_timeout(chain_id, &tokens, t)) {
             Ok(mut reply) => {
                 reply["tokenSort"] = json!(s.token_sort.as_str());
                 reply.to_string()
@@ -868,11 +898,22 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Ok(s) => s,
             Err(e) => return err(e),
         };
+        self.ensure_token_list(&b);
+        // The native row as evm_assets draws it off the chain record: its first, given no tokens.
+        let Some(t) = b.take(PROBE_BUDGET) else { return err("no time left to read the token picker") };
+        let listed = modules().evm_assets_module.list_assets_with_timeout(chain_id as i64, "[]", t);
+        let native = match assets_reply(listed).map(|v| v["tokens"][0].clone()) {
+            Ok(row) if row.is_object() => row,
+            Ok(_) => return err("evm_assets_module listed no native asset"),
+            Err(e) => return err(e),
+        };
+        let matches = catalogue::native_matches(&native, &query);
         let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to read the token picker") };
-        match assets_reply(modules().evm_assets_module.list_available_with_timeout(
-            chain_id as i64, &query, offset, limit, t,
+        match token_list_reply(modules().token_list_module.list_available_with_timeout(
+            chain_id as i64, &query, catalogue::provider_offset(matches, offset), limit, t,
         )) {
-            Ok(mut reply) => {
+            Ok(page) => {
+                let mut reply = catalogue::merge_native_page(&native, matches, page, offset, limit);
                 reply["tokenSort"] = json!(s.token_sort.as_str());
                 reply.to_string()
             }
@@ -888,7 +929,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         if let Err(e) = self.in_scope_chain(chain_id as u64, &b) {
             return err(e);
         }
-        self.watch_assets();
+        self.watch_tokens();
         self.ensure_token_list(&b);
         let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to update the token set") };
         match modules().token_list_module.set_token_enabled_with_timeout(chain_id, &address, enabled, t) {
@@ -987,15 +1028,25 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             .filter_map(|record| record.get("chainId").and_then(Value::as_u64))
             .collect();
         // `logos_module` is multi-concurrency and dependency clients are thread-safe. Keep
-        // one handle per chain and join in registry order: wall-clock cost is one bounded
-        // Multicall round trip, while the stable order keeps rendering deterministic.
+        // one handle per chain and join in registry order: wall-clock cost is one chain's
+        // offered read and bounded Multicall round trip, while the stable order keeps
+        // rendering deterministic.
         let chains: Vec<Value> = std::thread::scope(|scope| {
             let handles: Vec<_> = ids.into_iter().map(|chain_id| {
                 let address = &address;
                 let token_sort = settings.token_sort.as_str();
                 (chain_id, scope.spawn(move || {
+                    let b = Budget::new(BALANCES_BUDGET);
+                    let tokens = match self.offered_tokens(chain_id, &b) {
+                        Ok(rows) => json!(rows).to_string(),
+                        // A token_list failure refuses this chain alone, in the per-chain shape.
+                        Err(e) => return Ok(err(e)),
+                    };
+                    let Some(t) = b.take(BALANCES_BUDGET) else {
+                        return Ok(err("no time left to read the balances"));
+                    };
                     modules().evm_assets_module.get_balances_with_timeout(
-                        chain_id as i64, address, token_sort, BALANCES_BUDGET,
+                        chain_id as i64, address, &tokens, token_sort, t,
                     )
                 }))
             }).collect();
@@ -1038,9 +1089,21 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Err(e) => return err(e),
         };
         let history = history::scope(history, &ids);
+        // Each chain decorates with its own offered tokens. One whose read failed decorates
+        // with its native asset alone, and the reply says so.
+        let mut tokens = serde_json::Map::new();
+        let mut unread = Vec::new();
+        for chain in history::chains(&history) {
+            match self.offered_tokens(chain, &b) {
+                Ok(rows) => { tokens.insert(chain.to_string(), json!(rows)); }
+                Err(e) => unread.push(json!({ "chainId": chain, "error": e })),
+            }
+        }
         let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to decorate the history") };
-        match modules().evm_assets_module.decorate_history_with_timeout(&history.to_string(), t) {
-            Ok(reply) => reply,
+        match modules().evm_assets_module.decorate_history_with_timeout(
+            &history.to_string(), &Value::Object(tokens).to_string(), t,
+        ) {
+            Ok(reply) => history::add_decoration_errors(reply, unread),
             Err(e) => err(format!("evm_assets_module: {e:?}")),
         }
     }

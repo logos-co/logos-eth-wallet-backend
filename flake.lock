@@ -182,17 +182,14 @@
         ],
         "logos-module-builder": [
           "logos-module-builder"
-        ],
-        "token_list_module": [
-          "token_list_module"
         ]
       },
       "locked": {
-        "lastModified": 1789518787,
-        "narHash": "sha256-lEiviODU0UtvzO+p1qX1ytRBKMP5poUlHhLBUokhVHI=",
+        "lastModified": 1789773624,
+        "narHash": "sha256-WuVHCyOad6xltRZPXUxBw3RA/0ozbwHVvpd+vEzZYAQ=",
         "owner": "logos-co",
         "repo": "logos-evm-assets-module",
-        "rev": "58f7077acacacf47e7f266748275a8cbd50aae8a",
+        "rev": "e1d719e68c407710fe31596fdc8b4e56a363b1e6",
         "type": "github"
       },
       "original": {

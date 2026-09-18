@@ -1,6 +1,7 @@
 //! The rule this file holds: a method that changes persisted or observable state announces
 //! it, on the change alone and after the write; a pure reader announces nothing; and what
-//! the sender announces reaches this module's subscribers unchanged.
+//! the sender announces reaches this module's subscribers unchanged, as does a move in
+//! either owner of the token rows.
 //!
 //! `glue.rs` is behind the `logos_module` feature and `--no-default-features` cannot compile
 //! it, so it is read as text. Every check pins the SITE rather than the vocabulary, and every
@@ -318,8 +319,8 @@ fn no_read_announces_itself() {
 fn a_read_that_announces_itself_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        match modules().evm_assets_module.decorate_history_with_timeout(&history.to_string(), t) {",
-        "        emit_balances_updated(&address);\n        match modules().evm_assets_module.decorate_history_with_timeout(&history.to_string(), t) {",
+        "        match modules().evm_assets_module.decorate_history_with_timeout(",
+        "        emit_balances_updated(&address);\n        match modules().evm_assets_module.decorate_history_with_timeout(",
     );
     let e = check_readers_stay_silent(&mutant).unwrap_err();
     assert!(e.contains("get_history"), "{e}");
@@ -378,4 +379,43 @@ fn a_relay_that_swallows_an_event_is_caught() {
     );
     let e = check_the_sender_relay_re_emits_everything(&mutant).unwrap_err();
     assert!(e.contains("decode_history_changed"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------
+// 5. A move in either owner of the token rows is a `tokens_changed`.
+// ---------------------------------------------------------------------------------------
+
+/// token_list owns the offered rows and eth_rpc's chain record the native row that heads
+/// them, so a move in either is this module's `tokens_changed`.
+fn check_both_token_owners_are_relayed(src: &str) -> Result<(), String> {
+    let code = code_only(src);
+    let fns = functions(&code);
+    for (relay, decode) in [
+        ("watch_tokens", "decode_tokens_updated"),
+        ("watch_chain_config", "decode_chain_config_changed"),
+    ] {
+        let body = bodies_of(&fns, &code, relay)[0];
+        let at = body.find(decode).ok_or_else(|| format!("{relay} no longer decodes {decode}"))?;
+        let arm = &body[at..block_end(body, at)];
+        if !arm.contains("emit_tokens_changed(") {
+            return Err(format!("{relay} decodes {decode} and does not announce tokens_changed"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_move_in_either_owner_of_the_token_rows_is_announced() {
+    check_both_token_owners_are_relayed(GLUE).unwrap();
+}
+
+#[test]
+fn a_chain_record_change_that_leaves_the_token_rows_stale_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "                    // The record names the native asset, and its row heads every token list.\n                    emit_tokens_changed(e.chain_id);\n",
+        "",
+    );
+    let e = check_both_token_owners_are_relayed(&mutant).unwrap_err();
+    assert!(e.contains("watch_chain_config"), "{e}");
 }
