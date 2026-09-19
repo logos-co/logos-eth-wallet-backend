@@ -70,10 +70,11 @@ jobs:
           out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
           for t in money_leaves_only_through_tx_sender_module \
                    the_send_path_resolves_a_token_to_one_contract \
+                   eth_rpc_defaults_are_asked_for_at_startup_and_before_every_registry_read \
                    every_event_this_module_declares_is_emitted_somewhere \
                    the_sender_relay_re_emits_every_event_it_subscribes_to \
                    the_keystore_relay_arms_once_listens_off_thread_and_closes_its_own_window; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 75 ]
+          echo "tests: $n"; [ "$n" -ge 90 ]

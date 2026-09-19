@@ -1,6 +1,6 @@
 //! A source-shape guard on `glue.rs`: no outbound call is made under a lock, every call is
-//! bounded or argued for, a send names one contract, and money leaves ONLY through
-//! `tx_sender_module`.
+//! bounded or argued for, a send names one contract, money leaves ONLY through
+//! `tx_sender_module`, and eth_rpc's defaults are asked for with no gate.
 //!
 //! `glue.rs` is behind the `logos_module` feature and `--no-default-features` cannot compile
 //! it, so it is read as text. Two rules keep these honest:
@@ -551,4 +551,56 @@ fn a_send_with_no_claim_line_is_caught() {
     );
     let e = check_money_leaves_through_the_sender(&mutant).unwrap_err();
     assert!(e.contains("does not forward"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------
+// 8. eth_rpc's defaults are asked for, never gated.
+// ---------------------------------------------------------------------------------------
+
+/// eth_rpc owns its defaults and this wallet asks for them: at startup and in front of every
+/// registry read, until one answer lands. A `config_status` gate would strand them: a store
+/// another app already wrote to reads `configured` and still lacks what it needs.
+fn check_eth_rpc_defaults_are_asked_for(src: &str) -> Result<(), String> {
+    let full = code_only(src);
+    let code = non_test(&full);
+    let fns = functions(code);
+    let asks = sites(code, ".eth_rpc_module.init_defaults_with_timeout(");
+    if asks.len() != 1 || enclosing_fn(&fns, asks[0]) != "ensure_eth_rpc" {
+        return Err(format!(
+            "eth_rpc's defaults must be asked for in `ensure_eth_rpc` alone; found {} sites",
+            asks.len()
+        ));
+    }
+    if no_ws(code).contains(".eth_rpc_module.config_status") {
+        return Err("eth_rpc's `config_status` is read: its defaults must not be gated on it".into());
+    }
+    for caller in ["on_context_ready", "chain_configs"] {
+        if !bodies_of(&fns, code, caller).iter().any(|b| b.contains("self.ensure_eth_rpc(")) {
+            return Err(format!("`{caller}` does not ask eth_rpc for its defaults"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn eth_rpc_defaults_are_asked_for_at_startup_and_before_every_registry_read() {
+    check_eth_rpc_defaults_are_asked_for(GLUE).unwrap();
+}
+
+#[test]
+fn a_config_status_gate_on_eth_rpc_defaults_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "let applied = modules().eth_rpc_module.init_defaults_with_timeout(t);",
+        "let _ = modules().eth_rpc_module.config_status_with_timeout(t);\n        let applied = modules().eth_rpc_module.init_defaults_with_timeout(t);",
+    );
+    let e = check_eth_rpc_defaults_are_asked_for(&mutant).unwrap_err();
+    assert!(e.contains("config_status"), "{e}");
+}
+
+#[test]
+fn a_registry_read_that_skips_the_defaults_is_caught() {
+    let mutant = mutate(GLUE, "        self.ensure_eth_rpc(b);\n", "");
+    let e = check_eth_rpc_defaults_are_asked_for(&mutant).unwrap_err();
+    assert!(e.contains("chain_configs"), "{e}");
 }
