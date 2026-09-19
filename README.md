@@ -41,8 +41,10 @@ reads: token_list writes its defaults only when nothing is configured.
   mistaken for a dead proxy.
 - `get_history(address)` asks the sender for all locally recorded chains, filters to the
   current device scope, then asks `evm_assets_module` to decorate every row by its own
-  `(chainId, contract)` against that chain's offered tokens. This is local sender history,
-  not a chain indexer.
+  `(chainId, contract)` against that chain's offered tokens, plus token_list's catalogue
+  rows for any other token a transfer moved, such as a swap's other side. If decorating
+  fails, the rows come back undecorated with `decorationErrors` saying why, not as an
+  error. This is local sender history, not a chain indexer.
 - `suggest_fees(chain_id)`, `refresh_pending(address)`, `refresh_tx_status(address, hash)` and
   `get_tx_details(address, hash)` preserve the owning module's structured reply.
 

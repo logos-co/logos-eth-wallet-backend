@@ -679,6 +679,16 @@ impl EthWalletBackendImpl {
         Ok(v.get("tokens").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
+    /// The catalogue's rows for `addresses` on `chain_id`, whether or not the user enabled them.
+    fn catalogue_tokens(&self, chain_id: u64, addresses: &[String], b: &Budget) -> Result<Vec<Value>, String> {
+        let t = b.take(OFFERED_BUDGET).ok_or("no time left to name the transferred tokens")?;
+        let raw = modules().token_list_module.get_tokens_by_address_with_timeout(
+            chain_id as i64, &json!(addresses).to_string(), t,
+        );
+        let v = token_list_reply(raw)?;
+        Ok(v.get("tokens").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
     /// Ask the reusable asset module to resolve units, check one ERC-20 balance when needed,
     /// and build the single unsigned call. It receives only its slice of the send budget.
     fn build_transfer(&self, chain_id: u64, request_json: &str, b: &Budget) -> Result<Value, String> {
@@ -1103,22 +1113,39 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             Err(e) => return err(e),
         };
         let history = history::scope(history, &ids);
-        // Each chain decorates with its own offered tokens. One whose read failed decorates
-        // with its native asset alone, and the reply says so.
+        // Each chain decorates with its own offered tokens, then the catalogue's rows for any
+        // other token its transfers moved. One whose read failed decorates with its native
+        // asset alone, and the reply says so.
         let mut tokens = serde_json::Map::new();
         let mut unread = Vec::new();
         for chain in history::chains(&history) {
             match self.offered_tokens(chain, &b) {
-                Ok(rows) => { tokens.insert(chain.to_string(), json!(rows)); }
+                Ok(mut rows) => {
+                    let others = history::unlisted_contracts(&history, chain, &rows);
+                    if !others.is_empty() {
+                        match self.catalogue_tokens(chain, &others, &b) {
+                            Ok(more) => rows.extend(more),
+                            Err(e) => unread.push(json!({ "chainId": chain, "error": e })),
+                        }
+                    }
+                    tokens.insert(chain.to_string(), json!(rows));
+                }
                 Err(e) => unread.push(json!({ "chainId": chain, "error": e })),
             }
         }
-        let Some(t) = b.take(CATALOGUE_BUDGET) else { return err("no time left to decorate the history") };
+        // Rows left undecorated beat none: a failed read clears the view's list and its banner.
+        let Some(t) = b.take(CATALOGUE_BUDGET) else {
+            return history::undecorated(history, "no time left to decorate the history");
+        };
         match modules().evm_assets_module.decorate_history_with_timeout(
             &history.to_string(), &Value::Object(tokens).to_string(), t,
         ) {
-            Ok(reply) => history::add_decoration_errors(reply, unread),
-            Err(e) => err(format!("evm_assets_module: {e:?}")),
+            Ok(reply) if serde_json::from_str::<Value>(&reply).ok()
+                .and_then(|v| v.get("ok").and_then(Value::as_bool)) == Some(true) => {
+                history::add_decoration_errors(reply, unread)
+            }
+            Ok(reply) => history::undecorated(history, &format!("evm_assets_module: {reply}")),
+            Err(e) => history::undecorated(history, &format!("evm_assets_module: {e:?}")),
         }
     }
 

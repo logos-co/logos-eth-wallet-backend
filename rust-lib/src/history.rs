@@ -50,6 +50,37 @@ pub fn chains(history: &Value) -> Vec<u64> {
     out
 }
 
+/// Token contracts the rows' transfers moved on `chain` that `offered` does not describe,
+/// once each: a swap's other side is named from the catalogue, not left in base units.
+pub fn unlisted_contracts(history: &Value, chain: u64, offered: &[Value]) -> Vec<String> {
+    let known = |a: &str| offered.iter().any(|row| {
+        row.get("address").and_then(Value::as_str).is_some_and(|o| o.eq_ignore_ascii_case(a))
+    });
+    let mut out: Vec<String> = Vec::new();
+    let rows = history.get("transactions").and_then(Value::as_array).into_iter().flatten();
+    for row in rows.filter(|row| chain_id(row) == Some(chain)) {
+        let transfers = row.get("transfers").and_then(Value::as_array).into_iter().flatten();
+        for contract in transfers.filter_map(|t| t.get("contract").and_then(Value::as_str)) {
+            let lower = contract.to_ascii_lowercase();
+            if !known(contract) && !out.contains(&lower) {
+                out.push(lower);
+            }
+        }
+    }
+    out
+}
+
+/// The sender's rows as they came, when decorating them failed: they still carry their
+/// status, nonce and ether figures, so the view keeps the list rather than losing it.
+pub fn undecorated(mut history: Value, error: &str) -> String {
+    let errors: Vec<Value> = chains(&history).into_iter()
+        .map(|chain| json!({ "chainId": chain, "error": error }))
+        .collect();
+    history["ok"] = json!(true);
+    history["decorationErrors"] = json!(errors);
+    history.to_string()
+}
+
 /// Report the chains whose offered tokens went unread in the decorated reply's
 /// `decorationErrors`, one entry per chain as when evm_assets read them. A refusal is relayed.
 pub fn add_decoration_errors(reply: String, unread: Vec<Value>) -> String {
@@ -129,5 +160,32 @@ mod tests {
         let refused = json!({"ok":false,"error":"invalid history"}).to_string();
         let unread = vec![json!({"chainId":1,"error":"x"})];
         assert_eq!(add_decoration_errors(refused.clone(), unread), refused, "a refusal stays one");
+    }
+
+    #[test]
+    fn only_contracts_the_offered_rows_do_not_describe_are_looked_up() {
+        let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+        let usdt = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+        let value = json!({"transactions":[
+            {"chainId":1,"transfers":[{"contract":weth},{"contract":usdt}]},
+            {"chainId":1,"transfers":[{"contract":usdt.to_ascii_lowercase()}]},
+            {"chainId":10,"transfers":[{"contract":"0x4200000000000000000000000000000000000006"}]},
+            {"chainId":1}
+        ]});
+        let offered = [json!({"address": weth.to_ascii_lowercase(), "symbol":"WETH"})];
+        assert_eq!(unlisted_contracts(&value, 1, &offered), [usdt.to_ascii_lowercase()]);
+        assert!(unlisted_contracts(&value, 5, &offered).is_empty());
+    }
+
+    #[test]
+    fn rows_that_could_not_be_decorated_are_kept_and_say_why() {
+        let rows = json!({"transactions":[{"chainId":10,"nonce":4,"status":"pending"},{"chainId":1}],
+                          "stillDue":true});
+        let out: Value = serde_json::from_str(&undecorated(rows.clone(), "evm_assets_module: Timeout")).unwrap();
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["transactions"], rows["transactions"]);
+        assert_eq!(out["stillDue"], json!(true));
+        assert_eq!(out["decorationErrors"], json!([{"chainId":10,"error":"evm_assets_module: Timeout"},
+                                                   {"chainId":1,"error":"evm_assets_module: Timeout"}]));
     }
 }
