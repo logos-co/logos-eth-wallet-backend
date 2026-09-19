@@ -18,6 +18,10 @@ pub const INIT_BUDGET: Duration = Duration::from_secs(5);
 /// ~86 KB of JSON to serialize, ship and parse — an order of magnitude more than a probe.
 pub const CATALOGUE_BUDGET: Duration = Duration::from_secs(3);
 
+/// One `token_list` offered-rows read: local, and only the pinned and enabled rows, so a small
+/// slice in front of the call that consumes them.
+pub const OFFERED_BUDGET: Duration = Duration::from_secs(1);
+
 /// One JSON-RPC round trip through `eth_rpc`, or one keystore read. Unlike the two above
 /// this crosses a network, so 3s is a working number rather than slack.
 pub const RPC_BUDGET: Duration = Duration::from_secs(3);
@@ -47,9 +51,9 @@ const CALLEE_MARGIN: Duration = Duration::from_millis(300);
 pub const READ_BUDGET: Duration = Duration::from_secs(4);
 pub const STARTUP_BUDGET: Duration = Duration::from_secs(6);
 
-/// A send's outbound work: validate the requested chain against the registry, delegate one
-/// transfer build, then ask `tx_sender_module` to price or submit it.
-pub const SEND_BUDGET: Duration = Duration::from_secs(15);
+/// A send's outbound work: validate the requested chain against the registry, read the
+/// offered tokens, delegate one transfer build, then ask `tx_sender_module` to price or submit.
+pub const SEND_BUDGET: Duration = Duration::from_secs(16);
 
 /// The one delegated call of a send: `tx_sender_module.prepare` or `.send`, which itself runs
 /// a gate, a fee estimate, a balance and a nonce read, and the approval request. Its own
@@ -57,9 +61,9 @@ pub const SEND_BUDGET: Duration = Duration::from_secs(15);
 /// bare transport timeout.
 pub const SENDER_BUDGET: Duration = Duration::from_secs(9);
 
-/// Resolve and build one transfer in `evm_assets_module`. Together with the registry read
-/// and sender allowance this exactly fits the public send budget; the callee gets a slightly
-/// shorter deadline so its structured error still has time to return.
+/// Resolve and build one transfer in `evm_assets_module`. Together with the registry read,
+/// the offered read and the sender allowance this exactly fits the public send budget; the
+/// callee gets a slightly shorter deadline so its structured error still has time to return.
 pub const ASSETS_BUDGET: Duration = Duration::from_millis(4_500);
 
 /// One relayed `send_status`: the sender reads the approval, collects the signatures, gates,
@@ -70,13 +74,13 @@ pub const STATUS_BUDGET: Duration = Duration::from_secs(18);
 /// One relayed history read or receipt sweep: the sender's own sweep allowance is 10s.
 pub const HISTORY_BUDGET: Duration = Duration::from_secs(12);
 
-/// One `get_balances`: the lazy eth_rpc retry, the verified gate, and the single Multicall3
-/// read that answers every row. The gate is INSIDE it — an unbounded probe in front of a
-/// read is time a user waits that no budget can see — and it is sized so the gate and the
-/// read both fit, because a balance list cannot degrade the way a network row can.
-/// evm_assets reserves up to fourteen seconds for catalogue composition plus a verified
-/// Multicall3 proof. Leave it one second for the reply to cross back through this composer;
-/// together with registry discovery the public call still fits the UI's 20s transport bound.
+/// One chain's `get_balances`: its offered rows, then the lazy eth_rpc retry, the verified
+/// gate, and the single Multicall3 read that answers every row. The gate is INSIDE it — an
+/// unbounded probe in front of a read is time a user waits that no budget can see — and it is
+/// sized so the gate and the read both fit, because a balance list cannot degrade the way a
+/// network row can. evm_assets reserves up to fourteen seconds for the chain record plus a
+/// verified Multicall3 proof; the offered read goes first and always leaves it that much.
+/// Together with registry discovery the public call still fits the UI's 20s transport bound.
 pub const BALANCES_BUDGET: Duration = Duration::from_secs(15);
 
 /// One `suggest_fees`: the verified gate and one `fee_module` estimate.
@@ -155,12 +159,13 @@ mod tests {
         assert!(walk(READ_BUDGET, &calls) <= READ_BUDGET);
     }
 
-    /// A send: the gate, a token balance read, then the one delegated call to the sender.
-    /// The delegated call gets the lion's share — it is where the fee, the nonce and the
-    /// approval happen — and it must fit AFTER the two reads in front of it.
+    /// A send: the gate, the offered tokens, the transfer build with its token balance read,
+    /// then the one delegated call to the sender. The delegated call gets the lion's share —
+    /// it is where the fee, the nonce and the approval happen — and it must fit AFTER the
+    /// three calls in front of it.
     #[test]
     fn a_send_is_bounded_across_its_reads_and_the_delegated_call() {
-        let calls = [PROBE_BUDGET, ASSETS_BUDGET, SENDER_BUDGET];
+        let calls = [PROBE_BUDGET, OFFERED_BUDGET, ASSETS_BUDGET, SENDER_BUDGET];
         assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
         assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "every call must fit");
         assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
@@ -168,6 +173,16 @@ mod tests {
         // brings its reply home — and that is still a working allowance.
         let handed = callee_deadline(SENDER_BUDGET).expect("worth bounding");
         assert!(handed >= 8_000, "the sender needs room for four calls of its own: {handed}ms");
+        assert!(SEND_BUDGET < Duration::from_secs(20), "inside the view's 20s transport");
+    }
+
+    /// Per chain the offered read goes first and evm_assets gets the rest, which must cover
+    /// the fourteen seconds it bounds its own balance read at.
+    #[test]
+    fn a_chains_offered_read_leaves_the_assets_read_its_own_bound() {
+        let assets_own = Duration::from_secs(14);
+        let left = slice(BALANCES_BUDGET, OFFERED_BUDGET, BALANCES_BUDGET).expect("time left");
+        assert!(left >= assets_own, "{left:?}");
     }
 
     /// The relays sit under the protocol's 20s default, so a slow sender reports its own
