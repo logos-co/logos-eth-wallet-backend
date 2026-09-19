@@ -201,9 +201,10 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// Returns `{ ok, chainId, from, to, amount, amountDisplay, amountExact, amountSymbol,
     /// amountDecimals, nativeSymbol, token?, tokenAddress, nonce, gasLimit, maxFeePerGas,
     /// maxPriorityFeePerGas, maxCostWei(+Display/Exact), feeCeilingWei(+Display/Exact),
-    /// feeSource, route, feeRoute }`. `feeCeilingWei` is `maxFeePerGas × gasLimit` — a
-    /// ceiling, never a price, so a view must say "at most". No approval is requested and no
-    /// nonce is reserved, so it is safe to call on every keystroke.
+    /// feeSource, replaces, route, feeRoute }`. `feeCeilingWei` is `maxFeePerGas × gasLimit` —
+    /// a ceiling, never a price, so a view must say "at most". `replaces` is the sender's word
+    /// on a pinned nonce outbidding a transaction still pending there, else null. No approval
+    /// is requested and no nonce is reserved, so it is safe to call on every keystroke.
     fn prepare_send(&self, request_json: String) -> String;
 
     /// Ask a human to approve a send. Takes the same `request_json` as `prepare_send`.
@@ -732,7 +733,7 @@ impl EthWalletBackendImpl {
         } else {
             built.get("symbol").cloned().unwrap_or(Value::Null)
         };
-        for key in ["nonce", "gasLimit", "maxFeePerGas", "maxPriorityFeePerGas", "feeSource"] {
+        for key in ["nonce", "gasLimit", "maxFeePerGas", "maxPriorityFeePerGas", "feeSource", "replaces"] {
             v[key] = priced.get(key).cloned().unwrap_or(Value::Null);
         }
         for key in ["maxCostWei", "feeCeilingWei"] {
