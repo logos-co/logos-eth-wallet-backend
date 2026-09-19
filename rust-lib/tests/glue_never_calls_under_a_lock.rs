@@ -535,8 +535,8 @@ fn money_leaves_only_through_tx_sender_module() {
 fn a_wallet_that_broadcasts_itself_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))",
-        "        let _ = modules().eth_rpc_module.send_raw_transaction_with_timeout(1, &request_id, t);\n        relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))",
+        "        send_status::relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))",
+        "        let _ = modules().eth_rpc_module.send_raw_transaction_with_timeout(1, &request_id, t);\n        send_status::relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))",
     );
     let e = check_money_leaves_through_the_sender(&mutant).unwrap_err();
     assert!(e.contains("send_raw_transaction"), "{e}");
