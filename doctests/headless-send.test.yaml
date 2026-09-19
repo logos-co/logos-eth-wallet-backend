@@ -270,12 +270,14 @@ sections:
           `send_status` is the wallet's word on where a send got to. Before the human has
           answered it says `awaitingApproval`, and carries no `hash` — checked explicitly,
           because a hash here would mean a signature existed before anyone approved it.
+          `final: false` is the sender telling the poller to come back.
         run: |
           ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send_status "$(cat rid.txt)" --human | tee status0.json
           python3 -c 'import json; d=json.load(open("status0.json")); print("HASH_BEFORE_APPROVAL=" + ("yes" if d.get("hash") else "no"))'
         code_block: "logosctl call eth_wallet_backend send_status <requestId>"
         expect_contains:
           - '"status":"awaitingApproval"'
+          - '"final":false'
           - "HASH_BEFORE_APPROVAL=no"
       - run: "sleep 3"
       - title: "The prompt, in the keystore's words"
@@ -327,11 +329,12 @@ sections:
         text: |
           There is no background advancer: `send_status` **is** the broadcast. The first
           poll after the approval collects the signature, sends the transaction exactly
-          once, records it, and answers `broadcast` with the hash.
+          once, records it, and answers `broadcast` with the hash. The loop polls until
+          `final`, and on nothing else.
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10; do
             out=$(./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send_status "$(cat rid.txt)" --human)
-            case "$out" in *'"status":"broadcast"'*|*'"status":"failed"'*|*'"status":"rejected"'*) break;; esac
+            case "$out" in *'"final":true'*) break;; esac
             sleep 2
           done
           echo "$out" | tee status1.json
@@ -339,6 +342,7 @@ sections:
         code_block: "logosctl call eth_wallet_backend send_status <requestId>"
         expect_contains:
           - '"status":"broadcast"'
+          - '"final":true'
           - '"route":"direct"'
           - '"hash":"0x'
 
@@ -401,6 +405,7 @@ sections:
         code_block: "logosctl call eth_wallet_backend send_status <requestId>"
         expect_contains:
           - '"status":"rejected"'
+          - '"final":true'
       - title: "Nothing moved"
         run: "./foundry/bin/cast balance 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://127.0.0.1:8545 --ether"
         code_block: "cast balance 0x7099…79C8 --rpc-url http://127.0.0.1:8545 --ether"

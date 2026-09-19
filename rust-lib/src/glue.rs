@@ -31,6 +31,7 @@ use crate::catalogue;
 use crate::contacts::ContactsStore;
 use crate::depinit::{self, Next};
 use crate::history;
+use crate::send_status;
 use crate::settings::{Settings, SettingsStore};
 use crate::settings::TokenSort;
 use crate::verified;
@@ -216,10 +217,15 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
 
     /// Advance a pending send and report where it got to. Poll this — the sender broadcasts
     /// on this call, exactly once, and records the row before the transaction leaves.
-    /// `{ ok, requestId, handle, status, hash?, hashes, route?, reason?, origin, purpose,
-    /// legs }` where `status` is `awaitingApproval` | `broadcasting` | `stuck` | `broadcast`
-    /// | `rejected` | `cancelled` | `failed`. A reply carrying `blocked: true` is a send being
-    /// HELD by the verified-proxy gate, not a failed one: keep polling, or `cancel_send`.
+    /// `{ ok, requestId, handle, status, final, hash?, hashes, route?, reason?, origin,
+    /// purpose, legs }` where `status` is `awaitingApproval` | `broadcasting` | `stuck` |
+    /// `broadcast` | `rejected` | `cancelled` | `failed`. A reply carrying `blocked: true` is a
+    /// send being HELD by the verified-proxy gate, not a failed one: keep polling, or
+    /// `cancel_send`.
+    ///
+    /// Poll until `final` is true, refusals included: `{ ok: false, error, final: false }` is
+    /// a poll that may yet succeed. `final` is the sender's own, read off `status` for a
+    /// sender that predates it; a sender that did not answer is never final.
     fn send_status(&self, request_id: String) -> String;
 
     /// Withdraw a send that has not been approved yet, releasing its reserved nonce.
@@ -1163,8 +1169,10 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
 
     fn send_status(&self, request_id: String) -> String {
         let b = Budget::new(STATUS_BUDGET);
-        let Some(t) = b.take(STATUS_BUDGET) else { return err("no time left to read the send") };
-        relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))
+        let Some(t) = b.take(STATUS_BUDGET) else {
+            return send_status::refused("no time left to read the send");
+        };
+        send_status::relay(modules().tx_sender_module.send_status_with_timeout(&request_id, t))
     }
 
     fn cancel_send(&self, request_id: String) -> String {

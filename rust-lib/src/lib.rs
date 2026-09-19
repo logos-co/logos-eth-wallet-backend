@@ -14,6 +14,7 @@ pub mod catalogue;
 pub mod contacts;
 pub mod depinit;
 pub mod history;
+pub mod send_status;
 pub mod settings;
 pub mod store;
 pub mod verified;

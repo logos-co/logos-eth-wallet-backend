@@ -69,6 +69,12 @@ the candidates, then passes the resulting unsigned call to `tx_sender_module`. I
 or broadcasts itself. `send` returns a pending request; `send_status` advances the
 approval/broadcast state machine.
 
+Poll `send_status` until `final` is true, and on nothing else. `final` is the sender's own:
+false while the send awaits approval or is broadcasting, and false on a refusal that may yet
+pass — a refusal is final only when the sender no longer holds the request. A sender that
+predates `final` is read off `status` (only `awaitingApproval` and `broadcasting` still move,
+and none of its refusals is final), and a sender that did not answer is never final.
+
 For ERC-20s, `tokenAddress` is the identity and wins over `token`. An ambiguous symbol is
 refused. For native sends the sender remains responsible for native affordability and fees.
 
@@ -106,5 +112,6 @@ nix build .#default .#lgx
 ```
 
 The Rust suite covers exact amounts, contacts, settings, dependency startup, verified-proxy
-refusals and source-shape guards. `doctests/headless-send.test.yaml` stages the full module
-graph, including `evm_assets_module`, and exercises the public composer contract.
+refusals, the `send_status` relay and source-shape guards. `doctests/headless-send.test.yaml`
+stages the full module graph, including `evm_assets_module`, and exercises the public
+composer contract.
