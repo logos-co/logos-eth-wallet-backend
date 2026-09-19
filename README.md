@@ -19,7 +19,8 @@ device scope is the `mainnets`, `testnets`, or `both` setting owned by `eth_rpc_
 On start, and in front of every registry read until one call lands, the composer asks
 `eth_rpc_module.init_defaults` for the default chains. It does not ask `config_status` first:
 eth_rpc fills only what is absent and seeds a default chain at most once per device.
-`token_list_module`'s defaults are applied only when it reports `unconfigured`.
+`token_list_module.init_defaults` is asked the same way, on start and in front of the token
+reads: token_list writes its defaults only when nothing is configured.
 
 ## Read contract
 

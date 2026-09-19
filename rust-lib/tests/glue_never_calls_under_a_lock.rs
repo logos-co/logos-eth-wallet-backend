@@ -1,6 +1,6 @@
 //! A source-shape guard on `glue.rs`: no outbound call is made under a lock, every call is
 //! bounded or argued for, a send names one contract, money leaves ONLY through
-//! `tx_sender_module`, and eth_rpc's defaults are asked for with no gate.
+//! `tx_sender_module`, and eth_rpc's and token_list's defaults are asked for with no gate.
 //!
 //! `glue.rs` is behind the `logos_module` feature and `--no-default-features` cannot compile
 //! it, so it is read as text. Two rules keep these honest:
@@ -554,37 +554,59 @@ fn a_send_with_no_claim_line_is_caught() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 8. eth_rpc's defaults are asked for, never gated.
+// 8. eth_rpc's and token_list's defaults are asked for, never gated.
 // ---------------------------------------------------------------------------------------
 
-/// eth_rpc owns its defaults and this wallet asks for them: at startup and in front of every
-/// registry read, until one answer lands. A `config_status` gate would strand them: a store
-/// another app already wrote to reads `configured` and still lacks what it needs.
-fn check_eth_rpc_defaults_are_asked_for(src: &str) -> Result<(), String> {
+/// Each dependency owns its defaults and fills only what is absent, and this wallet asks for
+/// them: at startup and in front of the reads that need them, until one answer lands. A
+/// `config_status` gate would strand eth_rpc's: a store another app already wrote to reads
+/// `configured` and still lacks what it needs.
+fn check_defaults_are_asked_for(
+    src: &str,
+    dep: &str,
+    ensure: &str,
+    callers: &[&str],
+) -> Result<(), String> {
     let full = code_only(src);
     let code = non_test(&full);
     let fns = functions(code);
-    let asks = sites(code, ".eth_rpc_module.init_defaults_with_timeout(");
-    if asks.len() != 1 || enclosing_fn(&fns, asks[0]) != "ensure_eth_rpc" {
+    let asks = sites(code, &format!(".{dep}.init_defaults_with_timeout("));
+    if asks.len() != 1 || enclosing_fn(&fns, asks[0]) != ensure {
         return Err(format!(
-            "eth_rpc's defaults must be asked for in `ensure_eth_rpc` alone; found {} sites",
+            "{dep}'s defaults must be asked for in `{ensure}` alone; found {} sites",
             asks.len()
         ));
     }
-    if no_ws(code).contains(".eth_rpc_module.config_status") {
-        return Err("eth_rpc's `config_status` is read: its defaults must not be gated on it".into());
+    if no_ws(code).contains(&format!(".{dep}.config_status")) {
+        return Err(format!("{dep}'s `config_status` is read: its defaults must not be gated on it"));
     }
-    for caller in ["on_context_ready", "chain_configs"] {
-        if !bodies_of(&fns, code, caller).iter().any(|b| b.contains("self.ensure_eth_rpc(")) {
-            return Err(format!("`{caller}` does not ask eth_rpc for its defaults"));
+    let call = format!("self.{ensure}(");
+    for caller in callers {
+        if !bodies_of(&fns, code, caller).iter().any(|b| b.contains(&call)) {
+            return Err(format!("`{caller}` does not ask {dep} for its defaults"));
         }
     }
     Ok(())
 }
 
+fn check_eth_rpc_defaults_are_asked_for(src: &str) -> Result<(), String> {
+    let callers = ["on_context_ready", "chain_configs"];
+    check_defaults_are_asked_for(src, "eth_rpc_module", "ensure_eth_rpc", &callers)
+}
+
+fn check_token_list_defaults_are_asked_for(src: &str) -> Result<(), String> {
+    let callers = ["on_context_ready", "list_tokens", "list_available_tokens", "set_token_enabled"];
+    check_defaults_are_asked_for(src, "token_list_module", "ensure_token_list", &callers)
+}
+
 #[test]
 fn eth_rpc_defaults_are_asked_for_at_startup_and_before_every_registry_read() {
     check_eth_rpc_defaults_are_asked_for(GLUE).unwrap();
+}
+
+#[test]
+fn token_list_defaults_are_asked_for_at_startup_and_before_its_token_reads() {
+    check_token_list_defaults_are_asked_for(GLUE).unwrap();
 }
 
 #[test]
@@ -599,8 +621,30 @@ fn a_config_status_gate_on_eth_rpc_defaults_is_caught() {
 }
 
 #[test]
+fn a_config_status_gate_on_token_list_defaults_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "let applied = modules().token_list_module.init_defaults_with_timeout(t);",
+        "let _ = modules().token_list_module.config_status_with_timeout(t);\n        let applied = modules().token_list_module.init_defaults_with_timeout(t);",
+    );
+    let e = check_token_list_defaults_are_asked_for(&mutant).unwrap_err();
+    assert!(e.contains("config_status"), "{e}");
+}
+
+#[test]
 fn a_registry_read_that_skips_the_defaults_is_caught() {
     let mutant = mutate(GLUE, "        self.ensure_eth_rpc(b);\n", "");
     let e = check_eth_rpc_defaults_are_asked_for(&mutant).unwrap_err();
     assert!(e.contains("chain_configs"), "{e}");
+}
+
+#[test]
+fn a_token_read_that_skips_the_defaults_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "        self.watch_tokens();\n        self.ensure_token_list(&b);\n",
+        "        self.watch_tokens();\n",
+    );
+    let e = check_token_list_defaults_are_asked_for(&mutant).unwrap_err();
+    assert!(e.contains("set_token_enabled"), "{e}");
 }

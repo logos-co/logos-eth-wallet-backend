@@ -250,8 +250,8 @@ mod tests {
 
     #[test]
     fn the_load_hook_is_bounded_too() {
-        // ensure_eth_rpc (init_defaults) then ensure_token_list (config_status + init).
-        let calls = [INIT_BUDGET, PROBE_BUDGET, INIT_BUDGET];
+        // ensure_eth_rpc then ensure_token_list, one init_defaults each.
+        let calls = [INIT_BUDGET, INIT_BUDGET];
         assert!(calls.iter().sum::<Duration>() > STARTUP_BUDGET);
         assert!(walk(STARTUP_BUDGET, &calls) <= STARTUP_BUDGET);
     }

@@ -29,7 +29,7 @@ use crate::budget::{
 };
 use crate::catalogue;
 use crate::contacts::ContactsStore;
-use crate::depinit::{self, Next};
+use crate::depinit;
 use crate::history;
 use crate::send_status;
 use crate::settings::{Settings, SettingsStore};
@@ -631,28 +631,16 @@ impl EthWalletBackendImpl {
         }
     }
 
-    /// Ask token_list whether it holds a config and, only if it says it holds none, tell it
-    /// to apply its own defaults. Unkeyed, so the gate is mandatory; an `Err` or an `unready`
-    /// initializes nothing — a call that did not arrive is not an empty config.
+    /// Have token_list apply its own defaults. No `config_status` gate: it writes them only
+    /// when nothing is configured, so a config another app or the user set is never replaced.
     fn ensure_token_list(&self, b: &Budget) {
         if self.deps.token_list.load(Ordering::Relaxed) {
             return;
         }
-        let Some(t) = b.take(PROBE_BUDGET) else { return };
-        let Ok(status) = modules().token_list_module.config_status_with_timeout(t) else {
-            return;
-        };
-        match depinit::next_step(&status) {
-            Next::Settled => self.deps.token_list.store(true, Ordering::Relaxed),
-            Next::Initialize => {
-                let Some(t) = b.take(INIT_BUDGET) else { return };
-                let applied = modules().token_list_module.init_defaults_with_timeout(t);
-                // `applied: false` is another consumer having got there first, not a failure.
-                if applied.map(|raw| depinit::reply_ok(&raw)).unwrap_or(false) {
-                    self.deps.token_list.store(true, Ordering::Relaxed);
-                }
-            }
-            Next::AskAgain => {}
+        let Some(t) = b.take(INIT_BUDGET) else { return };
+        let applied = modules().token_list_module.init_defaults_with_timeout(t);
+        if applied.map(|raw| depinit::reply_ok(&raw)).unwrap_or(false) {
+            self.deps.token_list.store(true, Ordering::Relaxed);
         }
     }
 
