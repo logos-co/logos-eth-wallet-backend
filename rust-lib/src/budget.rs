@@ -74,7 +74,7 @@ pub const STATUS_BUDGET: Duration = Duration::from_secs(18);
 /// One relayed history read or receipt sweep: the sender's own sweep allowance is 10s.
 pub const HISTORY_BUDGET: Duration = Duration::from_secs(12);
 
-/// One chain's `get_balances`: its offered rows, then the lazy eth_rpc retry, the verified
+/// One chain's `get_balances`: its offered rows, then evm_assets' chain record, the verified
 /// gate, and the single Multicall3 read that answers every row. The gate is INSIDE it — an
 /// unbounded probe in front of a read is time a user waits that no budget can see — and it is
 /// sized so the gate and the read both fit, because a balance list cannot degrade the way a
@@ -130,11 +130,11 @@ pub fn slice(total: Duration, elapsed: Duration, per_call: Duration) -> Option<D
 mod tests {
     use super::*;
 
-    /// The worst case `list_networks` presents: the lazy eth_rpc retry (three chain seeds
-    /// plus `init_defaults`), then three networks × (verdict + endpoint).
+    /// The worst case `list_networks` presents: the lazy eth_rpc retry (`init_defaults`), the
+    /// registry read, then a verdict for each of three networks.
     fn list_networks_calls() -> Vec<Duration> {
-        let mut c = vec![INIT_BUDGET; 4];
-        c.extend([PROBE_BUDGET; 6]);
+        let mut c = vec![INIT_BUDGET];
+        c.extend([PROBE_BUDGET; 4]);
         c
     }
 
@@ -250,9 +250,8 @@ mod tests {
 
     #[test]
     fn the_load_hook_is_bounded_too() {
-        // ensure_eth_rpc (3 seeds + init) then ensure_token_list (config_status + init).
-        let calls =
-            [INIT_BUDGET, INIT_BUDGET, INIT_BUDGET, INIT_BUDGET, PROBE_BUDGET, INIT_BUDGET];
+        // ensure_eth_rpc (init_defaults) then ensure_token_list (config_status + init).
+        let calls = [INIT_BUDGET, PROBE_BUDGET, INIT_BUDGET];
         assert!(calls.iter().sum::<Duration>() > STARTUP_BUDGET);
         assert!(walk(STARTUP_BUDGET, &calls) <= STARTUP_BUDGET);
     }

@@ -317,6 +317,7 @@ fn listen<S: Send + 'static>(flag: Arc<AtomicBool>, sub: S, body: impl FnOnce(S)
 /// that crashed and restarted comes back late, so startup is not the only chance to ask.
 #[derive(Default)]
 struct DepInit {
+    eth_rpc: AtomicBool,
     token_list: AtomicBool,
 }
 
@@ -616,6 +617,20 @@ impl EthWalletBackendImpl {
         });
     }
 
+    /// Have eth_rpc seed its default chains. No `config_status` gate: it fills only what is
+    /// absent and seeds a default chain at most once per device, so a store another app has
+    /// already written to still gets the defaults it lacks.
+    fn ensure_eth_rpc(&self, b: &Budget) {
+        if self.deps.eth_rpc.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(t) = b.take(INIT_BUDGET) else { return };
+        let applied = modules().eth_rpc_module.init_defaults_with_timeout(t);
+        if applied.map(|raw| depinit::reply_ok(&raw)).unwrap_or(false) {
+            self.deps.eth_rpc.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Ask token_list whether it holds a config and, only if it says it holds none, tell it
     /// to apply its own defaults. Unkeyed, so the gate is mandatory; an `Err` or an `unready`
     /// initializes nothing — a call that did not arrive is not an empty config.
@@ -746,7 +761,10 @@ impl EthWalletBackendImpl {
         v
     }
 
+    /// The chain registry, behind the lazy eth_rpc seeding retry: every read that needs a
+    /// chain comes through here, so a startup that could not seed is retried by the next.
     fn chain_configs(&self, b: &Budget) -> Result<(String, Vec<Value>), String> {
+        self.ensure_eth_rpc(b);
         let t = b.take(PROBE_BUDGET).ok_or("no time left to read the chain registry")?;
         let raw = modules()
             .eth_rpc_module
@@ -802,8 +820,9 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         if let Ok(mut g) = self.state.write() {
             *g = Some(Arc::new(State { settings, contacts }));
         }
-        // Token-list initialization is best effort and remains inside one startup budget.
+        // Dependency defaults are best effort, and both share one startup budget.
         let b = Budget::new(STARTUP_BUDGET);
+        self.ensure_eth_rpc(&b);
         self.ensure_token_list(&b);
         // After the state above exists: the relay's first act is a `list_accounts`, and a
         // consumer must never be told to re-read before this module can answer.

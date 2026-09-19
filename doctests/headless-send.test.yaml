@@ -24,6 +24,7 @@ what_you_learn:
   - How `send_status` drives the broadcast, and how to read the receipt back
   - What a rejected send looks like from the wallet's side
   - Where `logosctl` mistypes a `0x…` argument, and the `str:` prefix that stops it
+  - How the wallet gets eth_rpc's default chains when another app configured one first
 
 prerequisites:
   - |
@@ -424,6 +425,60 @@ sections:
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
         run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
+        expect_contains:
+          - "not_running"
+
+  - title: "Another app set chain 1 first"
+    step: true
+    text: |
+      On a fresh device the Ethereum RPC app may set mainnet's endpoint before any wallet has
+      started. `patch_chain_endpoint` creates that record bare — no name, no native asset, no
+      testnet flag — so chain 1 is outside the `mainnets` scope. `eth_rpc_module` never seeds
+      itself: `eth_wallet_backend` asks it for its defaults when it starts, and chain 1 gains
+      what it lacks while the endpoint stays the one the user set.
+    steps:
+      - title: "Start a fresh session"
+        run: |
+          mkdir -p fresh/modules
+          cp -RL ./session/modules/. ./fresh/modules/
+          ./logos/bin/logosctl --config-dir ./fresh daemon start --detach
+        code_block: "logosctl --config-dir ./fresh daemon start --detach"
+      - run: "sleep 3"
+      - title: "Only eth_rpc, and chain 1's endpoint"
+        run: |
+          ./logos/bin/logosctl --config-dir ./fresh module load eth_rpc_module
+          ./logos/bin/logosctl --config-dir ./fresh call eth_rpc_module patch_chain_endpoint 1 http://127.0.0.1:8545 --human
+          ./logos/bin/logosctl --config-dir ./fresh call eth_rpc_module list_chain_configs --human
+        code_block: |
+          logosctl module load eth_rpc_module
+          logosctl call eth_rpc_module patch_chain_endpoint 1 http://127.0.0.1:8545
+          logosctl call eth_rpc_module list_chain_configs
+        expect_contains:
+          - '"chainId":1'
+          - '"inScope":false'
+      - title: "The wallet starts"
+        run: |
+          for m in keystore_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend; do
+            ./logos/bin/logosctl --config-dir ./fresh module load $m || exit 1
+          done
+        code_block: |
+          for m in keystore_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend; do
+            logosctl module load $m
+          done
+      - title: "Chain 1 is Ethereum, in scope, on the user's endpoint"
+        run: "./logos/bin/logosctl --config-dir ./fresh call eth_wallet_backend list_networks --human"
+        code_block: "logosctl call eth_wallet_backend list_networks"
+        expect_contains:
+          - '"name":"Ethereum"'
+          - '"inScope":true'
+          - '"rpcUrl":"http://127.0.0.1:8545"'
+      - title: "Stop the fresh session"
+        run: "./logos/bin/logosctl --config-dir ./fresh daemon stop"
+        code_block: "logosctl daemon stop"
+      - run: "sleep 2"
+      - title: "Confirm it has stopped"
+        run: "./logos/bin/logosctl --config-dir ./fresh daemon status || true"
         code_block: "logosctl daemon status"
         expect_contains:
           - "not_running"

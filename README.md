@@ -16,6 +16,11 @@ leaving reusable EVM facts and actions in the modules that own them:
 The composer has no active-chain setting. Chain selection belongs to each UI operation;
 device scope is the `mainnets`, `testnets`, or `both` setting owned by `eth_rpc_module`.
 
+On start, and in front of every registry read until one call lands, the composer asks
+`eth_rpc_module.init_defaults` for the default chains. It does not ask `config_status` first:
+eth_rpc fills only what is absent and seeds a default chain at most once per device.
+`token_list_module`'s defaults are applied only when it reports `unconfigured`.
+
 ## Read contract
 
 - `list_networks()` returns the enabled in-scope `networks`, plus all
