@@ -648,3 +648,44 @@ fn a_token_read_that_skips_the_defaults_is_caught() {
     let e = check_token_list_defaults_are_asked_for(&mutant).unwrap_err();
     assert!(e.contains("set_token_enabled"), "{e}");
 }
+
+// ---------------------------------------------------------------------------------------
+// 9. History keeps its rows when decorating them fails, and names every token they moved.
+// ---------------------------------------------------------------------------------------
+
+fn check_history_keeps_its_rows(src: &str) -> Result<(), String> {
+    let code = code_only(src);
+    let fns = functions(&code);
+    let body = *bodies_of(&fns, &code, "get_history").last().expect("get_history");
+    let decorate = body.find("decorate_history_with_timeout(").ok_or("get_history no longer decorates")?;
+    if body[decorate..].contains("err(") {
+        return Err("a failed decoration throws the history away".into());
+    }
+    if !calls(&body[..decorate], "catalogue_tokens") {
+        return Err("transfers are named from the offered tokens alone".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_failed_decoration_keeps_the_history_rows() {
+    check_history_keeps_its_rows(GLUE).unwrap();
+}
+
+#[test]
+fn a_history_lost_to_its_decoration_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "Err(e) => history::undecorated(history, &format!(\"evm_assets_module: {e:?}\")),",
+        "Err(e) => err(format!(\"evm_assets_module: {e:?}\")),",
+    );
+    let e = check_history_keeps_its_rows(&mutant).unwrap_err();
+    assert!(e.contains("throws the history away"), "{e}");
+}
+
+#[test]
+fn transfers_named_from_the_offered_tokens_alone_are_caught() {
+    let mutant = mutate(GLUE, "self.catalogue_tokens(chain, &others, &b)", "Ok::<Vec<Value>, String>(Vec::new())");
+    let e = check_history_keeps_its_rows(&mutant).unwrap_err();
+    assert!(e.contains("offered tokens alone"), "{e}");
+}
