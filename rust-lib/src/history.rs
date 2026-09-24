@@ -4,6 +4,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+/// EIP-7708's emitter. Its Transfer logs move ether, so it is never a token to look up.
+const SYSTEM_ADDRESS: &str = "0xfffffffffffffffffffffffffffffffffffffffe";
+
 fn chain_id(row: &Value) -> Option<u64> {
     row.get("chainId").and_then(Value::as_u64).or_else(|| row.as_u64())
 }
@@ -62,7 +65,7 @@ pub fn unlisted_contracts(history: &Value, chain: u64, offered: &[Value]) -> Vec
         let transfers = row.get("transfers").and_then(Value::as_array).into_iter().flatten();
         for contract in transfers.filter_map(|t| t.get("contract").and_then(Value::as_str)) {
             let lower = contract.to_ascii_lowercase();
-            if !known(contract) && !out.contains(&lower) {
+            if lower != SYSTEM_ADDRESS && !known(contract) && !out.contains(&lower) {
                 out.push(lower);
             }
         }
@@ -175,6 +178,18 @@ mod tests {
         let offered = [json!({"address": weth.to_ascii_lowercase(), "symbol":"WETH"})];
         assert_eq!(unlisted_contracts(&value, 1, &offered), [usdt.to_ascii_lowercase()]);
         assert!(unlisted_contracts(&value, 5, &offered).is_empty());
+    }
+
+    /// An older sender files EIP-7708 ether logs as transfers of 0xFfff…FFfE. That is not a
+    /// token, so the catalogue is never asked to name it, in any casing.
+    #[test]
+    fn the_system_address_is_never_looked_up_as_a_token() {
+        let usdt = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+        let value = json!({"transactions":[{"chainId":1,"transfers":[
+            {"contract":"0xFffFFffFFfFfFfFfffffffFfFFfFFfffFFFFfFfE"},
+            {"contract":SYSTEM_ADDRESS},
+            {"contract":usdt}]}]});
+        assert_eq!(unlisted_contracts(&value, 1, &[]), [usdt.to_ascii_lowercase()]);
     }
 
     #[test]
