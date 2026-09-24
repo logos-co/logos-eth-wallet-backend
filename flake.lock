@@ -18216,11 +18216,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789864832,
-        "narHash": "sha256-+rou5vPUROM4GK7M0VUMFgUCT8AsTR9spo4rkscD2Fo=",
+        "lastModified": 1790268849,
+        "narHash": "sha256-xHMXRHhnv+3EkzWtkZL3do5FG7IDQtUtCgpe5e26SgE=",
         "owner": "logos-co",
         "repo": "logos-evm-tx-sender-module",
-        "rev": "69ed1d9f78e91b784faea1998f8ed7a6a7a64f2b",
+        "rev": "7cd2fead60a78ac9ac8a4337fd9f01e1ab5515e2",
         "type": "github"
       },
       "original": {
