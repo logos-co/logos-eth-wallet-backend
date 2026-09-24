@@ -185,11 +185,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789863489,
-        "narHash": "sha256-J/j7PymVGRzAYGstpQ7adRGp/V7diqhppJn6nWMX0I4=",
+        "lastModified": 1790271364,
+        "narHash": "sha256-oZ2GzwRZeSWVmV0arAZm5ZrL7Q0Asgd+iHJn/PH8gjo=",
         "owner": "logos-co",
         "repo": "logos-evm-assets-module",
-        "rev": "2f15719bc2958ebc9bb5a9c7982b2a5db98462d4",
+        "rev": "3235e6bfaa63c85f5857591da290bb1631ece183",
         "type": "github"
       },
       "original": {
