@@ -1,10 +1,10 @@
 //! A Tier A approver, so a send can be driven to a real signature without a GUI.
 //!
-//! Name it the keystore's approver — there is no config file, so a spec has to make the call
-//! itself: `configure({"approvers":"approver_probe","custodians":"..."})`. That document is
-//! TOTAL, so a spec that names only the approver leaves Tier D held by nobody and its own
-//! setup then refuses. Named, the probe does exactly what a human in `evm_signer_ui` does:
-//! claim the request, read back the bundle id the keystore authored, and approve that exact id.
+//! A spec makes it an approver in the daemon's access policy, before the daemon starts: a
+//! version 2 rule on keystore_module listing `pending`, `acknowledge`, `approve` and `reject`
+//! for `approver_probe` (a list; a `"*"` grant is not scoped and approves nothing). Granted,
+//! the probe does exactly what a human in `evm_signer_ui` does: claim the request, read back
+//! the bundle id the keystore authored, and approve that exact id.
 
 use serde_json::{json, Value};
 
