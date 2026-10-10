@@ -1,10 +1,11 @@
 {
-  description = "approver_probe — doc-test fixture: the module that asks for a signature.";
+  description = "approver_probe — doc-test fixture: the module that approves a signature.";
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    keystore_module = {
-      url = "github:logos-co/logos-evm-keystore-module";
+    # Pinned to the manager's first branch until it reaches main.
+    signer_manager_module = {
+      url = "github:logos-co/logos-signer-manager-module/67859da29c14e1ffe1da306e0c31fdafb33a0a02";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
   };

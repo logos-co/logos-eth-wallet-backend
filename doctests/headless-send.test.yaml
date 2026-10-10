@@ -5,19 +5,19 @@ release: ""
 intro: |
   `eth_wallet_backend` never signs, and never broadcasts. A `send` resolves the transfer and
   hands it to `tx_sender_module` — the one sender on the device — which reserves a nonce,
-  hands the keystore an approval request and answers `pending`: no hash, because nothing
-  exists to hash. In Basecamp the human then approves in `evm_signer_ui`. On a headless
-  `logosctl` daemon there is no window, and `logosctl call keystore_module approve …` is
-  refused by design: the CLI is the host anchor, not a named module.
+  hands the signer manager an approval request and answers `pending`: no hash, because
+  nothing exists to hash. In Basecamp the human then approves in `evm_signer_ui`. On a
+  headless `logosctl` daemon there is no window, and `logosctl call signer_manager_module
+  approve …` is refused by design: the CLI is the host anchor, not a named module.
 
   This doc-test runs the whole send against a local **Anvil** chain with nothing but
   `logosctl`: `evm_keystore_cli` imports the key, `eth_wallet_backend` asks, the request
-  appears on `logosctl watch evm_signer_cli` in the keystore's own words, the approval is
+  appears on `logosctl watch evm_signer_cli` in the manager's own words, the approval is
   typed, and the wallet collects the signature, broadcasts, and sees the receipt. Then a
   second send is refused.
 
 what_you_learn:
-  - Which nine modules a headless eth wallet needs, and the order to load them in
+  - Which ten modules a headless eth wallet needs, and the order to load them in
   - How to point `eth_rpc_module` at a local chain
   - Why `send` returns no hash, and how to prove it
   - How the approval prompt reaches an operator, and what it says
@@ -55,11 +55,11 @@ sections:
         expect_contains:
           - "cast"
 
-  - title: "Build the nine modules"
+  - title: "Build the ten modules"
     step: true
     text: |
-      `eth_wallet_backend` and its six providers — `keystore_module` for keys and the
-      approval queue, `eth_rpc_module` for the chain, `fee_module` for the fee estimate,
+      `eth_wallet_backend` and its seven providers — `keystore_module` for keys,
+      `signer_manager_module` for the approval queue, `eth_rpc_module` for the chain, `fee_module` for the fee estimate,
       `token_list_module` for token metadata, `evm_assets_module` for balances and unsigned
       transfer construction, and `tx_sender_module` for the nonce, approval request,
       broadcast and record — plus the two headless surfaces:
@@ -73,17 +73,19 @@ sections:
         code_block: |
           # From inside the clone this is simply: nix build '.#install'
           nix build 'github:logos-co/logos-eth-wallet-backend#install' --out-link ./result-ewb
-      - title: "Build the six providers"
+      - title: "Build the seven providers"
         run: |
           set -e
-          nix build "github:logos-co/logos-evm-keystore-module#install" --out-link ./result-keystore
+          nix build "github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1#install" --out-link ./result-keystore
+          nix build "github:logos-co/logos-signer-manager-module/67859da29c14e1ffe1da306e0c31fdafb33a0a02#install" --out-link ./result-manager
           nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
           nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
           nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
           nix build "github:logos-co/logos-evm-assets-module#install" --out-link ./result-assets
-          nix build "github:logos-co/logos-evm-tx-sender-module#install" --out-link ./result-sender
+          nix build "github:logos-co/logos-evm-tx-sender-module/b01c896d5ad51fa046c545afcc6fae4a3cbfd79f#install" --out-link ./result-sender
         code_block: |
           nix build 'github:logos-co/logos-evm-keystore-module#install' --out-link ./result-keystore
+          nix build 'github:logos-co/logos-signer-manager-module#install' --out-link ./result-manager
           nix build 'github:logos-co/logos-evm-eth-rpc-module#install' --out-link ./result-rpc
           nix build 'github:logos-co/logos-evm-fee-module#install' --out-link ./result-fee
           nix build 'github:logos-co/logos-evm-token-list-module#install' --out-link ./result-tl
@@ -92,7 +94,7 @@ sections:
       - title: "Build the two headless surfaces"
         run: |
           set -e
-          nix build "github:logos-co/logos-evm-signer-cli#install" --out-link ./result-signer
+          nix build "github:logos-co/logos-evm-signer-cli/5b69f375b2295e0d331ce8d65e2bd881b605f072#install" --out-link ./result-signer
           nix build "github:logos-co/logos-evm-keystore-cli#install" --out-link ./result-kcli
         code_block: |
           nix build 'github:logos-co/logos-evm-signer-cli#install' --out-link ./result-signer
@@ -101,7 +103,7 @@ sections:
         run: |
           mkdir -p session/modules
           cp -RL ./logos/modules/. ./session/modules/
-          for r in result-keystore result-rpc result-fee result-tl result-assets result-sender result-ewb result-signer result-kcli; do
+          for r in result-keystore result-manager result-rpc result-fee result-tl result-assets result-sender result-ewb result-signer result-kcli; do
             cp -RL ./$r/modules/. ./session/modules/
           done
           chmod -R u+w session/modules
@@ -113,6 +115,7 @@ sections:
           chmod -R u+w session/modules
         expect_contains:
           - "keystore_module"
+          - "signer_manager_module"
           - "eth_rpc_module"
           - "fee_module"
           - "token_list_module"
@@ -151,20 +154,21 @@ sections:
           up **before** the first `send`: an approval request nobody claims is swept after
           60 seconds, and the wallet reports that send as `failed`.
         run: |
-          for m in keystore_module eth_rpc_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend evm_signer_cli evm_keystore_cli; do
+          for m in keystore_module signer_manager_module eth_rpc_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend evm_signer_cli evm_keystore_cli; do
             ./logos/bin/logosctl --config-dir ./session module load $m || exit 1
           done
         code_block: |
-          for m in keystore_module eth_rpc_module fee_module token_list_module evm_assets_module tx_sender_module \
-                   eth_wallet_backend evm_signer_cli evm_keystore_cli; do
+          for m in keystore_module signer_manager_module eth_rpc_module fee_module token_list_module \
+                   evm_assets_module tx_sender_module eth_wallet_backend evm_signer_cli evm_keystore_cli; do
             logosctl module load $m
           done
       - run: "sleep 2"
-      - title: "All nine are up"
+      - title: "All ten are up"
         run: "./logos/bin/logosctl --config-dir ./session daemon status --json"
         code_block: "logosctl daemon status --json"
         expect_contains:
           - '"name":"keystore_module","status":"loaded"'
+          - '"name":"signer_manager_module","status":"loaded"'
           - '"name":"eth_rpc_module","status":"loaded"'
           - '"name":"fee_module","status":"loaded"'
           - '"name":"token_list_module","status":"loaded"'
@@ -177,20 +181,23 @@ sections:
   - title: "Configure"
     step: true
     steps:
-      - title: "Name the two roles"
+      - title: "Name the roles"
         text: |
-          The keystore admits approvals only from a configured **approver** and mutations
-          only from a configured **custodian**. `configure` is total — a document that
-          omits a name strips it — so the Basecamp surfaces are kept alongside the two
+          The keystore admits mutations only from a configured **custodian** and signs only
+          for its configured **manager**. The manager admits approvals only from a configured
+          **approver** and asks its configured **signers**. `configure` is total — a document
+          that omits a name strips it — so the Basecamp surfaces are kept alongside the two
           headless ones.
         run: |
-          ./logos/bin/logosctl --config-dir ./session call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}' --human
+          ./logos/bin/logosctl --config-dir ./session call keystore_module configure '{"custodians":["evm_keystore_ui","evm_keystore_cli"],"managers":["signer_manager_module"]}' --human
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui"],"signers":["keystore_module"]}' --human
         code_block: |
-          logosctl call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}'
+          logosctl call keystore_module configure '{"custodians":["evm_keystore_ui","evm_keystore_cli"],"managers":["signer_manager_module"]}'
+          logosctl call signer_manager_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui"],"signers":["keystore_module"]}'
         expect_contains:
           - '"evm_signer_cli"'
           - '"evm_keystore_cli"'
-          - '"ok":true'
+          - '"signers":["keystore_module"]'
       - title: "Point eth_rpc at Anvil"
         text: |
           `eth_rpc_module` owns the endpoint table for every wallet on the device. The
@@ -257,7 +264,7 @@ sections:
       - title: "The wallet asks"
         text: |
           `amountUnits` is in ETH, as a user would type it. The reply is a request id and
-          the keystore's handle for the approval record — and nothing else.
+          the signer manager's handle for the approval record — and nothing else.
         run: |
           ./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send '{"chainId":11155111,"from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","amountUnits":"1"}' --human | tee send.json
           python3 -c 'import json; open("rid.txt","w").write(json.load(open("send.json"))["requestId"])'
@@ -265,7 +272,7 @@ sections:
           logosctl call eth_wallet_backend send '{"chainId":11155111,"from":"0xf39F…2266","to":"0x7099…79C8","amountUnits":"1"}'
         expect_contains:
           - '"pending":true'
-          - '"requestId":"snd_ksh_'
+          - '"requestId":"snd_smh_'
       - title: "Nothing is signed yet"
         text: |
           `send_status` is the wallet's word on where a send got to. Before the human has
@@ -281,11 +288,11 @@ sections:
           - '"final":false'
           - "HASH_BEFORE_APPROVAL=no"
       - run: "sleep 3"
-      - title: "The prompt, in the keystore's words"
+      - title: "The prompt, in the signer manager's words"
         text: |
-          `evm_signer_cli` claimed the request and published the keystore's two lists,
+          `evm_signer_cli` claimed the request and published the manager's two lists,
           kept apart: what the requester *claims* the signature is for, and what will
-          actually be signed. The requester the keystore attests is `tx_sender_module`,
+          actually be signed. The requester the manager attests is `tx_sender_module`,
           the one sender every wallet on the device goes through; the claim line names
           the module that asked it to — `eth_wallet_backend` — and the last two lines are
           the commands to type.
@@ -300,7 +307,7 @@ sections:
           - "Requested by: tx_sender_module"
           # The WHOLE claim, both ends included. `expect_contains` is a substring match, so
           # asserting "Send 1 ETH" alone would keep passing against a line that named nobody —
-          # and naming both ends is the point: the two lines below are the keystore's own
+          # and naming both ends is the point: the two lines below are the manager's own
           # reading of the same transaction, and this is what a human compares them against.
           # The sender appends who asked, as the runtime attested it.
           - "Purpose (claimed by the requester): Send 1 ETH from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 [asked by eth_wallet_backend]"
@@ -308,14 +315,14 @@ sections:
           - "Transaction on chain 11155111"
           - "To: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
           - "Value: 0xde0b6b3a7640000 (1000000000000000000)"
-          - "approve:  logosctl call evm_signer_cli approve ksh_"
+          - "approve:  logosctl call evm_signer_cli approve smh_"
       - title: "Note the handle and the bundle id"
         run: |
           ./logos/bin/logosctl --config-dir ./session call evm_signer_cli status --human \
             | python3 -c 'import sys,json; r=json.load(sys.stdin)["rendered"]; open("handle.txt","w").write(r["handle"]); open("bundle.txt","w").write(r["bundle_id"]); print(r["requester"], r["handle"], r["bundle_id"])'
         code_block: "logosctl call evm_signer_cli status"
         expect_contains:
-          - "tx_sender_module ksh_"
+          - "tx_sender_module smh_"
       - title: "The human says yes"
         text: |
           The reply is a **count**. The approver causes a signature to exist and never
@@ -401,7 +408,7 @@ sections:
       - title: "The send settles rejected"
         text: |
           Polled promptly: a rejected send is remembered for two minutes, after which the
-          keystore has forgotten the record and the wallet can only report `failed`.
+          manager has forgotten the record and the wallet can only report `failed`.
         run: "./logos/bin/logosctl --config-dir ./session call eth_wallet_backend send_status \"$(cat rid2.txt)\" --human"
         code_block: "logosctl call eth_wallet_backend send_status <requestId>"
         expect_contains:
@@ -459,11 +466,11 @@ sections:
           - '"inScope":false'
       - title: "The wallet starts"
         run: |
-          for m in keystore_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend; do
+          for m in keystore_module signer_manager_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend; do
             ./logos/bin/logosctl --config-dir ./fresh module load $m || exit 1
           done
         code_block: |
-          for m in keystore_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend; do
+          for m in keystore_module signer_manager_module fee_module token_list_module evm_assets_module tx_sender_module eth_wallet_backend; do
             logosctl module load $m
           done
       - title: "Chain 1 is Ethereum, in scope, on the user's endpoint"
