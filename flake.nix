@@ -37,7 +37,7 @@
       inputs.eth_rpc_module.follows = "eth_rpc_module";
     };
     # The one sender on the device. Every transaction this wallet makes leaves through it:
-    # it reserves the nonce, asks the keystore, broadcasts and records.
+    # it reserves the nonce, asks the signer manager, broadcasts and records.
     tx_sender_module = {
       url = "github:logos-co/logos-evm-tx-sender-module";
       inputs.logos-module-builder.follows = "logos-module-builder";

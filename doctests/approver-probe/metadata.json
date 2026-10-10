@@ -1,13 +1,13 @@
 {
   "name": "approver_probe",
   "version": "1.0.0",
-  "description": "Doc-test fixture: a Tier A approver. Stands in for evm_signer_ui so a send can be driven to a real signature without a GUI.",
+  "description": "Doc-test fixture: an approver of the signer manager. Stands in for evm_signer_ui so a send can be driven to a real signature without a GUI.",
   "author": "Logos Core Team",
   "type": "core",
   "interface": "cdylib",
   "category": "test",
   "main": "approver_probe_plugin",
-  "dependencies": ["keystore_module"],
+  "dependencies": ["signer_manager_module"],
   "include": [],
   "capabilities": [],
   "codegen": {

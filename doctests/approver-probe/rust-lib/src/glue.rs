@@ -1,10 +1,10 @@
-//! A Tier A approver, so a send can be driven to a real signature without a GUI.
+//! An approver, so a send can be driven to a real signature without a GUI.
 //!
-//! Name it the keystore's approver — there is no config file, so a spec has to make the call
-//! itself: `configure({"approvers":"approver_probe","custodians":"..."})`. That document is
-//! TOTAL, so a spec that names only the approver leaves Tier D held by nobody and its own
-//! setup then refuses. Named, the probe does exactly what a human in `evm_signer_ui` does:
-//! claim the request, read back the bundle id the keystore authored, and approve that exact id.
+//! Name it the signer manager's approver — there is no config file, so a spec has to make the
+//! call itself: `configure({"approvers":"approver_probe","custodians":"...","signers":"keystore_module"})`.
+//! That document is TOTAL, so a spec that names only the approver leaves the manager no signer.
+//! Named, the probe does exactly what a human in `evm_signer_ui` does: claim the request, read
+//! back the bundle id the manager authored, and approve that exact id.
 
 use serde_json::{json, Value};
 
@@ -14,8 +14,8 @@ pub trait ApproverProbeModule: Send + 'static {
 
     /// Acknowledge and approve the oldest pending request with `password`.
     ///
-    /// Approves the bundle id the keystore returned from `acknowledge`, never one supplied
-    /// by the caller — a mismatch is what the keystore refuses, and honouring that is the
+    /// Approves the bundle id the manager returned from `acknowledge`, never one supplied
+    /// by the caller — a mismatch is what the manager refuses, and honouring that is the
     /// whole point of the fixture.
     fn approve_oldest(&mut self, password: String) -> String;
 
@@ -43,9 +43,9 @@ fn parse(reply: Result<String, impl std::fmt::Debug>) -> Result<Value, String> {
     Ok(v)
 }
 
-/// The oldest handle the keystore is offering, if any.
+/// The oldest handle the manager is offering, if any.
 fn oldest_handle() -> Result<Option<String>, String> {
-    let v = parse(modules().keystore_module.pending())?;
+    let v = parse(modules().signer_manager_module.pending())?;
     Ok(v.get("pending")
         .and_then(Value::as_array)
         .and_then(|a| a.first())
@@ -69,14 +69,14 @@ impl ApproverProbeModule for ApproverProbeModuleImpl {
             Ok(None) => return err("nothing pending to approve"),
             Err(e) => return err(e),
         };
-        let ack = match parse(modules().keystore_module.acknowledge(&handle)) {
+        let ack = match parse(modules().signer_manager_module.acknowledge(&handle)) {
             Ok(v) => v,
             Err(e) => return err(format!("acknowledge: {e}")),
         };
         let Some(bundle_id) = ack.get("bundle_id").and_then(Value::as_str) else {
             return err("acknowledge returned no bundle_id");
         };
-        match parse(modules().keystore_module.approve(&handle, bundle_id, &password)) {
+        match parse(modules().signer_manager_module.approve(&handle, bundle_id, &password)) {
             Ok(v) => json!({
                 "ok": true, "handle": handle, "bundleId": bundle_id,
                 "signedCount": v.get("signed_count").cloned().unwrap_or(Value::Null),
@@ -90,7 +90,7 @@ impl ApproverProbeModule for ApproverProbeModuleImpl {
     fn reject_oldest(&mut self) -> String {
         match oldest_handle() {
             Ok(Some(h)) => {
-                let ok = modules().keystore_module.reject(&h).unwrap_or(false);
+                let ok = modules().signer_manager_module.reject(&h).unwrap_or(false);
                 json!({ "ok": ok, "handle": h }).to_string()
             }
             Ok(None) => err("nothing pending to reject"),
