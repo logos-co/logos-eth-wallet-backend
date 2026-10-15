@@ -33,6 +33,10 @@
     {
       "name": "tx_sender_module",
       "version": "~0.1.0"
+    },
+    {
+      "name": "signer_manager_module",
+      "version": "~0.1.0"
     }
   ],
   "include": [],

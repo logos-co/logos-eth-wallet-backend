@@ -344,12 +344,12 @@ fn handing_back_a_borrow_instead_of_a_handle_is_caught() {
 const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
     // One call each, and neither sits behind a gate.
     ("keystore_module", "list_accounts", "a passthrough, one call"),
-    ("keystore_module", "get_labels", "a passthrough, one call"),
     ("keystore_module", "get_account_wallets", "a passthrough, one call"),
     // Not calls at all: each arms an `EventSubscription` and the generated client emits no
     // bounded twin for one. A deadline on arming would be a deadline on the SUBSCRIPTION,
     // which is meant to outlive every call this module makes.
     ("keystore_module", "on_accounts_changed", "a subscription has no bounded twin"),
+    ("signer_manager_module", "on_accounts_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_chain_config_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_chain_enabled_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_network_scope_changed", "a subscription has no bounded twin"),

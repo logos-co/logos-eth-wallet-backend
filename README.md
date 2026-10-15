@@ -8,7 +8,8 @@ leaving reusable EVM facts and actions in the modules that own them:
 | Chain registry, endpoint, scope and verified-proxy policy | `eth_rpc_module` |
 | Token catalogue and persisted enabled-token snapshots | `token_list_module` |
 | Native/token identity, balances, amount conversion and unsigned transfers | `evm_assets_module` |
-| Accounts and account-to-wallet provenance | `keystore_module` |
+| Software and offered device accounts | `signer_manager_module` |
+| Software account-to-wallet provenance | `keystore_module` |
 | Fee suggestions | `fee_module` |
 | Approval, signing hand-off, broadcast and local history | `tx_sender_module` |
 | Contacts and token sort preference | `eth_wallet_backend` |
@@ -32,8 +33,15 @@ reads: token_list writes its defaults only when nothing is configured.
   which answers them as asset rows behind the chain's native one.
   `list_available_tokens(chain_id, query, offset, limit)` pages `token_list_module`'s
   catalogue, with that native row first on the first page.
-- `list_accounts()`, `get_account_labels()` and `get_account_wallets()` relay the ungated
-  keystore inventory. They cannot create, import, export or sign.
+- `list_accounts()` reads the signer manager's inventory and presents its EVM addresses.
+  The manager owns aggregation and signer precedence for software and devices (including
+  Keycard); this wallet does not maintain a second inventory. Bitcoin accounts are excluded. Disconnected device accounts remain visible for balance/history reads.
+- `get_account_labels()` includes device labels; existing software labels take precedence.
+  `get_account_wallets()` retains the keystore's derivation provenance. These reads cannot
+  create, import, export or sign. A failed inventory read returns an error, allowing the UI
+  to keep its previous list instead of silently dropping accounts.
+- Changes from both the keystore and signer manager emit `accounts_changed`, so offering or
+  removing a device account refreshes an already-open wallet. No PIN is needed to list accounts.
 - `get_balances(address)` reads every enabled in-scope chain concurrently: its offered tokens,
   then one `evm_assets_module` balance read. Its top-level answer remains usable when one
   chain fails: each item in `chains` carries its own `ok`, `chainId`, balances/route or error.
@@ -123,3 +131,8 @@ The Rust suite covers exact amounts, contacts, settings, dependency startup, ver
 refusals, the `send_status` relay and source-shape guards. `doctests/headless-send.test.yaml`
 stages the full module graph, including `evm_assets_module`, and exercises the public
 composer contract.
+
+Account inventory comes from `signer_manager_module`, including disconnected hardware
+accounts. The per-address `wallets` metadata also carries `signer`, `available`, and
+the provider's optional public `origin`, so selectors can show device, recovery source,
+and account address without changing account identity or signing selection.
