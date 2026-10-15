@@ -20,16 +20,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use logos_rust_sdk::LogosError;
 use serde_json::{json, Value};
 
 use crate::budget::{
-    callee_deadline, Budget, BALANCES_BUDGET, CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET,
-    HISTORY_BUDGET, INIT_BUDGET, OFFERED_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET,
-    RPC_BUDGET, ASSETS_BUDGET, SENDER_BUDGET, SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET,
+    callee_deadline, fees_budget, round_trip, sender_budget, Budget, BALANCES_BUDGET,
+    CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, HISTORY_BUDGET, INIT_BUDGET, OFFERED_BUDGET,
+    PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, ASSETS_BUDGET, SENDER_BUDGET,
+    SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET,
 };
 use crate::catalogue;
 use crate::contacts::ContactsStore;
 use crate::depinit;
+use crate::failure;
 use crate::history;
 use crate::send_status;
 use crate::settings::{Settings, SettingsStore};
@@ -357,8 +360,8 @@ const NO_CONTEXT: &str = "module context not ready";
 /// A reply from `tx_sender_module`, parsed, with its refusal surfaced as this module's own.
 /// A transport error names the sender, so an operator can tell a sender that is down from a
 /// sender that said no.
-fn sender_reply(raw: Result<String, impl std::fmt::Debug>) -> Result<Value, String> {
-    let raw = raw.map_err(|e| format!("tx_sender_module: {e:?}"))?;
+fn sender_reply(raw: Result<String, LogosError>) -> Result<Value, String> {
+    let raw = raw.map_err(|e| unreached("tx_sender_module", &e))?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(v.to_string());
@@ -389,10 +392,18 @@ fn token_list_reply(raw: Result<String, impl std::fmt::Debug>) -> Result<Value, 
 
 /// A reply relayed to the view VERBATIM — the sender's refusals included, because they are
 /// already in the `{ ok: false, error, verifiedProxy? }` shape the view renders.
-fn relay(raw: Result<String, impl std::fmt::Debug>) -> String {
+fn relay(raw: Result<String, LogosError>) -> String {
     match raw {
         Ok(reply) => reply,
-        Err(e) => err(format!("tx_sender_module: {e:?}")),
+        Err(e) => unreached("tx_sender_module", &e),
+    }
+}
+
+/// A dependency that did not answer, as a reply in words with the runtime's code.
+fn unreached(module: &str, e: &LogosError) -> String {
+    match e {
+        LogosError::PluginCallFailed { message, .. } => failure::unreached(module, message),
+        other => failure::unreached(module, &other.to_string()),
     }
 }
 
@@ -1199,12 +1210,12 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         };
         if req.chain_id < 0 { return err(format!("chain {} is not a valid chain id", req.chain_id)); }
         let chain_id = req.chain_id as u64;
-        if let Err(e) = self.in_scope_chain(chain_id, &b) { return err(e); }
+        let rt = match self.in_scope_chain(chain_id, &b) { Ok(record) => round_trip(&record), Err(e) => return err(e) };
         let built = match self.build_transfer(chain_id, &request_json, &b) {
             Ok(built) => built,
             Err(e) => return err(e),
         };
-        let Some(t) = b.take(SENDER_BUDGET) else { return err("no time left to price the send") };
+        let Some(t) = b.take(sender_budget(rt, false)) else { return err("no time left to price the send") };
         let request = match Self::built_sender_request(&built, &req, t) { Ok(v) => v, Err(e) => return err(e) };
         match sender_reply(modules().tx_sender_module.prepare_with_timeout(&request.to_string(), t)) {
             Ok(priced) => Self::built_quote_reply(&built, &priced).to_string(),
@@ -1222,12 +1233,12 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         // Read the request's chain once and validate it against the shared registry before
         // building. The assets reply stamps the same id into the sender request.
         let chain_id = req.chain_id as u64;
-        if let Err(e) = self.in_scope_chain(chain_id, &b) { return err(e); }
+        let rt = match self.in_scope_chain(chain_id, &b) { Ok(record) => round_trip(&record), Err(e) => return err(e) };
         let built = match self.build_transfer(chain_id, &request_json, &b) {
             Ok(built) => built,
             Err(e) => return err(e),
         };
-        let Some(t) = b.take(SENDER_BUDGET) else { return err("no time left to request approval") };
+        let Some(t) = b.take(sender_budget(rt, true)) else { return err("no time left to request approval") };
         let mut request = match Self::built_sender_request(&built, &req, t) {
             Ok(v) => v,
             Err(e) => return err(e),
@@ -1273,13 +1284,13 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             return err(format!("chain {chain_id} is not a valid chain id"));
         }
         let b = Budget::new(FEES_BUDGET);
-        if let Err(e) = self.in_scope_chain(chain_id as u64, &b) { return err(e); }
-        let Some(t) = b.take(RPC_BUDGET) else {
+        let rt = match self.in_scope_chain(chain_id as u64, &b) { Ok(record) => round_trip(&record), Err(e) => return err(e) };
+        let Some(t) = b.take(fees_budget(rt)) else {
             return err("no time left to price the fee");
         };
         match modules().fee_module.suggest_fees_with_timeout(chain_id, t) {
             Ok(reply) => reply,
-            Err(e) => err(format!("{e:?}")),
+            Err(e) => unreached("fee_module", &e),
         }
     }
 }
