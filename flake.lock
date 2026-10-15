@@ -10932,6 +10932,23 @@
         "type": "github"
       }
     },
+    "logos-signer-interface": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791601039,
+        "narHash": "sha256-VQjc0vyzqs11hVEObM3mtNrydDYP8zDke0+PFtL6AT0=",
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02",
+        "type": "github"
+      }
+    },
     "logos-standalone-app": {
       "inputs": {
         "logos-cpp-sdk": "logos-cpp-sdk_2",
@@ -18076,6 +18093,7 @@
         "fee_module": "fee_module",
         "keystore_module": "keystore_module",
         "logos-module-builder": "logos-module-builder",
+        "signer_manager_module": "signer_manager_module",
         "token_list_module": "token_list_module",
         "tx_sender_module": "tx_sender_module"
       }
@@ -18177,6 +18195,30 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "signer_manager_module": {
+      "inputs": {
+        "keystore_module": [
+          "keystore_module"
+        ],
+        "logos-module-builder": [
+          "logos-module-builder"
+        ],
+        "logos-signer-interface": "logos-signer-interface"
+      },
+      "locked": {
+        "lastModified": 1792020945,
+        "narHash": "sha256-n8qS+bnq+LVncUmnGATCL8rNtbN0NDVbNW2oetKTaq4=",
+        "owner": "logos-co",
+        "repo": "logos-signer-manager-module",
+        "rev": "3ef020c16f8c6a3e1f5bd56c63d3b12b5cd55f6c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-signer-manager-module",
         "type": "github"
       }
     },

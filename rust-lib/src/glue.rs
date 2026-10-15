@@ -112,13 +112,14 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// new order on every network at once, so there is no chain to scope it to.
     fn set_token_sort(&self, order: String) -> String;
 
-    /// Accounts the keystore holds. Read-only: this module can never create, import or
-    /// export one — those are the custodian's, and reach the keystore only via `evm_keystore_ui`.
+    /// EVM addresses from the signer manager, which owns discovery and signer precedence.
+    /// Offered device accounts remain listed while disconnected, for balance/history reads.
+    /// Read-only: this module cannot create, import or export keys.
     fn list_accounts(&self) -> String;
 
     /// Account names, `{ ok, labels: { "<lowercase hex, no 0x>": "<name>" } }`, relayed from
-    /// the keystore verbatim. `keystore_module.get_labels` is ungated — a label is not a
-    /// secret — and this passthrough keeps a view's dependency list at exactly one module.
+    /// the keystore plus offered EVM device labels. A keystore label takes precedence.
+    /// Both inventories are ungated; this keeps a view's dependency list at one module.
     ///
     /// The keys are `vault_name` form and `list_accounts` answers EIP-55 checksummed
     /// addresses, so the two never match textually and a lookup must normalise.
@@ -260,7 +261,7 @@ pub trait EthWalletBackendModuleEvents {
     /// Relayed from `tx_sender_module`: a pending send changed state.
     fn send_status_changed(&self, request_id: String);
     /// The keystore's accounts moved — the set itself, or the names they are shown under.
-    /// Relayed from `keystore_module::accounts_changed`; `count` is carried verbatim and is
+    /// Relayed from the keystore and signer manager; `count` is
     /// ADVISORY, not a change detector: a rename does not move it. Re-read both
     /// `list_accounts` and `get_account_labels` on it.
     fn accounts_changed(&self, count: i64);
@@ -303,6 +304,7 @@ struct Feeds {
     enabled: Arc<AtomicBool>,
     scope: Arc<AtomicBool>,
     tokens: Arc<AtomicBool>,
+    signers: Arc<AtomicBool>,
 }
 
 /// Run a subscription's listener thread, releasing `flag` when the feed ends.
@@ -478,6 +480,26 @@ impl EthWalletBackendImpl {
                     .map(|e| e.count)
                     .unwrap_or(-1);
                 emit_accounts_changed(count);
+            }
+        });
+    }
+
+    /// Hardware signers can offer or withdraw accounts after this wallet is open.
+    fn watch_signers(&self) {
+        let flag = &self.feeds.signers;
+        if flag.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut manager = modules().signer_manager_module;
+        let Ok(sub) = manager.on_accounts_changed() else {
+            flag.store(false, Ordering::SeqCst);
+            return;
+        };
+        listen(Arc::clone(flag), sub, |sub| {
+            // Close the subscribe/read race without querying devices during startup.
+            emit_accounts_changed(-1);
+            for _ in sub {
+                emit_accounts_changed(-1);
             }
         });
     }
@@ -826,6 +848,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         // After the state above exists: the relay's first act is a `list_accounts`, and a
         // consumer must never be told to re-read before this module can answer.
         self.watch_keystore();
+        self.watch_signers();
         self.watch_sender();
         self.watch_chain_config();
         self.watch_chain_enabled();
@@ -982,26 +1005,39 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         // The relay's only retry: `on_context_ready` is the one chance startup gives it, and
         // a client that could not be built there would otherwise leave the view deaf forever.
         self.watch_keystore();
-        match modules().keystore_module.list_accounts() {
-            Ok(reply) => reply,
-            Err(e) => err(format!("{e:?}")),
-        }
+        self.watch_signers();
+        let result = (|| {
+            let signers = modules().signer_manager_module.accounts_with_timeout(RPC_BUDGET)
+                .map_err(|e| format!("signer_manager_module: {e:?}"))?;
+            crate::accounts::evm_accounts(&signers)
+        })();
+        result.unwrap_or_else(err)
     }
 
     fn get_account_labels(&self) -> String {
         self.watch_keystore();
-        match modules().keystore_module.get_labels() {
-            Ok(reply) => reply,
-            Err(e) => err(format!("{e:?}")),
-        }
+        self.watch_signers();
+        let result = (|| {
+            let labels = modules().keystore_module.get_labels_with_timeout(RPC_BUDGET)
+                .map_err(|e| format!("keystore_module: {e:?}"))?;
+            let signers = modules().signer_manager_module.accounts_with_timeout(RPC_BUDGET)
+                .map_err(|e| format!("signer_manager_module: {e:?}"))?;
+            crate::accounts::merge_labels(&labels, &signers)
+        })();
+        result.unwrap_or_else(err)
     }
 
     fn get_account_wallets(&self) -> String {
         self.watch_keystore();
-        match modules().keystore_module.get_account_wallets() {
-            Ok(reply) => reply,
-            Err(e) => err(format!("{e:?}")),
-        }
+        self.watch_signers();
+        let result = (|| {
+            let wallets = modules().keystore_module.get_account_wallets_with_timeout(RPC_BUDGET)
+                .unwrap_or_else(|_| "{\"ok\":true,\"wallets\":{}}".into());
+            let signers = modules().signer_manager_module.accounts_with_timeout(RPC_BUDGET)
+                .map_err(|e| format!("signer_manager_module: {e:?}"))?;
+            crate::accounts::merge_wallets(&wallets, &signers)
+        })();
+        result.unwrap_or_else(err)
     }
 
     fn list_contacts(&self) -> String {
