@@ -9,6 +9,8 @@
 
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 /// Per-call caps. Reading a dependency's config or its metadata is local work; writing one
 /// is a file write plus, for token_list, a ~1ms parse — 5s is slack, not a working number.
 pub const PROBE_BUDGET: Duration = Duration::from_millis(1500);
@@ -51,15 +53,38 @@ const CALLEE_MARGIN: Duration = Duration::from_millis(300);
 pub const READ_BUDGET: Duration = Duration::from_secs(4);
 pub const STARTUP_BUDGET: Duration = Duration::from_secs(6);
 
-/// A send's outbound work: validate the requested chain against the registry, read the
-/// offered tokens, delegate one transfer build, then ask `tx_sender_module` to price or submit.
-pub const SEND_BUDGET: Duration = Duration::from_secs(16);
+/// The most a send's outbound work may take on any chain: validate the requested chain against
+/// the registry, read the offered tokens, delegate one transfer build, then ask
+/// `tx_sender_module` to price or submit. Under the view's 130 s send transport.
+pub const SEND_BUDGET: Duration = Duration::from_secs(120);
 
-/// The one delegated call of a send: `tx_sender_module.prepare` or `.send`, which itself runs
-/// a gate, a fee estimate, a balance and a nonce read, and the approval request. Its own
-/// allowance is handed down as `deadlineMs` so its error sentence comes home rather than a
-/// bare transport timeout.
+/// One delegated call to `tx_sender_module` that is not a send (a history read), and the least
+/// a send's is ever handed.
 pub const SENDER_BUDGET: Duration = Duration::from_secs(9);
+
+/// One round trip on a chain, from its eth_rpc record: the `timeoutSecs` the user set, or
+/// `verifiedTimeoutSecs` when its reads go through the verified proxy.
+pub fn round_trip(record: &Value) -> Duration {
+    let verified = record.get("verifiedProxyMode").and_then(Value::as_str) == Some("required");
+    let (key, default) = if verified { ("verifiedTimeoutSecs", 15) } else { ("timeoutSecs", 8) };
+    let secs = record.get(key).and_then(Value::as_u64).filter(|s| *s > 0).unwrap_or(default);
+    Duration::from_secs(secs.clamp(1, 60))
+}
+
+/// The one delegated call of a send: `tx_sender_module.prepare` or `.send`, which reads the
+/// chain's config, gates, prices the transfer (fee history, tip, estimate), reads the balance
+/// and the nonce, each a whole round trip `rt`, and on `send` registers the approval. Handed
+/// down as `deadlineMs`, so its error sentence comes home rather than a bare transport timeout.
+pub fn sender_budget(rt: Duration, sending: bool) -> Duration {
+    let approval = if sending { INIT_BUDGET } else { Duration::ZERO };
+    (PROBE_BUDGET * 2 + (rt + CALLEE_MARGIN) * 5 + CALLEE_MARGIN * 2 + approval).max(SENDER_BUDGET)
+}
+
+/// One `suggest_fees` on a chain: the fee history and, where its reward rows are blank, the
+/// node's tip, each a whole round trip.
+pub fn fees_budget(rt: Duration) -> Duration {
+    ((rt + CALLEE_MARGIN) * 2 + CALLEE_MARGIN).max(RPC_BUDGET)
+}
 
 /// Resolve and build one transfer in `evm_assets_module`. Together with the registry read,
 /// the offered read and the sender allowance this exactly fits the public send budget; the
@@ -83,8 +108,8 @@ pub const HISTORY_BUDGET: Duration = Duration::from_secs(12);
 /// Together with registry discovery the public call still fits the UI's 20s transport bound.
 pub const BALANCES_BUDGET: Duration = Duration::from_secs(15);
 
-/// One `suggest_fees`: the verified gate and one `fee_module` estimate.
-pub const FEES_BUDGET: Duration = Duration::from_secs(5);
+/// The most one `suggest_fees` may take on any chain: the registry read and [`fees_budget`].
+pub const FEES_BUDGET: Duration = Duration::from_secs(120);
 
 /// One `verified_proxy_state`: the verdict probe alone. A report rather than a gate — here
 /// the verdict IS the answer — but a chip polling every five seconds must not be able to
@@ -165,15 +190,33 @@ mod tests {
     /// three calls in front of it.
     #[test]
     fn a_send_is_bounded_across_its_reads_and_the_delegated_call() {
-        let calls = [PROBE_BUDGET, OFFERED_BUDGET, ASSETS_BUDGET, SENDER_BUDGET];
-        assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
-        assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "every call must fit");
-        assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
-        // What the sender is handed is what is left after the reads, less the margin that
-        // brings its reply home — and that is still a working allowance.
-        let handed = callee_deadline(SENDER_BUDGET).expect("worth bounding");
-        assert!(handed >= 8_000, "the sender needs room for four calls of its own: {handed}ms");
-        assert!(SEND_BUDGET < Duration::from_secs(20), "inside the view's 20s transport");
+        // The default timeouts on both routes: 8 s direct, 15 s through the verified proxy.
+        for rt in [8, 15].map(Duration::from_secs) {
+            let sender = sender_budget(rt, true);
+            let calls = [PROBE_BUDGET, OFFERED_BUDGET, ASSETS_BUDGET, sender];
+            assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
+            assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "every call must fit: {rt:?}");
+            assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
+            // Five whole round trips, the config read and the gate, past the margin home.
+            let handed = Duration::from_millis(callee_deadline(sender).expect("worth bounding") as u64);
+            assert!(handed >= (rt + CALLEE_MARGIN) * 5 + PROBE_BUDGET * 2 + INIT_BUDGET, "{handed:?}");
+        }
+        assert!(SEND_BUDGET < Duration::from_secs(130), "inside the view's 130s send transport");
+    }
+
+    /// The demo: mainnet at `timeoutSecs: 8`. The sender was handed 8.7 s for five round trips
+    /// that each took 2-3 s.
+    #[test]
+    fn the_sender_is_handed_whole_round_trips_on_the_chains_own_timeout() {
+        use serde_json::json;
+        let rt = round_trip(&json!({ "timeoutSecs": 8, "verifiedProxyMode": "off", "verifiedTimeoutSecs": 15 }));
+        assert_eq!(rt, Duration::from_secs(8));
+        assert_eq!(sender_budget(rt, false), Duration::from_millis(45_100));
+        assert_eq!(round_trip(&json!({ "timeoutSecs": 8, "verifiedProxyMode": "required",
+                                       "verifiedTimeoutSecs": 15 })), Duration::from_secs(15));
+        assert_eq!(round_trip(&Value::Null), Duration::from_secs(8), "eth_rpc's own default");
+        assert!(sender_budget(Duration::from_secs(1), false) >= SENDER_BUDGET, "never below the old one");
+        assert_eq!(fees_budget(rt), Duration::from_millis(16_900));
     }
 
     /// Per chain the offered read goes first and evm_assets gets the rest, which must cover
@@ -218,7 +261,7 @@ mod tests {
     #[test]
     fn the_two_one_call_paths_are_bounded_across_their_gates_too() {
         for (total, calls) in
-            [(FEES_BUDGET, vec![PROBE_BUDGET, RPC_BUDGET]), (VERDICT_BUDGET, vec![PROBE_BUDGET])]
+            [(FEES_BUDGET, vec![PROBE_BUDGET, fees_budget(Duration::from_secs(15))]), (VERDICT_BUDGET, vec![PROBE_BUDGET])]
         {
             assert!(walk(total, &calls) <= total);
             assert!(calls.iter().sum::<Duration>() <= total, "the gate must fit too");

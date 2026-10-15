@@ -14,6 +14,7 @@ pub mod budget;
 pub mod catalogue;
 pub mod contacts;
 pub mod depinit;
+pub mod failure;
 pub mod history;
 pub mod send_status;
 pub mod settings;
