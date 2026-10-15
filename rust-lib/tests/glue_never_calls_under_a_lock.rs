@@ -342,9 +342,8 @@ fn handing_back_a_borrow_instead_of_a_handle_is_caught() {
 /// Every outbound call carries a deadline, except these — each one a decision, not an
 /// oversight. A new unbounded call fails this test and has to be argued for here.
 const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
-    // One call each, and neither sits behind a gate.
+    // One call, and it doesn't sit behind a gate.
     ("keystore_module", "list_accounts", "a passthrough, one call"),
-    ("keystore_module", "get_account_wallets", "a passthrough, one call"),
     // Not calls at all: each arms an `EventSubscription` and the generated client emits no
     // bounded twin for one. A deadline on arming would be a deadline on the SUBSCRIPTION,
     // which is meant to outlive every call this module makes.
