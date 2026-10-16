@@ -40,6 +40,10 @@ reads: token_list writes its defaults only when nothing is configured.
   `get_account_wallets()` retains the keystore's derivation provenance. These reads cannot
   create, import, export or sign. A failed inventory read returns an error, allowing the UI
   to keep its previous list instead of silently dropping accounts.
+- `account_roster()` relays the signer manager's `roster()`, EVM entries only and as they
+  are: each account once, with the wallet it comes from (master fingerprint and name) and
+  every signer holding it, ranked. It is what the account picker shows; `list_accounts()`
+  stays the list of addresses this wallet reads.
 - Changes from both the keystore and signer manager emit `accounts_changed`, so offering or
   removing a device account refreshes an already-open wallet. No PIN is needed to list accounts.
 - `get_balances(address)` reads every enabled in-scope chain concurrently: its offered tokens,

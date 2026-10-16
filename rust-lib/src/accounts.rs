@@ -31,6 +31,15 @@ pub fn evm_accounts(signers: &str) -> Result<String, String> {
     Ok(json!({ "ok": true, "accounts": accounts }).to_string())
 }
 
+/// The signer manager's roster, its EVM entries only and as they are: each account once, with
+/// the wallet it comes from and every signer holding it, for the account picker.
+pub fn evm_roster(roster: &str) -> Result<String, String> {
+    let v = reply(roster)?;
+    let rows = v["accounts"].as_array().ok_or("roster is missing accounts")?;
+    let evm: Vec<&Value> = rows.iter().filter(|a| a["family"] == "evm").collect();
+    Ok(json!({ "ok": true, "accounts": evm }).to_string())
+}
+
 pub fn merge_labels(keystore: &str, signers: &str) -> Result<String, String> {
     let mut labels = reply(keystore)?;
     let out = labels["labels"].as_object_mut().ok_or("keystore reply is missing labels")?;
@@ -135,5 +144,21 @@ mod tests {
         }
         assert!(merge_labels(r#"{"ok":false,"error":"offline"}"#, &inventory(true)).is_err());
         assert_eq!(evm_accounts(r#"{"ok":true,"accounts":[]}"#).unwrap(), r#"{"accounts":[],"ok":true}"#);
+    }
+
+    #[test]
+    fn the_roster_keeps_its_evm_accounts_as_they_are_and_every_holder() {
+        let holders = json!([{"signer":"keystore_module","accountId":SOFTWARE,"transport":"keystore"},
+                             {"signer":"keycard_module","accountId":SOFTWARE,"transport":"reader"}]);
+        let roster = json!({"ok": true, "accounts": [
+            {"key": SOFTWARE, "family": "evm", "address": SOFTWARE, "label": "Software",
+             "wallet": {"fingerprint": "73c5da0a", "name": "Main"}, "holders": holders},
+            {"key": "btc_0011", "family": "bitcoin", "chain": "test", "holders": []}
+        ]});
+        let v: Value = serde_json::from_str(&evm_roster(&roster.to_string()).unwrap()).unwrap();
+        assert_eq!(v["accounts"].as_array().unwrap().len(), 1, "no Bitcoin account");
+        assert_eq!(v["accounts"][0], roster["accounts"][0], "an entry is passed on as it is");
+        assert!(evm_roster(r#"{"ok":false,"error":"not authorized"}"#).is_err());
+        assert!(evm_roster(r#"{"ok":true}"#).is_err());
     }
 }

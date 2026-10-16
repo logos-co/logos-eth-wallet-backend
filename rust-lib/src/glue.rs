@@ -139,6 +139,12 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// rather than derived — both are ordinary, and an empty map is the normal state.
     fn get_account_wallets(&self) -> String;
 
+    /// Every EVM account once, with the wallet it comes from and every signer holding it, as
+    /// the signer manager's `roster()` gives it: `{ ok, accounts: [{ key, family, address,
+    /// path?, label?, labels?, wallet?: { fingerprint?, name? }, holders: [..] }] }`. What the
+    /// account picker shows; `list_accounts` stays the list of addresses this wallet reads.
+    fn account_roster(&self) -> String;
+
     /// The address book: `{ ok, contacts: [{ address, name }] }`, named rows first and then
     /// unnamed, each ordered by name and address so a picker can show them without sorting
     /// and the order does not move when an unrelated contact is added.
@@ -1047,6 +1053,16 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             let signers = modules().signer_manager_module.accounts_with_timeout(RPC_BUDGET)
                 .map_err(|e| format!("signer_manager_module: {e:?}"))?;
             crate::accounts::merge_wallets(&wallets, &signers)
+        })();
+        result.unwrap_or_else(err)
+    }
+
+    fn account_roster(&self) -> String {
+        self.watch_signers();
+        let result = (|| {
+            let roster = modules().signer_manager_module.roster_with_timeout(RPC_BUDGET)
+                .map_err(|e| format!("signer_manager_module: {e:?}"))?;
+            crate::accounts::evm_roster(&roster)
         })();
         result.unwrap_or_else(err)
     }
