@@ -82,7 +82,7 @@ sections:
           nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
           nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
           nix build "github:logos-co/logos-evm-assets-module#install" --out-link ./result-assets
-          nix build "github:logos-co/logos-evm-tx-sender-module/b01c896d5ad51fa046c545afcc6fae4a3cbfd79f#install" --out-link ./result-sender
+          nix build "github:logos-co/logos-evm-tx-sender-module/9ad3472e3d8b0d6811ee1f7c5b802ad6e559a76f#install" --out-link ./result-sender
         code_block: |
           nix build 'github:logos-co/logos-evm-keystore-module#install' --out-link ./result-keystore
           nix build 'github:logos-co/logos-signer-manager-module#install' --out-link ./result-manager
