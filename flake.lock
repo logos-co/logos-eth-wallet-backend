@@ -18253,11 +18253,11 @@
         "logos-signer-interface": "logos-signer-interface"
       },
       "locked": {
-        "lastModified": 1792161367,
-        "narHash": "sha256-tl0uv3dfVMsNCAS27mVZjW56h6Grevc8pkDSDQkH9Uw=",
+        "lastModified": 1792171691,
+        "narHash": "sha256-1Q57r0vEo7nh5/mhERmebUK+z2DqA14PuiXQKBepWxM=",
         "owner": "logos-co",
         "repo": "logos-signer-manager-module",
-        "rev": "7d7951d96af8611fd63f655d7717a849330df91b",
+        "rev": "cd661b5a5fc119c01154982bc3c84f023dbcc4a2",
         "type": "github"
       },
       "original": {
