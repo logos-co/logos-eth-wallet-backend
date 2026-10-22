@@ -28,6 +28,10 @@ pub const OFFERED_BUDGET: Duration = Duration::from_secs(1);
 /// this crosses a network, so 3s is a working number rather than slack.
 pub const RPC_BUDGET: Duration = Duration::from_secs(3);
 
+/// One `data_key` from the signer manager: a local derivation, asked from the key worker's
+/// own thread, so it holds up no reply a person waits on.
+pub const KEY_BUDGET: Duration = Duration::from_secs(5);
+
 /// The deadline to hand a callee that this caller will wait `transport` for.
 ///
 /// Shorter than the transport bound on purpose. The two clocks start together, so a callee

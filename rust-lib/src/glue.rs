@@ -18,22 +18,25 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock, Weak};
 
 use logos_rust_sdk::LogosError;
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest, PROFILE};
+use logos_signer_interface::{ErrorCode, SignerError};
 use serde_json::{json, Value};
 
 use crate::budget::{
     callee_deadline, fees_budget, round_trip, sender_budget, Budget, BALANCES_BUDGET,
-    CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, HISTORY_BUDGET, INIT_BUDGET, OFFERED_BUDGET,
-    PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, ASSETS_BUDGET, SENDER_BUDGET,
-    SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET,
+    CATALOGUE_BUDGET, DETAILS_BUDGET, FEES_BUDGET, HISTORY_BUDGET, INIT_BUDGET, KEY_BUDGET,
+    OFFERED_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, ASSETS_BUDGET,
+    SENDER_BUDGET, SEND_BUDGET, STARTUP_BUDGET, STATUS_BUDGET,
 };
 use crate::catalogue;
 use crate::contacts::ContactsStore;
 use crate::depinit;
 use crate::failure;
 use crate::history;
+use crate::profile;
 use crate::send_status;
 use crate::settings::{Settings, SettingsStore};
 use crate::settings::TokenSort;
@@ -113,6 +116,9 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     ///
     /// Device-wide, and emits `token_sort_changed` on a move: the same rows come back in a
     /// new order on every network at once, so there is no chain to scope it to.
+    ///
+    /// Settings are sealed under the profile key: while every wallet is locked this answers
+    /// `{ ok: false, code: "locked", error }`, and the reads that order rows use `alpha`.
     fn set_token_sort(&self, order: String) -> String;
 
     /// EVM addresses from the signer manager, which owns discovery and signer precedence.
@@ -150,7 +156,10 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// and the order does not move when an unrelated contact is added.
     ///
     /// These are COUNTERPARTIES and live here rather than in the keystore, which names
-    /// accounts it holds keys for. A contact carries no key material and is not a secret.
+    /// accounts it holds keys for. A contact carries no key material.
+    ///
+    /// The book is sealed under the profile key: while every wallet is locked the three
+    /// contact methods answer `{ ok: false, code: "locked", error }` and touch no file.
     fn list_contacts(&self) -> String;
 
     /// Add a contact, or rename one already there — an UPSERT, because a user who saves an
@@ -277,7 +286,8 @@ pub trait EthWalletBackendModuleEvents {
     /// The set of tokens OFFERED on `chain_id` moved. Chain-scoped, so a wallet on another
     /// network can ignore it.
     fn tokens_changed(&self, chain_id: i64);
-    /// The balance-row order moved. Device-wide and chainless.
+    /// The balance-row order moved. Device-wide and chainless. Also emitted when the profile
+    /// key comes or goes, so a view re-reads its contacts and settings.
     fn token_sort_changed(&self, order: String);
     /// Relayed from `tx_sender_module`: a recorded row for `address` appeared or changed with
     /// no hash for `tx_status_changed` to name.
@@ -338,6 +348,88 @@ struct DepInit {
 struct State {
     settings: SettingsStore,
     contacts: ContactsStore,
+    /// The key worker's queue, see `serve_keys`. The worker holds a weak handle, so the
+    /// worker of a replaced state ends.
+    keys: mpsc::Sender<KeyWork>,
+    /// The manager's two wallet feeds, armed per state so a new context arms its own.
+    wallets_changed: Arc<AtomicBool>,
+    wallets_locked: Arc<AtomicBool>,
+}
+
+/// What the key worker is asked to do.
+#[derive(Clone, Copy, PartialEq)]
+enum KeyWork {
+    /// Ask the manager for the profile keys again.
+    Ask,
+    /// Drop the keys and what they opened, then ask again: some wallets may still be unlocked.
+    Lock,
+}
+
+/// The key worker: asks for the profile keys one request at a time, on a thread of its own,
+/// so no dispatch thread waits on the manager.
+fn serve_keys(state: Weak<State>, work: mpsc::Receiver<KeyWork>) {
+    while let Ok(first) = work.recv() {
+        // What queued meanwhile is one more ask; a lock among it is still a lock.
+        let mut lock = first == KeyWork::Lock;
+        while let Ok(more) = work.try_recv() {
+            lock |= more == KeyWork::Lock;
+        }
+        let Some(st) = state.upgrade() else { return };
+        let mut moved = lock && (st.contacts.vault().close() | st.settings.vault().close());
+        for (vault, scope) in [
+            (st.contacts.vault(), ContactsStore::SCOPE),
+            (st.settings.vault(), SettingsStore::SCOPE),
+        ] {
+            let done = profile::refresh(vault, |generation| profile_key(scope, generation));
+            if let Some(e) = done.error {
+                eprintln!("eth_wallet_backend: the {scope} key: {e}");
+            }
+            moved |= done.moved;
+        }
+        if moved {
+            // Contacts have no event of their own; a view re-reads them on this one.
+            emit_token_sort_changed(st.settings.shown().unwrap_or_default().token_sort.as_str());
+        }
+    }
+}
+
+/// This module's profile key for `scope`: asked asynchronously and waited for on a channel,
+/// never a blocking call, which would nest on the main thread.
+fn profile_key(scope: &str, generation: Option<u32>) -> Result<DataKey, SignerError> {
+    let unavailable = |e: String| SignerError::new(ErrorCode::Unavailable, e);
+    let request = DataKeyRequest { seed: PROFILE.into(), scope: scope.into(), generation };
+    let body = serde_json::to_string(&request).map_err(|e| unavailable(e.to_string()))?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    modules().signer_manager_module.data_key_async_with_timeout(&body, KEY_BUDGET, move |r| {
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(KEY_BUDGET + std::time::Duration::from_secs(1)) {
+        Ok(Ok(reply)) => read_data_key(&reply),
+        Ok(Err(e)) => Err(unavailable(format!("signer_manager_module: {e:?}"))),
+        Err(_) => Err(unavailable("signer_manager_module did not answer".into())),
+    }
+}
+
+/// Relay one of the manager's wallet feeds to the key worker as `work`, while `flag` is held.
+fn relay_to_keys(
+    flag: &Arc<AtomicBool>,
+    sub: Result<logos_rust_sdk::EventSubscription, LogosError>,
+    keys: &mpsc::Sender<KeyWork>,
+    work: KeyWork,
+) -> bool {
+    let Ok(sub) = sub else {
+        flag.store(false, Ordering::SeqCst);
+        return false;
+    };
+    let keys = keys.clone();
+    listen(Arc::clone(flag), sub, move |sub| {
+        for _ in sub {
+            if keys.send(work).is_err() {
+                return;
+            }
+        }
+    });
+    true
 }
 
 /// Accounts the keystore holds, or -1 when it could not be asked — the keystore's own
@@ -466,10 +558,10 @@ impl EthWalletBackendImpl {
         guard.clone().ok_or_else(|| NO_CONTEXT.to_string())
     }
 
-    /// The whole settings file. A file read; no lock and no call. An unreadable settings file
-    /// is an error, never chain 1: every caller here gates, prices or labels on this answer.
+    /// The whole settings file, or the defaults while locked, which reads nothing. A file read;
+    /// no call. An unreadable settings file stays an error.
     fn settings(&self) -> Result<Settings, String> {
-        self.state()?.settings.try_load().map_err(|e| e.to_string())
+        self.state()?.settings.shown().map_err(|e| e.to_string())
     }
 
     /// Relay the keystore's account changes to this module's own subscribers, so a view one
@@ -519,6 +611,28 @@ impl EthWalletBackendImpl {
                 emit_accounts_changed(-1);
             }
         });
+    }
+
+    /// The manager's wallet feeds, relayed to the key worker: an unlock or a change asks for
+    /// the profile keys again, a lock drops them first. Retried from the contact and settings
+    /// methods, like the keystore relay from the account reads.
+    fn watch_wallets(&self) {
+        let Ok(st) = self.state() else { return };
+        let mut armed = false;
+        if !st.wallets_changed.swap(true, Ordering::SeqCst) {
+            let mut manager = modules().signer_manager_module;
+            let sub = manager.on_wallets_changed();
+            armed |= relay_to_keys(&st.wallets_changed, sub, &st.keys, KeyWork::Ask);
+        }
+        if !st.wallets_locked.swap(true, Ordering::SeqCst) {
+            let mut manager = modules().signer_manager_module;
+            let sub = manager.on_wallets_locked();
+            armed |= relay_to_keys(&st.wallets_locked, sub, &st.keys, KeyWork::Lock);
+        }
+        // Arming is not retroactive: one ask closes the window.
+        if armed {
+            let _ = st.keys.send(KeyWork::Ask);
+        }
     }
 
     /// Relay the sender's three events as this module's own. A view depends on this module
@@ -854,10 +968,24 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         let dir = PathBuf::from(&ctx.instance_persistence_path);
         let settings = SettingsStore::with_path(dir.join("settings.json"));
         let contacts = ContactsStore::with_path(dir.join("contacts.json"));
+        // Both locked until the key worker's first answer.
+        let (keys, work) = mpsc::channel();
+        let state = Arc::new(State {
+            settings,
+            contacts,
+            keys,
+            wallets_changed: Arc::default(),
+            wallets_locked: Arc::default(),
+        });
+        let weak = Arc::downgrade(&state);
+        let ask = state.keys.clone();
 
         if let Ok(mut g) = self.state.write() {
-            *g = Some(Arc::new(State { settings, contacts }));
+            *g = Some(state);
         }
+        // After the state is in place, so an unlock it announces can be read back.
+        std::thread::spawn(move || serve_keys(weak, work));
+        let _ = ask.send(KeyWork::Ask);
         // Dependency defaults are best effort, and both share one startup budget.
         let b = Budget::new(STARTUP_BUDGET);
         self.ensure_eth_rpc(&b);
@@ -871,6 +999,7 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         self.watch_chain_enabled();
         self.watch_scope();
         self.watch_tokens();
+        self.watch_wallets();
     }
 
     fn list_networks(&self) -> String {
@@ -1006,7 +1135,8 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
         let Some(o) = TokenSort::parse(&order) else {
             return err(format!("'{order}' is not an order; use 'alpha' or 'balance'"));
         };
-        match self.state().and_then(|st| st.settings.set_token_sort(o).map_err(|e| e.to_string())) {
+        self.watch_wallets();
+        match self.state().and_then(|st| st.settings.set_token_sort(o).map_err(|e| e.reply())) {
             Ok(a) => {
                 let order = a.settings.token_sort.as_str();
                 if a.changed {
@@ -1068,35 +1198,38 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
     }
 
     fn list_contacts(&self) -> String {
+        self.watch_wallets();
         let st = match self.state() {
             Ok(st) => st,
             Err(e) => return err(e),
         };
         match st.contacts.list() {
             Ok(all) => json!({ "ok": true, "contacts": all }).to_string(),
-            Err(e) => err(e),
+            Err(e) => e.reply(),
         }
     }
 
     fn save_contact(&self, address: String, name: String) -> String {
+        self.watch_wallets();
         let st = match self.state() {
             Ok(st) => st,
             Err(e) => return err(e),
         };
         match st.contacts.save(&address, &name) {
             Ok(c) => json!({ "ok": true, "contact": c }).to_string(),
-            Err(e) => err(e),
+            Err(e) => e.reply(),
         }
     }
 
     fn forget_contact(&self, address: String) -> String {
+        self.watch_wallets();
         let st = match self.state() {
             Ok(st) => st,
             Err(e) => return err(e),
         };
         match st.contacts.remove(&address) {
             Ok(()) => json!({ "ok": true, "address": address }).to_string(),
-            Err(e) => err(e),
+            Err(e) => e.reply(),
         }
     }
 

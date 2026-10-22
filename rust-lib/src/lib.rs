@@ -16,6 +16,7 @@ pub mod contacts;
 pub mod depinit;
 pub mod failure;
 pub mod history;
+pub mod profile;
 pub mod send_status;
 pub mod settings;
 pub mod store;

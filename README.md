@@ -70,6 +70,21 @@ the chain registry. `set_token_enabled(chain_id, address, enabled)` is an explic
 the token list. `set_token_sort(order)` and the contact methods write only composer-owned
 preferences.
 
+### Contacts and settings are sealed
+
+`contacts.json` and `settings.json` are each one box (`logos-signer-interface`'s
+`wallets::seal`, 0600, the file's name as associated data) under this module's profile keys:
+`signer_manager_module.data_key({ seed: "profile", scope: "contacts" | "settings" })`, which
+answers while any wallet is unlocked in the Signer app. A key worker asks for them on its own
+thread, at start and on every `wallets_changed`; `wallets_locked` drops them and asks again.
+A box sealed under an older generation is opened with that generation's key and sealed again
+under the current one. Plain files from before sealing are ignored.
+
+While no profile key is at hand, nothing is read or written: `list_contacts`, `save_contact`,
+`forget_contact` and `set_token_sort` answer `{ ok: false, code: "locked", error }`, and the
+reads that order rows use the default `alpha` sort. `token_sort_changed` is emitted when the
+keys come or go, so a view re-reads both.
+
 Every send request must name `chainId`:
 
 ```json
@@ -120,7 +135,7 @@ The composer relays or emits:
 - `balances_updated(address)`
 - `history_changed(address)` and `tx_status_changed(hash)`
 - `send_status_changed(requestId)`
-- `token_sort_changed(order)`
+- `token_sort_changed(order)`, also when the profile keys come or go
 
 Views re-read the relevant owner after an event; event payloads are hints, not snapshots.
 
