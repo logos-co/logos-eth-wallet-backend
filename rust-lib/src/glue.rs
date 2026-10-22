@@ -151,6 +151,11 @@ pub trait EthWalletBackendModule: Send + Sync + 'static {
     /// account picker shows; `list_accounts` stays the list of addresses this wallet reads.
     fn account_roster(&self) -> String;
 
+    /// The signer manager's wallets, by their public names only: `{ ok, wallets: [{ seed, name,
+    /// locked, kinds }] }`. A locked wallet's accounts aren't in `account_roster` until the person
+    /// unlocks it in the Signer app; a view shows the account kit's locked banner from this.
+    fn signer_wallets(&self) -> String;
+
     /// The address book: `{ ok, contacts: [{ address, name }] }`, named rows first and then
     /// unnamed, each ordered by name and address so a picker can show them without sorting
     /// and the order does not move when an unrelated contact is added.
@@ -1193,6 +1198,22 @@ impl EthWalletBackendModule for EthWalletBackendImpl {
             let roster = modules().signer_manager_module.roster_with_timeout(RPC_BUDGET)
                 .map_err(|e| format!("signer_manager_module: {e:?}"))?;
             crate::accounts::evm_roster(&roster)
+        })();
+        result.unwrap_or_else(err)
+    }
+
+    fn signer_wallets(&self) -> String {
+        let result = (|| {
+            let reply = modules().signer_manager_module.wallets_with_timeout(RPC_BUDGET)
+                .map_err(|e| format!("signer_manager_module: {e:?}"))?;
+            let v: Value = serde_json::from_str(&reply).map_err(|e| format!("signer_manager_module: {e}"))?;
+            if v["ok"] != true {
+                return Err(v["error"].as_str().unwrap_or("the signer manager refused").to_string());
+            }
+            let rows: Vec<Value> = v["wallets"].as_array().cloned().unwrap_or_default().iter()
+                .map(|w| json!({ "seed": w["seed"], "name": w["name"], "locked": w["locked"], "kinds": w["kinds"] }))
+                .collect();
+            Ok(json!({ "ok": true, "wallets": rows }).to_string())
         })();
         result.unwrap_or_else(err)
     }

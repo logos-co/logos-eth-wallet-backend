@@ -44,6 +44,9 @@ reads: token_list writes its defaults only when nothing is configured.
   are: each account once, with the wallet it comes from (master fingerprint and name) and
   every signer holding it, ranked. It is what the account picker shows; `list_accounts()`
   stays the list of addresses this wallet reads.
+- `signer_wallets()` relays the signer manager's `wallets()` by public name only (`seed`,
+  `name`, `locked`, `kinds`). A locked wallet's accounts aren't in the roster until the person
+  unlocks it in the Signer app; the view shows the account kit's locked banner from it.
 - Changes from both the keystore and signer manager emit `accounts_changed`, so offering or
   removing a device account refreshes an already-open wallet. No PIN is needed to list accounts.
 - `get_balances(address)` reads every enabled in-scope chain concurrently: its offered tokens,
