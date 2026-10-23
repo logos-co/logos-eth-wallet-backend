@@ -48,7 +48,8 @@ reads: token_list writes its defaults only when nothing is configured.
   `name`, `locked`, `kinds`). A locked wallet's accounts aren't in the roster until the person
   unlocks it in the Signer app; the view shows the account kit's locked banner from it.
 - Changes from both the keystore and signer manager emit `accounts_changed`, so offering or
-  removing a device account refreshes an already-open wallet. No PIN is needed to list accounts.
+  removing a device account refreshes an already-open wallet; so does a wallet unlocking or
+  locking in the Signer app. No PIN is needed to list accounts.
 - `get_balances(address)` reads every enabled in-scope chain concurrently: its offered tokens,
   then one `evm_assets_module` balance read. Its top-level answer remains usable when one
   chain fails: each item in `chains` carries its own `ok`, `chainId`, balances/route or error.

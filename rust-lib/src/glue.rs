@@ -415,7 +415,8 @@ fn profile_key(scope: &str, generation: Option<u32>) -> Result<DataKey, SignerEr
     }
 }
 
-/// Relay one of the manager's wallet feeds to the key worker as `work`, while `flag` is held.
+/// Relay one of the manager's wallet feeds to the key worker as `work`, while `flag` is held,
+/// and announce `accounts_changed`: the accounts reply's `signerWallets` moved.
 fn relay_to_keys(
     flag: &Arc<AtomicBool>,
     sub: Result<logos_rust_sdk::EventSubscription, LogosError>,
@@ -429,6 +430,7 @@ fn relay_to_keys(
     let keys = keys.clone();
     listen(Arc::clone(flag), sub, move |sub| {
         for _ in sub {
+            emit_accounts_changed(-1);
             if keys.send(work).is_err() {
                 return;
             }
