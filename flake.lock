@@ -10977,17 +10977,17 @@
     "logos-signer-interface": {
       "flake": false,
       "locked": {
-        "lastModified": 1791601039,
-        "narHash": "sha256-VQjc0vyzqs11hVEObM3mtNrydDYP8zDke0+PFtL6AT0=",
+        "lastModified": 1792693772,
+        "narHash": "sha256-qaeEDsVeaqo2uL+Yux0ZTyZP9KInc92ECNhx2RVhjfM=",
         "owner": "logos-co",
         "repo": "logos-signer-interface",
-        "rev": "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02",
+        "rev": "752b7bd69a79ead110efccab40a64731535187f5",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-signer-interface",
-        "rev": "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02",
+        "rev": "752b7bd69a79ead110efccab40a64731535187f5",
         "type": "github"
       }
     },
@@ -18128,6 +18128,50 @@
         "type": "github"
       }
     },
+    "qr_scanner_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "signer_manager_module",
+          "qr_signer_module",
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792177170,
+        "narHash": "sha256-ttibWHZ59BtWX9ZnAg0UQo9VEb8Z8yV88H4gEESpCRQ=",
+        "owner": "logos-co",
+        "repo": "logos-qr-scanner-module",
+        "rev": "bd5084b7491e3914538099b43d18e7e5e832c771",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-qr-scanner-module",
+        "type": "github"
+      }
+    },
+    "qr_signer_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "signer_manager_module",
+          "logos-module-builder"
+        ],
+        "qr_scanner_module": "qr_scanner_module"
+      },
+      "locked": {
+        "lastModified": 1792182734,
+        "narHash": "sha256-l9mL7lrRi7mT3SKNEjGQXy/V0/wFL67TGkkXezRQH0Y=",
+        "owner": "logos-co",
+        "repo": "logos-qr-signer-module",
+        "rev": "33f525fd3bbdf25b8772f0ec0c610a8fab5cf048",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-qr-signer-module",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "eth_rpc_module": "eth_rpc_module",
@@ -18250,14 +18294,15 @@
         "logos-module-builder": [
           "logos-module-builder"
         ],
-        "logos-signer-interface": "logos-signer-interface"
+        "logos-signer-interface": "logos-signer-interface",
+        "qr_signer_module": "qr_signer_module"
       },
       "locked": {
-        "lastModified": 1792171691,
-        "narHash": "sha256-1Q57r0vEo7nh5/mhERmebUK+z2DqA14PuiXQKBepWxM=",
+        "lastModified": 1792700358,
+        "narHash": "sha256-8R0KKrTZ9U9TxFhhXWQo3CZOAuT48rVFvpzuXgjKN8E=",
         "owner": "logos-co",
         "repo": "logos-signer-manager-module",
-        "rev": "cd661b5a5fc119c01154982bc3c84f023dbcc4a2",
+        "rev": "cfe858ea55a763ffa6e8e0e12a94a08c91199639",
         "type": "github"
       },
       "original": {

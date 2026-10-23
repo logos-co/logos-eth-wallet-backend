@@ -75,6 +75,7 @@ jobs:
                    every_event_this_module_declares_is_emitted_somewhere \
                    the_sender_relay_re_emits_every_event_it_subscribes_to \
                    the_keystore_relay_arms_once_listens_off_thread_and_closes_its_own_window \
+                   the_profile_keys_are_asked_async_and_only_by_the_key_worker \
                    a_failed_decoration_keeps_the_history_rows \
                    history::tests::the_system_address_is_never_looked_up_as_a_token; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
