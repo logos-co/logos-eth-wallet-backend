@@ -293,9 +293,9 @@ sections:
           `evm_signer_cli` claimed the request and published the manager's two lists,
           kept apart: what the requester *claims* the signature is for, and what will
           actually be signed. The requester the manager attests is `tx_sender_module`,
-          the one sender every wallet on the device goes through; the claim line names
-          the module that asked it to — `eth_wallet_backend` — and the last two lines are
-          the commands to type.
+          the one sender every wallet on the device goes through, shown after its
+          installed name; the claim line names the module that asked it to —
+          `eth_wallet_backend` — and the last two lines are the commands to type.
         run: |
           python3 -c '
           import json
@@ -304,7 +304,7 @@ sections:
               if d.get("event") == "prompt": print(d["data"]["arg1"])'
         code_block: "# the watcher's terminal"
         expect_contains:
-          - "Requested by: tx_sender_module"
+          - "Requested by: EVM Transaction Sender (tx_sender_module)"
           # The WHOLE claim, both ends included. `expect_contains` is a substring match, so
           # asserting "Send 1 ETH" alone would keep passing against a line that named nobody —
           # and naming both ends is the point: the two lines below are the manager's own
