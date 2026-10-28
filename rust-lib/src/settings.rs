@@ -1,12 +1,16 @@
 //! The wallet's one persisted view preference. Chain facts and scope live in
 //! `eth_rpc_module`; token membership and snapshots live in `token_list_module`.
+//!
+//! Sealed under this module's profile key (`profile.rs`). While every wallet is locked nothing
+//! is read or written, and views are shown the defaults.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
+use logos_signer_interface::wallets::DataKey;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
+use crate::profile::{self, SealedFile, Vault};
 use crate::store;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,14 +55,15 @@ pub struct Applied {
 }
 
 pub struct SettingsStore {
-    path: PathBuf,
-    gate: Mutex<()>,
+    vault: Vault,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SettingsError {
     Persist(String),
     Unreadable(String),
+    /// No wallet is unlocked, so the settings' key is not here. Nothing was read or written.
+    Locked,
 }
 
 impl std::fmt::Display for SettingsError {
@@ -66,27 +71,44 @@ impl std::fmt::Display for SettingsError {
         match self {
             Self::Persist(error) => write!(f, "could not save settings: {error}"),
             Self::Unreadable(error) => write!(f, "could not read settings: {error}"),
+            Self::Locked => write!(f, "settings are locked: {}", profile::UNLOCK_HINT),
         }
     }
 }
 
+impl SettingsError {
+    /// As a reply, with `code: "locked"` while locked.
+    pub fn reply(&self) -> String {
+        profile::refusal(self, matches!(self, Self::Locked))
+    }
+}
+
 impl SettingsStore {
-    pub fn with_path(path: PathBuf) -> Self { Self { path, gate: Mutex::new(()) } }
+    /// The settings' `data_key` scope.
+    pub const SCOPE: &'static str = "settings";
+
+    /// Locked until its key comes.
+    pub fn with_path(path: PathBuf) -> Self { Self { vault: Vault::new(path) } }
+
+    pub fn vault(&self) -> &Vault { &self.vault }
 
     pub fn try_load(&self) -> Result<Settings, SettingsError> {
-        let _guard = self.gate.lock();
-        self.read()
+        self.vault.with(Self::read).unwrap_or(Err(SettingsError::Locked))
     }
 
-    fn read(&self) -> Result<Settings, SettingsError> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Settings::default());
-            }
-            Err(error) => return Err(SettingsError::Unreadable(error.to_string())),
+    /// What a view is shown: the stored settings, or the defaults while locked, read from nowhere.
+    pub fn shown(&self) -> Result<Settings, SettingsError> {
+        match self.try_load() {
+            Err(SettingsError::Locked) => Ok(Settings::default()),
+            other => other,
+        }
+    }
+
+    fn read(file: &SealedFile, key: &DataKey) -> Result<Settings, SettingsError> {
+        let Some(plain) = file.open(key).map_err(SettingsError::Unreadable)? else {
+            return Ok(Settings::default());
         };
-        let value: serde_json::Value = serde_json::from_str(&text)
+        let value: serde_json::Value = serde_json::from_slice(&plain)
             .map_err(|error| SettingsError::Unreadable(error.to_string()))?;
         if !value.is_object() {
             return Err(SettingsError::Unreadable("settings must be a JSON object".into()));
@@ -94,39 +116,31 @@ impl SettingsStore {
         serde_json::from_value(value).map_err(|error| SettingsError::Unreadable(error.to_string()))
     }
 
-    fn quarantine(&self) -> bool {
-        let aside = self.path.with_extension(format!("json.unreadable-{}", store::now_secs()));
-        std::fs::rename(&self.path, aside).is_ok()
+    fn quarantine(file: &SealedFile) -> bool {
+        let aside = file.path().with_extension(format!("json.unreadable-{}", store::now_secs()));
+        std::fs::rename(file.path(), aside).is_ok()
     }
 
-    fn save(&self, settings: &Settings) -> Result<(), SettingsError> {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SettingsError::Persist(e.to_string()))?;
-        }
-        let text = serde_json::to_string_pretty(settings)
-            .map_err(|e| SettingsError::Persist(e.to_string()))?;
-        let temporary = self.path.with_extension(format!(
-            "{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        if store::write_then_rename(&temporary, &self.path, &text) {
-            Ok(())
-        } else {
-            Err(SettingsError::Persist(format!("could not replace {}", self.path.display())))
-        }
+    fn save(file: &SealedFile, key: &DataKey, settings: &Settings) -> Result<(), SettingsError> {
+        let text = Zeroizing::new(
+            serde_json::to_vec(settings).map_err(|e| SettingsError::Persist(e.to_string()))?,
+        );
+        file.seal(key, &text).map_err(SettingsError::Persist)
     }
 
     fn update(&self, edit: impl FnOnce(&mut Settings)) -> Result<Applied, SettingsError> {
-        let _guard = self.gate.lock();
-        let (mut settings, readable) = match self.read() {
-            Ok(settings) => (settings, true),
-            Err(SettingsError::Unreadable(_)) if self.quarantine() => (Settings::default(), false),
-            Err(error) => return Err(error),
-        };
-        let before = settings.clone();
-        edit(&mut settings);
-        self.save(&settings)?;
-        Ok(Applied { changed: !readable || settings != before, settings })
+        self.vault.with(|file, key| {
+            let (mut settings, readable) = match Self::read(file, key) {
+                Ok(settings) => (settings, true),
+                Err(SettingsError::Unreadable(_)) if Self::quarantine(file) => (Settings::default(), false),
+                Err(error) => return Err(error),
+            };
+            let before = settings.clone();
+            edit(&mut settings);
+            Self::save(file, key, &settings)?;
+            Ok(Applied { changed: !readable || settings != before, settings })
+        })
+        .unwrap_or(Err(SettingsError::Locked))
     }
 
     pub fn set_token_sort(&self, order: TokenSort) -> Result<Applied, SettingsError> {
@@ -137,9 +151,21 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::tests::{key, manager};
+    use crate::profile::refresh;
+
+    fn opened(path: PathBuf, k: &DataKey) -> SettingsStore {
+        let s = SettingsStore::with_path(path);
+        assert_eq!(s.vault().unlock(k, k).error, None);
+        s
+    }
 
     fn store(dir: &tempfile::TempDir) -> SettingsStore {
-        SettingsStore::with_path(dir.path().join("settings.json"))
+        opened(dir.path().join("settings.json"), &key(1, 0))
+    }
+
+    fn sealed(path: &std::path::Path, k: &DataKey, text: &str) {
+        SealedFile::new(path.to_path_buf()).seal(k, text.as_bytes()).unwrap();
     }
 
     #[test]
@@ -149,32 +175,72 @@ mod tests {
     }
 
     #[test]
+    fn while_locked_nothing_is_read_or_written_and_views_get_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let locked = SettingsStore::with_path(path.clone());
+        assert_eq!(locked.try_load(), Err(SettingsError::Locked));
+        assert_eq!(locked.set_token_sort(TokenSort::Balance).unwrap_err(), SettingsError::Locked);
+        assert!(!path.exists(), "nothing was written");
+
+        sealed(&path, &key(1, 0), r#"{"tokenSort":"balance"}"#);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(locked.shown().unwrap().token_sort, TokenSort::Alpha, "the stored order was not read");
+        assert_eq!(locked.set_token_sort(TokenSort::Alpha).unwrap_err(), SettingsError::Locked);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let v: serde_json::Value = serde_json::from_str(&SettingsError::Locked.reply()).unwrap();
+        assert_eq!(v["code"], "locked");
+        assert!(v["error"].as_str().unwrap().contains("Signer app"), "{v}");
+    }
+
+    #[test]
     fn old_network_and_enabled_token_copies_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        std::fs::write(&path, r#"{"activeChainId":11155111,"tokenSort":"balance","networks":[{"chainId":1,"enabledTokens":[{"symbol":"OLD"}]}]}"#).unwrap();
-        let settings = SettingsStore::with_path(path).try_load().unwrap();
+        sealed(&path, &key(1, 0), r#"{"activeChainId":11155111,"tokenSort":"balance","networks":[{"chainId":1,"enabledTokens":[{"symbol":"OLD"}]}]}"#);
+        let settings = opened(path, &key(1, 0)).try_load().unwrap();
         assert_eq!(settings.token_sort, TokenSort::Balance);
     }
 
     #[test]
-    fn preference_round_trips() {
+    fn preference_round_trips_and_opens_only_with_its_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let writer = SettingsStore::with_path(path.clone());
-        writer.set_token_sort(TokenSort::Balance).unwrap();
-        let value = SettingsStore::with_path(path).try_load().unwrap();
-        assert_eq!(value.token_sort, TokenSort::Balance);
+        store(&dir).set_token_sort(TokenSort::Balance).unwrap();
+        assert_eq!(opened(path.clone(), &key(1, 0)).try_load().unwrap().token_sort, TokenSort::Balance);
+        let other = opened(path.clone(), &key(2, 0));
+        assert!(matches!(other.try_load(), Err(SettingsError::Unreadable(_))));
+        assert!(matches!(other.shown(), Err(SettingsError::Unreadable(_))), "unreadable is not locked");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("balance") && !text.contains("tokenSort"), "{text}");
     }
 
     #[test]
-    fn unreadable_bytes_are_never_mainnet() {
+    fn a_new_generation_seals_the_settings_again() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let settings = SettingsStore::with_path(path.clone());
-        for bytes in ["", "{", "[]", "not json"] {
+        store(&dir).set_token_sort(TokenSort::Balance).unwrap();
+        let reopened = SettingsStore::with_path(path.clone());
+        assert_eq!(refresh(reopened.vault(), manager(1, 4)).error, None);
+        assert_eq!(reopened.vault().wanted(), Some(4));
+        assert_eq!(opened(path, &key(1, 4)).try_load().unwrap().token_sort, TokenSort::Balance);
+    }
+
+    #[test]
+    fn unreadable_bytes_are_an_error_and_plain_files_from_before_sealing_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = store(&dir);
+        for bytes in ["{", "not json"] {
             std::fs::write(&path, bytes).unwrap();
             assert!(matches!(settings.try_load(), Err(SettingsError::Unreadable(_))), "{bytes:?}");
+        }
+        sealed(&path, &key(1, 0), "[]");
+        assert!(matches!(settings.try_load(), Err(SettingsError::Unreadable(_))), "a box of an array");
+        for plain in ["", "[]", r#"{"tokenSort":"balance"}"#] {
+            std::fs::write(&path, plain).unwrap();
+            assert_eq!(settings.try_load().unwrap(), Settings::default(), "{plain:?}");
         }
     }
 
@@ -183,9 +249,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{").unwrap();
-        let applied = SettingsStore::with_path(path.clone()).set_token_sort(TokenSort::Balance).unwrap();
+        let applied = store(&dir).set_token_sort(TokenSort::Balance).unwrap();
         assert!(applied.changed);
-        assert_eq!(SettingsStore::with_path(path).try_load().unwrap().token_sort, TokenSort::Balance);
+        assert_eq!(store(&dir).try_load().unwrap().token_sort, TokenSort::Balance);
         assert!(std::fs::read_dir(dir.path()).unwrap().flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains("unreadable")));
     }

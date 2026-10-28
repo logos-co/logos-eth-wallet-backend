@@ -349,6 +349,8 @@ const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
     // which is meant to outlive every call this module makes.
     ("keystore_module", "on_accounts_changed", "a subscription has no bounded twin"),
     ("signer_manager_module", "on_accounts_changed", "a subscription has no bounded twin"),
+    ("signer_manager_module", "on_wallets_changed", "a subscription has no bounded twin"),
+    ("signer_manager_module", "on_wallets_locked", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_chain_config_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_chain_enabled_changed", "a subscription has no bounded twin"),
     ("eth_rpc_module", "on_network_scope_changed", "a subscription has no bounded twin"),

@@ -2,8 +2,10 @@
 //!
 //! Deliberately NOT in the keystore. The keystore names accounts it holds keys for, and every
 //! one of those names is about a key; these are about counterparties, carry no key material,
-//! and must not be reachable through a surface whose whole point is that it guards one. A
-//! contact is also not a secret — losing the file costs a nickname, not an asset.
+//! and must not be reachable through a surface whose whole point is that it guards one.
+//!
+//! Sealed under this module's profile key (`profile.rs`): who a person pays is theirs alone.
+//! While every wallet is locked the book is neither read nor written.
 //!
 //! Addresses are stored EIP-55 checksummed and matched case-insensitively. A user who types
 //! the same address in two casings has one contact, not two, and the on-disk form is the one
@@ -12,10 +14,13 @@
 //! Pure: no module calls, no chain, no keystore. `cargo test --no-default-features` covers it.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use alloy::primitives::Address;
+use logos_signer_interface::wallets::DataKey;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+use crate::profile::{self, SealedFile, Vault};
 
 /// One entry. `name` may be empty — an address worth remembering is worth remembering before
 /// its owner has been given a name, and refusing that would make the Save button conditional
@@ -43,6 +48,15 @@ pub enum ContactsError {
     /// would answer "you have no contacts" for a file we simply could not read, and the next
     /// write would then overwrite it.
     Unreadable(String),
+    /// No wallet is unlocked, so the book's key is not here. Nothing was read or written.
+    Locked,
+}
+
+impl ContactsError {
+    /// As a reply, with `code: "locked"` while locked.
+    pub fn reply(&self) -> String {
+        profile::refusal(self, matches!(self, Self::Locked))
+    }
 }
 
 impl std::fmt::Display for ContactsError {
@@ -55,6 +69,9 @@ impl std::fmt::Display for ContactsError {
             ContactsError::Full(n) => write!(f, "the address book holds at most {n} contacts"),
             ContactsError::Persist(e) => write!(f, "could not save the address book: {e}"),
             ContactsError::Unreadable(e) => write!(f, "could not read the address book: {e}"),
+            ContactsError::Locked => {
+                write!(f, "the address book is locked: {}", profile::UNLOCK_HINT)
+            }
         }
     }
 }
@@ -73,35 +90,36 @@ pub fn normalise(address: &str) -> Result<String, ContactsError> {
 }
 
 pub struct ContactsStore {
-    path: PathBuf,
-    /// Serializes read-modify-write, so two concurrent saves cannot each write from their own
-    /// snapshot. The same shape `SettingsStore` and `History` use.
-    gate: Mutex<()>,
+    /// The sealed book and its key. Its gate serializes read-modify-write, so two concurrent
+    /// saves cannot each write from their own snapshot.
+    vault: Vault,
 }
 
 impl ContactsStore {
+    /// The book's `data_key` scope.
+    pub const SCOPE: &'static str = "contacts";
+
+    /// Locked until its key comes.
     pub fn with_path(path: PathBuf) -> Self {
-        Self { path, gate: Mutex::new(()) }
+        Self { vault: Vault::new(path) }
+    }
+
+    pub fn vault(&self) -> &Vault {
+        &self.vault
     }
 
     /// Ordered by name, then address — a stable order a picker can show without sorting, and
     /// one that does not move when an unrelated contact is added. Unnamed entries sort last,
     /// because a row with a name is the one a user is looking for.
     pub fn list(&self) -> Result<Vec<Contact>, ContactsError> {
-        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        self.load()
+        self.vault.with(Self::load).unwrap_or(Err(ContactsError::Locked))
     }
 
-    fn load(&self) -> Result<Vec<Contact>, ContactsError> {
-        let raw = match std::fs::read_to_string(&self.path) {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(ContactsError::Unreadable(e.to_string())),
-        };
-        if raw.trim().is_empty() {
+    fn load(file: &SealedFile, key: &DataKey) -> Result<Vec<Contact>, ContactsError> {
+        let Some(plain) = file.open(key).map_err(ContactsError::Unreadable)? else {
             return Ok(Vec::new());
-        }
-        let mut all: Vec<Contact> = serde_json::from_str(&raw)
+        };
+        let mut all: Vec<Contact> = serde_json::from_slice(&plain)
             .map_err(|e| ContactsError::Unreadable(e.to_string()))?;
         all.sort_by(|a, b| {
             let key = |c: &Contact| (c.name.is_empty(), c.name.to_lowercase(), c.address.clone());
@@ -110,17 +128,13 @@ impl ContactsStore {
         Ok(all)
     }
 
-    fn write(&self, all: &[Contact]) -> Result<(), ContactsError> {
-        let body = serde_json::to_string_pretty(all)
-            .map_err(|e| ContactsError::Persist(e.to_string()))?;
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| ContactsError::Persist(e.to_string()))?;
-        }
-        // Write beside and rename: a half-written book is a book that reads as unreadable,
-        // and the next save would then be refused against a file we could not parse.
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(|e| ContactsError::Persist(e.to_string()))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| ContactsError::Persist(e.to_string()))
+    /// Sealed beside the book and renamed over it: a half-written book would read as
+    /// unreadable, and the next save would then be refused.
+    fn write(file: &SealedFile, key: &DataKey, all: &[Contact]) -> Result<(), ContactsError> {
+        let body = Zeroizing::new(
+            serde_json::to_vec(all).map_err(|e| ContactsError::Persist(e.to_string()))?,
+        );
+        file.seal(key, &body).map_err(ContactsError::Persist)
     }
 
     /// Add, or rename what is already there. UPSERT rather than refuse-if-present: a user who
@@ -132,19 +146,21 @@ impl ContactsStore {
         if name.chars().count() > MAX_NAME {
             return Err(ContactsError::NameTooLong(MAX_NAME));
         }
-        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all = self.load()?;
-        match all.iter_mut().find(|c| c.address.eq_ignore_ascii_case(&address)) {
-            Some(existing) => existing.name = name.to_string(),
-            None => {
-                if all.len() >= MAX_CONTACTS {
-                    return Err(ContactsError::Full(MAX_CONTACTS));
+        self.vault.with(|file, key| {
+            let mut all = Self::load(file, key)?;
+            match all.iter_mut().find(|c| c.address.eq_ignore_ascii_case(&address)) {
+                Some(existing) => existing.name = name.to_string(),
+                None => {
+                    if all.len() >= MAX_CONTACTS {
+                        return Err(ContactsError::Full(MAX_CONTACTS));
+                    }
+                    all.push(Contact { address: address.clone(), name: name.to_string() });
                 }
-                all.push(Contact { address: address.clone(), name: name.to_string() });
             }
-        }
-        self.write(&all)?;
-        Ok(Contact { address, name: name.to_string() })
+            Self::write(file, key, &all)?;
+            Ok(Contact { address: address.clone(), name: name.to_string() })
+        })
+        .unwrap_or(Err(ContactsError::Locked))
     }
 
     /// Removing something that is not there SUCCEEDS. The caller's goal is "this address is
@@ -152,24 +168,126 @@ impl ContactsStore {
     /// double click look like a fault.
     pub fn remove(&self, address: &str) -> Result<(), ContactsError> {
         let address = normalise(address)?;
-        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all = self.load()?;
-        all.retain(|c| !c.address.eq_ignore_ascii_case(&address));
-        self.write(&all)
+        self.vault.with(|file, key| {
+            let mut all = Self::load(file, key)?;
+            all.retain(|c| !c.address.eq_ignore_ascii_case(&address));
+            Self::write(file, key, &all)
+        })
+        .unwrap_or(Err(ContactsError::Locked))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::tests::{key, manager};
+    use crate::profile::refresh;
 
     const A: &str = "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199";
     const B: &str = "0x0adBc7B2D1A2b7C8E9F0A1b2c3d4e5f60718D3A7";
 
+    fn opened(path: PathBuf, k: &DataKey) -> ContactsStore {
+        let s = ContactsStore::with_path(path);
+        assert_eq!(s.vault().unlock(k, k).error, None);
+        s
+    }
+
     fn store() -> (tempfile::TempDir, ContactsStore) {
         let d = tempfile::tempdir().unwrap();
-        let s = ContactsStore::with_path(d.path().join("contacts.json"));
+        let s = opened(d.path().join("contacts.json"), &key(1, 0));
         (d, s)
+    }
+
+    #[test]
+    fn while_locked_the_book_is_neither_read_nor_written_and_says_locked() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("contacts.json");
+        let s = ContactsStore::with_path(path.clone());
+        assert_eq!(s.list(), Err(ContactsError::Locked));
+        assert_eq!(s.save(A, "Rorschach"), Err(ContactsError::Locked));
+        assert_eq!(s.remove(A), Err(ContactsError::Locked));
+        assert!(!path.exists(), "nothing was written");
+
+        // Bytes no key opens: an answer other than `Locked` would mean they were read.
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(s.list(), Err(ContactsError::Locked));
+        assert_eq!(s.save(A, "Rorschach"), Err(ContactsError::Locked));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+
+        let v: serde_json::Value = serde_json::from_str(&ContactsError::Locked.reply()).unwrap();
+        assert_eq!((v["ok"].as_bool(), v["code"].as_str()), (Some(false), Some("locked")));
+        assert!(v["error"].as_str().unwrap().contains("Signer app"), "{v}");
+        let v: serde_json::Value =
+            serde_json::from_str(&ContactsError::Full(1).reply()).unwrap();
+        assert!(v.get("code").is_none(), "only a lock is a lock: {v}");
+    }
+
+    #[test]
+    fn a_book_locked_again_forgets_its_key() {
+        let (_d, s) = store();
+        s.save(A, "Rorschach").unwrap();
+        assert!(s.vault().close());
+        assert_eq!(s.list(), Err(ContactsError::Locked));
+    }
+
+    #[test]
+    fn a_reopened_book_reads_only_with_its_own_key() {
+        let (d, s) = store();
+        s.save(A, "Rorschach").unwrap();
+        let path = d.path().join("contacts.json");
+        let before = std::fs::read(&path).unwrap();
+
+        let other = opened(path.clone(), &key(2, 0));
+        assert!(matches!(other.list(), Err(ContactsError::Unreadable(_))));
+        assert!(matches!(other.save(B, "x"), Err(ContactsError::Unreadable(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "and the box was left as it was");
+
+        let again = opened(path, &key(1, 0));
+        assert_eq!(again.list().unwrap(), vec![Contact { address: A.into(), name: "Rorschach".into() }]);
+    }
+
+    #[test]
+    fn no_name_or_address_reaches_the_file() {
+        let (d, s) = store();
+        s.save(A, "Rorschach").unwrap();
+        let text = std::fs::read_to_string(d.path().join("contacts.json")).unwrap();
+        for leak in ["Rorschach", A, &A.to_lowercase(), &A[2..].to_lowercase(), "address"] {
+            assert!(!text.contains(leak), "{leak:?} is in the file: {text}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.path().join("contacts.json")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_new_generation_seals_the_book_again() {
+        let (d, s) = store();
+        s.save(A, "Rorschach").unwrap();
+        let path = d.path().join("contacts.json");
+
+        let reopened = ContactsStore::with_path(path.clone());
+        assert_eq!(reopened.vault().wanted(), Some(0));
+        let done = refresh(reopened.vault(), manager(1, 1));
+        assert_eq!((done.moved, done.error), (true, None));
+        assert_eq!(reopened.vault().wanted(), Some(1), "sealed again under generation 1");
+        assert_eq!(reopened.list().unwrap().len(), 1);
+
+        assert!(matches!(opened(path.clone(), &key(1, 0)).list(), Err(ContactsError::Unreadable(_))));
+        assert_eq!(opened(path, &key(1, 1)).list().unwrap()[0].name, "Rorschach");
+    }
+
+    #[test]
+    fn a_plain_book_from_before_sealing_is_ignored() {
+        let (d, s) = store();
+        let path = d.path().join("contacts.json");
+        std::fs::write(&path, format!(r#"[{{"address":"{A}","name":"Plain"}}]"#)).unwrap();
+        assert_eq!(s.list().unwrap(), vec![]);
+        s.save(B, "Sealed").unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("Plain"));
+        assert_eq!(s.list().unwrap().len(), 1);
     }
 
     #[test]

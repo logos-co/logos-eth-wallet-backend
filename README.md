@@ -44,8 +44,12 @@ reads: token_list writes its defaults only when nothing is configured.
   are: each account once, with the wallet it comes from (master fingerprint and name) and
   every signer holding it, ranked. It is what the account picker shows; `list_accounts()`
   stays the list of addresses this wallet reads.
+- `signer_wallets()` relays the signer manager's `wallets()` by public name only (`seed`,
+  `name`, `locked`, `kinds`). A locked wallet's accounts aren't in the roster until the person
+  unlocks it in the Signer app; the view shows the account kit's locked banner from it.
 - Changes from both the keystore and signer manager emit `accounts_changed`, so offering or
-  removing a device account refreshes an already-open wallet. No PIN is needed to list accounts.
+  removing a device account refreshes an already-open wallet; so does a wallet unlocking or
+  locking in the Signer app. No PIN is needed to list accounts.
 - `get_balances(address)` reads every enabled in-scope chain concurrently: its offered tokens,
   then one `evm_assets_module` balance read. Its top-level answer remains usable when one
   chain fails: each item in `chains` carries its own `ok`, `chainId`, balances/route or error.
@@ -69,6 +73,21 @@ consumers must not scale through JavaScript numbers.
 the chain registry. `set_token_enabled(chain_id, address, enabled)` is an explicit relay to
 the token list. `set_token_sort(order)` and the contact methods write only composer-owned
 preferences.
+
+### Contacts and settings are sealed
+
+`contacts.json` and `settings.json` are each one box (`logos-signer-interface`'s
+`wallets::seal`, 0600, the file's name as associated data) under this module's profile keys:
+`signer_manager_module.data_key({ seed: "profile", scope: "contacts" | "settings" })`, which
+answers while any wallet is unlocked in the Signer app. A key worker asks for them on its own
+thread, at start and on every `wallets_changed`; `wallets_locked` drops them and asks again.
+A box sealed under an older generation is opened with that generation's key and sealed again
+under the current one. Plain files from before sealing are ignored.
+
+While no profile key is at hand, nothing is read or written: `list_contacts`, `save_contact`,
+`forget_contact` and `set_token_sort` answer `{ ok: false, code: "locked", error }`, and the
+reads that order rows use the default `alpha` sort. `token_sort_changed` is emitted when the
+keys come or go, so a view re-reads both.
 
 Every send request must name `chainId`:
 
@@ -120,7 +139,7 @@ The composer relays or emits:
 - `balances_updated(address)`
 - `history_changed(address)` and `tx_status_changed(hash)`
 - `send_status_changed(requestId)`
-- `token_sort_changed(order)`
+- `token_sort_changed(order)`, also when the profile keys come or go
 
 Views re-read the relevant owner after an event; event payloads are hints, not snapshots.
 
